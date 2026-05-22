@@ -1,0 +1,172 @@
+# -----------------------------------------
+# Rubidium Programming Language Syntax
+# File extension: .rub
+# Python-style readability + Rust-style static typing and memory safety
+# -----------------------------------------
+
+# -------------------------------
+# VARIABLES
+# -------------------------------
+# Declare variables with optional type:
+let x = 10           # type inferred as i32
+let mut y i32 = 5    # mutable integer
+let name str = "Rubidium"
+let f f64 = 3.14
+let b bool = True    # Boolean type
+
+# Reassigning mutable variables:
+y = 15
+f = 2.718
+b = False
+
+# Drop a variable:
+x.drop()            # frees memory, variable no longer exists
+# Note: drop() is real and releases memory safely.
+
+# -------------------------------
+# DATA TYPES
+# -------------------------------
+# Integer types: i8, i16, i32, i64, i128, i256
+# Floating types: f4, f8, f16, f32, f64, f128, f256
+# String: str
+# Boolean: bool (True / False)
+# Example:
+let a i32 = 100
+let b f64 = 3.14
+let name str = "Rubidium"
+let flag bool = True
+
+# -------------------------------
+# TYPE CHECKING
+# -------------------------------
+# Rubidium performs compile-time type checking:
+# - assigning wrong type raises a compile-time error
+# Example (will error):
+let x i32 = 5
+x = "hello"      # ❌ type mismatch
+
+# -------------------------------
+# MATH
+# -------------------------------
+# Standard operators: +, -, *, /
+# Operator precedence (BODMAS) applies
+let x = 1 + 2 * 3       # equals 7
+let y = (1 + 2) * 3     # equals 9
+# Comparison operators: ==, !=, >, <, >=, <=
+let check bool = x > 5  # True
+# Logical operators: and, or, not
+let cond bool = True and not False
+
+# -------------------------------
+# PRINT
+# -------------------------------
+print(x)
+print("Hello, Rubidium!")
+print(flag)
+
+# -------------------------------
+# FUNCTIONS
+# -------------------------------
+# Define functions:
+fn main() {
+    print("Hello, Rubidium!")
+}
+
+# Function with parameters and return type:
+fn add(a: i32, b: i32) -> i32 {
+    return a + b
+}
+
+# Call function:
+let result = add(2, 3)
+
+# -------------------------------
+# CONDITIONALS
+# -------------------------------
+if 1 == 1 {
+    print("True")
+} else if 1 > 2 {
+    print("Else if")
+} else {
+    print("False")
+}
+
+# -------------------------------
+# LOOPS
+# -------------------------------
+# While loop:
+let i = 0
+while i < 5 {
+    print(i)
+    i = i + 1
+}
+
+# For loop:
+for i in range(1, 10) {
+    print(i)
+}
+
+# -------------------------------
+# ERROR HANDLING
+# -------------------------------
+# try and on_error blocks:
+try {
+    let x i32 = 10 / 0   # division by zero
+} on_error {
+    print("An error occurred")
+}
+
+# -------------------------------
+# COMMENTS
+# -------------------------------
+# Comments start with #
+# Example:
+# This is a comment
+
+# -------------------------------
+# EXAMPLES COMBINED
+# -------------------------------
+let mut x i32 = 10
+print(x)        # 10
+
+x = x + 5
+print(x)        # 15
+
+x.drop()        # frees memory
+
+fn multiply(a: i32, b: i32) -> i32 {
+    return a * b
+}
+
+let product = multiply(3, 4)
+print(product)  # 12
+
+if product > 10 and product < 20 {
+    print("Big number")
+} else {
+    print("Small number")
+}
+
+while x < 20 {
+    print(x)
+    x = x + 1
+}
+
+for i in range(1, 5) {
+    print(i)
+}
+
+# -------------------------------
+# NOTES
+# -------------------------------
+# - All statements end with a newline (no semicolons)
+# - Variables can be mutable (mut) or immutable
+# - Functions support optional return types
+# - Math follows standard precedence rules
+# - if / else and loops use braces { }
+# - Strings in quotes: "text"
+# - drop() frees memory completely
+# - Type checking at compile time prevents type mismatches
+# - Boolean type: bool (True / False)
+# - Logical operators: and, or, not
+# - Error handling: try { ... } on_error { ... }
