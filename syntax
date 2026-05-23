@@ -1,28 +1,28 @@
 # -----------------------------------------
-# Rubidium Programming Language Syntax[cite: 8]
-# File extension: .rub[cite: 8]
-# Python-style readability + Rust-style static typing and memory safety[cite: 8]
+# Rubidium Programming Language Syntax
+# File extension: .rub
+# Python-style readability + Rust-style static typing and memory safety
 # -----------------------------------------
 
 # -------------------------------
 # VARIABLES & DATA TYPES
 # -------------------------------
-# Declare variables with optional types[cite: 8]:
-# Integer types: i8, i16, i32, i64, i128, i256[cite: 8]
-# Floating types: f4, f8, f16, f32, f64, f128, f256[cite: 8]
-# String: str[cite: 8]
-# Boolean: bool (True / False)[cite: 8]
+# Declare variables with optional types:
+# Integer types: i8, i16, i32, i64, i128, i256
+# Floating types: f4, f8, f16, f32, f64, f128, f256
+# String: str
+# Boolean: bool (True / False)
 
-let x = 10           # type inferred as i64[cite: 8]
-let mut y i32 = 5    # mutable integer[cite: 8]
-let name str = "Rubidium"[cite: 8]
-let f f64 = 3.14[cite: 8]
-let b bool = True    # Boolean type[cite: 8]
+let x = 10           # type inferred as i64
+let mut y i32 = 5    # mutable integer
+let name str = "Rubidium"
+let f f64 = 3.14
+let b bool = True    # Boolean type
 
-# Reassigning mutable variables[cite: 8]:
-y = 15[cite: 8]
-f = 2.718[cite: 8]
-b = False[cite: 8]
+# Reassigning mutable variables:
+y = 15
+f = 2.718
+b = False
 
 # Type Casting (as):
 let large_num i64 = y as i64
@@ -31,25 +31,25 @@ let float_val f64 = 100 as f64
 # -------------------------------
 # TYPE CHECKING
 # -------------------------------
-# Rubidium performs compile-time type checking[cite: 8]:
-# - assigning the wrong type raises a compile-time error[cite: 8]
-# Example (will error)[cite: 8]:
-# let val i32 = 5[cite: 8]
-# val = "hello"      # ❌ type mismatch[cite: 8]
+# Rubidium performs compile-time type checking:
+# - assigning the wrong type raises a compile-time error
+# Example (will error):
+# let val i32 = 5
+# val = "hello"      # type mismatch
 
 # -------------------------------
 # MATH & LOGIC
 # -------------------------------
-# Standard operators: +, -, *, /[cite: 8]
-# Operator precedence (BODMAS) applies[cite: 8]
-let calc1 = 1 + 2 * 3       # equals 7[cite: 8]
-let calc2 = (1 + 2) * 3     # equals 9[cite: 8]
+# Standard operators: +, -, *, /
+# Operator precedence (BODMAS) applies
+let calc1 = 1 + 2 * 3       # equals 7
+let calc2 = (1 + 2) * 3     # equals 9
 
-# Comparison operators: ==, !=, >, <, >=, <=[cite: 8]
-let check bool = calc1 > 5  # True[cite: 8]
+# Comparison operators: ==, !=, >, <, >=, <=
+let check bool = calc1 > 5  # True
 
-# Logical operators: and, or, not[cite: 8]
-let cond bool = True and not False[cite: 8]
+# Logical operators: and, or, not
+let cond bool = True and not False
 
 # -------------------------------
 # STRINGS & BUILT-IN METHODS
@@ -58,18 +58,14 @@ let greeting str = "Hello, "
 let target str = "World!"
 
 # String concatenation (returns a new heap-allocated string)
-let full_msg = greeting.concat(target)  # "Hello, World!"
+let full_msg = greeting.combine(target)  # "Hello, World!"
 let combined = greeting + target        # "Hello, World!"
 
 # String methods
 let length i64 = full_msg.len()         # Returns length of string
-let has_world bool = full_msg.contains("World") # True
+let has_world bool = full_msg.has("World") # True
 let number_str str = "404"
-let num_val i64 = number_str.to_int()   # Converts "404" to 404
-
-# Slicing and Splitting
-let slice_str str = full_msg.slice(0, 5) # "Hello"
-let first_word str = full_msg.split(",") # "Hello"
+let num_val i64 = number_str.to(i32)   # Converts "404" to 404
 
 # -------------------------------
 # DYNAMIC COLLECTIONS (list, index, dict)
@@ -78,7 +74,7 @@ let first_word str = full_msg.split(",") # "Hello"
 
 # 1. Lists (Arrays)
 let my_list list = ["64534", 2.124, "hi"]
-print(my_list(2))             # prints: hi
+print(my_list(3))             # prints: hi
 
 # 2. Indexes (Key-Value pairs with mixed types)
 let my_index index = ["one": "hello", 2: "no", 2.3: 123]
@@ -91,19 +87,20 @@ let my_dict dict = {
 }
 
 # Accessing Nested Collections
-print(my_dict("nested")(1))   # prints: hi (classic chaining)
-print(my_dict(nested(1)))     # prints: hi (bracketless dot syntax)
+print(my_dict(nested(1)))     # prints: hi
 
 # Mutating Collections via .set()
 my_list(2).set("why")
 my_index("one").set("changed")
 my_dict("nested", 1).set(99)
 
+# with lists and dicts the first thing is always 1 not 0 
+
 # -------------------------------
 # PRINT & I/O
 # -------------------------------
-print(x)[cite: 8]
-print("Hello, Rubidium!")[cite: 8]
+print(x)
+print("Hello, Rubidium!")
 
 # Standard Input
 let user_input str = input("Enter your name: ")
@@ -113,13 +110,14 @@ file_write("data.txt", "Saving this to disk!")
 let file_contents str = file_read("data.txt")
 print(file_contents)
 
+# "\n" would cause a newline
+
 # -------------------------------
 # DEEP MEMORY DROPS
 # -------------------------------
-# Drop a variable[cite: 8]:
-# x.drop() frees memory, variable no longer exists[cite: 8]
-# Note: drop() is real and releases memory safely[cite: 8].
-x.drop()[cite: 8]
+# Drop a variable:
+# x.drop() frees memory, variable no longer exists
+x.drop()
 
 # For collections and strings, .drop() recursively frees 
 # all nested boxes, arrays, and keys, preventing leaks!
@@ -129,31 +127,31 @@ my_dict.drop()
 # -------------------------------
 # CONDITIONALS
 # -------------------------------
-if calc1 == 7 {[cite: 8]
-    print("True")[cite: 8]
-} else if calc1 > 10 {[cite: 8]
-    print("Else if")[cite: 8]
-} else {[cite: 8]
-    print("False")[cite: 8]
-}[cite: 8]
+if calc1 == 7 {
+    print("True")
+} else if calc1 > 10 {
+    print("Else if")
+} else {
+    print("False")
+}
 
 # -------------------------------
 # LOOPS & ITERATION
 # -------------------------------
-# While loop[cite: 8]:
+# While loop:
 let mut count = 0
-while count < 5 {[cite: 8]
-    print(count)[cite: 8]
-    count = count + 1[cite: 8]
-}[cite: 8]
+while count < 5 {
+    print(count)
+    count = count + 1
+}
 
-# For loop (Numerical Range)[cite: 8]:
-for i in range(1, 10) {[cite: 8]
+# For loop (Numerical Range):
+for i in range(1, 10) {
     if i == 5 {
         break   # Exits the innermost loop
     }
-    print(i)[cite: 8]
-}[cite: 8]
+    print(i)
+}
 
 # Collection Iteration (for-in loops):
 let items list = [10, 20, 30]
@@ -174,67 +172,67 @@ for key in table {
 # Top-level variables (across ANY imported file) are strictly global.
 let global_counter = 0
 
-# Function with parameters and return type[cite: 8]:
-fn add(a: i32, b: i32) -> i32 {[cite: 8]
+# Function with parameters and return type:
+fn add(a: i32, b: i32) -> i32 {
     # Variables inside functions are local and threaded safely
     let local_var = a + b
-    return local_var[cite: 8]
-}[cite: 8]
+    return local_var
+}
 
-# Call function[cite: 8]:
-let math_result = add(2, 3)[cite: 8]
+# Call function:
+let math_result = add(2, 3)
 
 # -------------------------------
 # ERROR HANDLING
 # -------------------------------
-# try and on_error blocks[cite: 8]:
-try {[cite: 8]
-    let fail i32 = 10 / 0   # division by zero[cite: 8]
-} on_error {[cite: 8]
-    print("An error occurred")[cite: 8]
-}[cite: 8]
+# try and on_error blocks:
+try {
+    let fail i32 = 10 / 0   # division by zero
+} on_error {
+    print("An error occurred")
+}
 
 # -------------------------------
 # CLASSES
 # -------------------------------
-# Classes are like fully self-contained units[cite: 8]
+# Classes are like fully self-contained units
 
-class my_class() {[cite: 8]
-    let mut obj_val i32 = 10[cite: 8]
+class my_class() {
+    let mut obj_val i32 = 10
     
-    fn my_func() {[cite: 8]
-        print("Hello from class!")[cite: 8]
-    }[cite: 8]
-}[cite: 8]
+    fn my_func() {
+        print("Hello from class!")
+    }
+}
 
-# Classes can be instantiated and used like this[cite: 8]:
+# Classes can be instantiated and used like this:
 fn run_class() {
-    let class_one = my_class()[cite: 8]
-    print(class_one.obj_val)[cite: 8]
+    let class_one = my_class()
+    print(class_one.obj_val)
     class_one.obj_val = 99
-    class_one.my_func()[cite: 8]
+    class_one.my_func()
 }
 
 # -------------------------------
 # HARDWARE THREADING
 # -------------------------------
-# You can run code concurrently using real POSIX threading[cite: 8]
+# You can run code concurrently using real POSIX threading
 
-fn task1() {[cite: 8]
-    print("Task 1 Finished")[cite: 8]
-}[cite: 8]
+fn task1() {
+    print("Task 1 Finished")
+}
 
-fn task2() {[cite: 8]
-    print("Task 2 Finished")[cite: 8]
-}[cite: 8]
+fn task2() {
+    print("Task 2 Finished")
+}
 
 fn run_threads() {
-    # thread(function(), thread_id) runs the function asynchronously[cite: 8]
-    thread(task1(), 1)[cite: 8]
-    thread(task2(), 2)[cite: 8]
+    # thread(function(), thread_id) runs the function asynchronously
+    thread(task1(), 1)
+    thread(task2(), 2)
     
-    # Wait for specific thread IDs to return before moving on[cite: 8]
-    thread.wait(1, 2)[cite: 8]
+    # Wait for specific thread IDs to return before moving on
+    thread.wait(1, 2)
 }
 
 # -------------------------------
@@ -251,23 +249,23 @@ import math_tools
 # MAIN ENTRY POINT
 # -------------------------------
 # The compiler strictly looks for main() as the execution entry point.
-fn main() {[cite: 8]
-    print("Welcome to Rubidium!")[cite: 8]
+fn main() {
+    print("Welcome to Rubidium!")
     run_class()
     run_threads()
-}[cite: 8]
+}
 
 # -------------------------------
 # NOTES
 # -------------------------------
-# - All statements end with a newline (no semicolons)[cite: 8]
-# - Variables can be mutable (mut) or immutable[cite: 8]
-# - Functions support optional return types[cite: 8]
-# - Math follows standard precedence rules[cite: 8]
-# - if / else and loops use braces { }[cite: 8]
-# - Strings in quotes: "text"[cite: 8]
-# - drop() frees memory completely[cite: 8]
-# - Type checking at compile time prevents type mismatches[cite: 8]
-# - Boolean type: bool (True / False)[cite: 8]
-# - Logical operators: and, or, not[cite: 8]
-# - Error handling: try { ... } on_error { ... }[cite: 8]
+# - All statements end with a newline (no semicolons)
+# - Variables can be mutable (mut) or immutable
+# - Functions support optional return types
+# - Math follows standard precedence rules
+# - if / else and loops use braces { }
+# - Strings in quotes: "text"
+# - drop() frees memory completely
+# - Type checking at compile time prevents type mismatches
+# - Boolean type: bool (True / False)
+# - Logical operators: and, or, not
+# - Error handling: try { ... } on_error { ... }
