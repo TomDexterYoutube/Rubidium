@@ -20,4 +20,5 @@ fn main() {
     let stuff = thread(test2(), 2)
     thread.wait(1)
     print(stuff)
+    print(1)
 }

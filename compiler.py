@@ -2,46 +2,249 @@ import sys
 import os
 import subprocess
 import tempfile
+import glob
 
 from lexer import tokenize
 from parser import Parser
-from codegen import CodeGen
+from ast import Import, Use
+from codegen import CodeGen, RubidiumTypeError, RubidiumNameError
 
-def compile_file(source_file, output=None):
-    code = open(source_file).read()
+RUNTIME_C = """
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-    tokens = tokenize(code)
-    ast    = Parser(tokens).parse()
+typedef struct { int type; long long i; double f; char* s; void* p; } Box;
 
-    gen     = CodeGen()
-    ir_code = gen.gen(ast)
+void box_drop(Box* b) {
+    if (!b) return;
+    if (b->type == 2 && b->s) free(b->s);
+    if (b->type == 3 && b->p) {
+        int* magic = (int*)b->p;
+        if (magic && *magic == 1) {
+            Box** items = *(Box***)((char*)b->p + sizeof(int));
+            int count = *(int*)((char*)b->p + sizeof(int) + sizeof(Box**));
+            for(int i=0; i<count; i++) box_drop(items[i]);
+            free(items); free(b->p);
+        } else if (magic && *magic == 2) {
+            Box** keys = *(Box***)((char*)b->p + sizeof(int));
+            Box** vals = *(Box***)((char*)b->p + sizeof(int) + sizeof(Box**));
+            int count = *(int*)((char*)b->p + sizeof(int) + 2*sizeof(Box**));
+            for(int i=0; i<count; i++) { box_drop(keys[i]); box_drop(vals[i]); }
+            free(keys); free(vals); free(b->p);
+        } else {
+            free(b->p);
+        }
+    }
+    free(b);
+}
 
-    base        = os.path.splitext(os.path.basename(source_file))[0]
-    output_bin  = output or base
+Box* box_i(long long i) { Box* b=malloc(sizeof(Box)); b->type=0; b->i=i; return b; }
+Box* box_f(double f) { Box* b=malloc(sizeof(Box)); b->type=1; b->f=f; return b; }
+Box* box_s(char* s) { Box* b=malloc(sizeof(Box)); b->type=2; b->s=strdup(s); return b; }
+Box* box_p(void* p) { Box* b=malloc(sizeof(Box)); b->type=3; b->p=p; return b; }
 
-    # Write IR to a temp file
-    with tempfile.NamedTemporaryFile(suffix=".ll", delete=False, mode="w") as f:
-        f.write(ir_code)
-        ir_path = f.name
+long long unbox_i(Box* b) { return b ? b->i : 0; }
+double unbox_f(Box* b) { return b ? b->f : 0.0; }
+char* unbox_s(Box* b) { return (b && b->type==2) ? b->s : ""; }
+void* unbox_p(Box* b) { return (b && b->type==3) ? b->p : NULL; }
 
+typedef struct { int magic; Box** items; int count; int cap; } RList;
+Box* make_list() { RList* l=malloc(sizeof(RList)); l->magic=1; l->count=0; l->cap=8; l->items=malloc(8*sizeof(Box*)); return box_p(l); }
+void list_append(Box* lst, Box* b) { RList* l=lst->p; if(l->count==l->cap){l->cap*=2; l->items=realloc(l->items,l->cap*sizeof(Box*));} l->items[l->count++]=b; }
+Box* list_get(void* col, Box* idx) {
+    RList* l=col; int i=idx->i;
+    if(i>=0 && i<l->count) return l->items[i];
+    return box_i(0);
+}
+
+typedef struct { int magic; Box** keys; Box** vals; int count; int cap; } RDict;
+Box* make_dict() { RDict* d=malloc(sizeof(RDict)); d->magic=2; d->count=0; d->cap=8; d->keys=malloc(8*sizeof(Box*)); d->vals=malloc(8*sizeof(Box*)); return box_p(d); }
+int box_eq(Box* a, Box* b) {
+    if(!a || !b || a->type!=b->type) return 0;
+    if(a->type==0) return a->i==b->i;
+    if(a->type==1) return a->f==b->f;
+    if(a->type==2) return strcmp(a->s,b->s)==0;
+    return a->p==b->p;
+}
+void dict_set(Box* dct, Box* k, Box* v) {
+    RDict* d=dct->p;
+    for(int i=0;i<d->count;i++) if(box_eq(d->keys[i],k)) { 
+        box_drop(d->vals[i]);
+        d->vals[i]=v; 
+        return; 
+    }
+    if(d->count==d->cap){d->cap*=2; d->keys=realloc(d->keys,d->cap*sizeof(Box*)); d->vals=realloc(d->vals,d->cap*sizeof(Box*));}
+    d->keys[d->count]=k; d->vals[d->count]=v; d->count++;
+}
+Box* dict_get(void* col, Box* k) {
+    RDict* d=col;
+    for(int i=0;i<d->count;i++) if(box_eq(d->keys[i],k)) return d->vals[i];
+    return box_i(0);
+}
+
+Box* collection_get(Box* col_box, Box* key) {
+    if (!col_box || col_box->type != 3) return box_i(0);
+    void* col = col_box->p;
+    int* magic = (int*)col;
+    if (*magic == 1) return list_get(col, key);
+    if (*magic == 2) return dict_get(col, key);
+    return box_i(0);
+}
+
+void collection_set(Box* col_box, Box* key, Box* val) {
+    if (!col_box || col_box->type != 3) return;
+    void* col = col_box->p;
+    int* magic = (int*)col;
+    if (*magic == 1) {
+        RList* l = col;
+        int i = key->i;
+        if(i >= 0 && i < l->count) {
+            box_drop(l->items[i]);
+            l->items[i] = val;
+        } else if (i == l->count) {
+            list_append(col_box, val);
+        }
+    } else if (*magic == 2) {
+        dict_set(col_box, key, val);
+    }
+}
+
+int collection_len(Box* col_box) {
+    if (!col_box || col_box->type != 3) return 0;
+    void* col = col_box->p;
+    int* magic = (int*)col;
+    if (*magic == 1) return ((RList*)col)->count;
+    if (*magic == 2) return ((RDict*)col)->count;
+    return 0;
+}
+
+Box* collection_get_at(Box* col_box, int idx) {
+    if (!col_box || col_box->type != 3) return box_i(0);
+    void* col = col_box->p;
+    int* magic = (int*)col;
+    if (*magic == 1) {
+        RList* l = col;
+        if(idx>=0 && idx<l->count) return l->items[idx];
+    }
+    if (*magic == 2) {
+        RDict* d = col;
+        if(idx>=0 && idx<d->count) return d->keys[idx];
+    }
+    return box_i(0);
+}
+
+void print_boxed(Box* b) {
+    if(!b) { printf("null\\n"); return; }
+    if(b->type==0) printf("%lld\\n", b->i);
+    else if(b->type==1) printf("%g\\n", b->f);
+    else if(b->type==2) printf("%s\\n", b->s);
+    else {
+        int* magic = (int*)(b->p);
+        if(magic && *magic==1) printf("<list>\\n");
+        else if(magic && *magic==2) printf("<dict>\\n");
+        else printf("<object>\\n");
+    }
+}
+"""
+
+def parse_file(filepath, parsed_files, combined_ast):
+    abs_path = os.path.abspath(filepath)
+    if abs_path in parsed_files:
+        return
+    parsed_files.add(abs_path)
+    
     try:
-        result = subprocess.run(
-            ["clang", ir_path, "-o", output_bin, "-O2"],
-            capture_output=True, text=True
-        )
-    finally:
-        os.unlink(ir_path)
-
-    if result.returncode != 0:
-        print("✖ Compilation failed:")
-        print(result.stderr)
+        with open(filepath, "r") as f:
+            code = f.read()
+    except FileNotFoundError:
+        print(f"✖ Error: Could not find imported file '{filepath}'")
         sys.exit(1)
+        
+    tokens = tokenize(code)
+    ast = Parser(tokens).parse()
+    
+    for node in ast:
+        if isinstance(node, Import):
+            # 'import' is for external user files - resolve and parse them
+            mod_file = node.module_name.replace(".", os.sep) + ".rub"
+            base_dir = os.path.dirname(filepath)
+            mod_path = os.path.join(base_dir, mod_file) if base_dir else mod_file
+            parse_file(mod_path, parsed_files, combined_ast)
+        elif isinstance(node, Use):
+            # 'use' is for built-in modules only - do not search the disk
+            continue
+            
+    combined_ast.extend(ast)
 
-    print(f"✔ Compiled → ./{output_bin}")
+def compile_files(source_files, output=None):
+    try:
+        parsed_files = set()
+        combined_ast = []
+        
+        for source_file in source_files:
+            parse_file(source_file, parsed_files, combined_ast)
+
+        gen = CodeGen()
+        ir_code = gen.gen(combined_ast)
+
+        if output: output_bin = output
+        else: output_bin = os.path.splitext(os.path.basename(source_files[0]))[0]
+
+        with tempfile.NamedTemporaryFile(suffix=".ll", delete=False, mode="w") as f_ll:
+            f_ll.write(ir_code)
+            ir_path = f_ll.name
+            
+        with tempfile.NamedTemporaryFile(suffix=".c", delete=False, mode="w") as f_c:
+            f_c.write(RUNTIME_C)
+            c_path = f_c.name
+
+        try:
+            result = subprocess.run(
+                ["clang", ir_path, c_path, "-o", output_bin, "-O2", "-pthread"],
+                capture_output=True, text=True
+            )
+        finally:
+            os.unlink(ir_path)
+            os.unlink(c_path)
+
+        if result.returncode != 0:
+            print("✖ Compilation failed:")
+            print(result.stderr)
+            sys.exit(1)
+
+        print(f"✔ Compiled → ./{output_bin}")
+    
+    except SyntaxError as e:
+        print(f"✖ Syntax Error: {e}")
+        sys.exit(1)
+    except RubidiumTypeError as e:
+        print(f"✖ Type Error: {e}")
+        sys.exit(1)
+    except RubidiumNameError as e:
+        print(f"✖ Name Error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"✖ Compilation Error: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python compiler.py <file.rub> [output]")
+        print("Usage: python compiler.py <file1.rub> [file2.rub ...] [output]")
         sys.exit(1)
-    output = sys.argv[2] if len(sys.argv) > 2 else None
-    compile_file(sys.argv[1], output)
+    
+    if not sys.argv[-1].endswith('.rub'):
+        output = sys.argv[-1]
+        source_files = sys.argv[1:-1]
+    else:
+        output = None
+        source_files = sys.argv[1:]
+    
+    expanded_files = []
+    for pattern in source_files:
+        if '*' in pattern or '?' in pattern or '[' in pattern:
+            expanded_files.extend(glob.glob(pattern))
+        else:
+            expanded_files.append(pattern)
+    
+    compile_files(expanded_files, output)

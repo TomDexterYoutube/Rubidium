@@ -6,6 +6,9 @@ class Bool:
     def __init__(self, value):
         self.value = value
 
+class None_:
+    pass
+
 class Str:
     def __init__(self, value):
         self.value = value
@@ -13,6 +16,14 @@ class Str:
 class Var:
     def __init__(self, name):
         self.name = name
+
+class ListExpr:
+    def __init__(self, elements):
+        self.elements = elements
+
+class DictExpr:
+    def __init__(self, pairs):
+        self.pairs = pairs
 
 class BinOp:
     def __init__(self, left, op, right):
@@ -44,7 +55,6 @@ class Assign:
         self.value = value
 
 class FieldAssign:
-    """obj.field = value"""
     def __init__(self, obj, field, value):
         self.obj = obj
         self.field = field
@@ -87,16 +97,16 @@ class Try:
         self.error_body = error_body
 
 class Drop:
-    """x.drop() — marks variable as dropped (no-op at runtime, type-level)"""
     def __init__(self, name):
         self.name = name
 
 class For:
-    def __init__(self, var, start, end, body):
+    def __init__(self, var, start, end, body, iterable=None):
         self.var = var
         self.start = start
         self.end = end
         self.body = body
+        self.iterable = iterable
 
 class MethodCall:
     def __init__(self, obj, method, args):
@@ -105,20 +115,17 @@ class MethodCall:
         self.args = args
 
 class FieldAccess:
-    """obj.field  (as an expression — not a method call)"""
     def __init__(self, obj, field):
         self.obj = obj
         self.field = field
 
 class ClassDef:
-    """class Foo() { let mut x i32 = 3 }"""
-    def __init__(self, name, fields):
-        # fields: list of VarDecl
+    def __init__(self, name, fields, methods=None):
         self.name = name
         self.fields = fields
+        self.methods = methods if methods else []
 
 class ClassInstantiate:
-    """let stuff = my_class()"""
     def __init__(self, class_name):
         self.class_name = class_name
 
@@ -138,3 +145,24 @@ class Import:
 class Use:
     def __init__(self, module_name):
         self.module_name = module_name
+
+class TypeCast:
+    def __init__(self, expr, target_type):
+        self.expr = expr
+        self.target_type = target_type
+
+class Break:
+    pass
+
+class Input:
+    def __init__(self, prompt=None):
+        self.prompt = prompt
+
+class FileRead:
+    def __init__(self, path_expr):
+        self.path_expr = path_expr
+
+class FileWrite:
+    def __init__(self, path_expr, content_expr):
+        self.path_expr = path_expr
+        self.content_expr = content_expr
