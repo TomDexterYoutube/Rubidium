@@ -22,6 +22,9 @@ declare void @print_boxed(%Box*)
 declare i32 @collection_len(%Box*)
 declare %Box* @collection_get_at(%Box*, i32)
 declare void @box_drop(%Box*)
+declare i64 @time(i64*)
+declare i32 @rand()
+declare void @srand(i32)
 '''
 
 class RubidiumTypeError(Exception): pass
@@ -34,10 +37,8 @@ class CodeGen:
         self.str_count   = 0
         self.tmp_count   = 0
         self.label_count = 0
-        
         self.global_vars  = {}
         self.local_vars   = {}
-        
         self.mutable_vars = set()
         self.dropped_vars = set()
         self.class_defs   = {}
@@ -99,7 +100,7 @@ class CodeGen:
         raise RubidiumNameError(f"Undefined variable '{name}'")
 
     def class_ir_type(self, class_name): return f"%class_{class_name}"
-    
+
     def emit_class_type(self, cls):
         field_types = ", ".join(self.rubi_type_to_ir(f.vtype) for f in cls.fields)
         if not field_types: field_types = "i8"
@@ -147,8 +148,17 @@ class CodeGen:
         ]
 
         self._emit_input_line_helper()
-        top_init = [s for s in stmts if not isinstance(s, (FnDef, ClassDef, Import, Use))]
         
+        # Inject RNG seed
+        self.fn_lines += [
+            "define void @_rubidium_init_rng() {",
+            "  %t_seed = call i64 @time(i64* null)",
+            "  %t_seed_i32 = trunc i64 %t_seed to i32",
+            "  call void @srand(i32 %t_seed_i32)",
+            "  ret void", "}", ""
+        ]
+        
+        top_init = [s for s in stmts if not isinstance(s, (FnDef, ClassDef, Import, Use))]
         self.cur_fn = None
         self.local_vars = {}
         self.emit_fn(FnDef("_rubidium_init", [], None, top_init))
@@ -169,64 +179,45 @@ class CodeGen:
         out += self.global_decls + [""] + self.fn_lines
         return "\n".join(out)
 
-    def _emit_input_line_helper(self):
-        buf_size = 4096
-        fmt_lbl, flen = self.intern_str("%4095s")
-        self.fn_lines += [
-            f"define i8* @_rubidium_input_line() {{", "entry:",
-            f"  %buf = call i8* @malloc(i64 {buf_size})",
-            f"  %fmt = getelementptr [{flen} x i8], [{flen} x i8]* {fmt_lbl}, i64 0, i64 0",
-            f"  call i32 (i8*, ...) @scanf(i8* %fmt, i8* %buf)",
-            f"  ret i8* %buf", "}", ""
-        ]
+    def _inject_init_call(self):
+        patched = []; in_main = False; injected = False
+        for line in self.fn_lines:
+            patched.append(line)
+            if line.strip() == "define i32 @main() {": in_main = True
+            elif in_main and not injected and line.strip() == "entry:":
+                patched.append("  call void @_rubidium_init_rng()")
+                patched.append("  call i64 @_rubidium_init()")
+                injected = True
+        self.fn_lines = patched
 
     def _infer_type(self, node):
-            if isinstance(node, Number): return "double" if isinstance(node.value, float) else "i64"
-            if isinstance(node, Bool): return "i1"
-            if isinstance(node, None_): return "i64"
-            if isinstance(node, Str): return "i8*"
-            if isinstance(node, (ListExpr, DictExpr)): return "%Box*"
-            if isinstance(node, (Input, FileRead)): return "i8*"
+        if isinstance(node, Number): return "double" if isinstance(node.value, float) else "i64"
+        if isinstance(node, Bool): return "i1"
+        if isinstance(node, None_): return "i64"
+        if isinstance(node, Str): return "i8*"
+        if isinstance(node, (ListExpr, DictExpr)): return "%Box*"
+        if isinstance(node, (Input, FileRead)): return "i8*"
         
-            # FIX: Robust MethodCall type inference
-            if isinstance(node, MethodCall):
-                # Resolve object name
-                obj_name = node.obj.name if hasattr(node.obj, 'name') else node.obj
-            
-                # Check if this object is an instance of a class we know
-                if obj_name in self.instances:
-                    class_name = self.instances[obj_name]
-                    mangled = self.method_ir_name(class_name, node.method)
-                
-                    # Check our function registry for the actual return type
-                    if mangled in self.functions:
-                        fn = self.functions[mangled]
-                        # Return the real type found in the function definition
-                        return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
-            
-                # Hardcoded fallbacks for built-ins if not in registry
-                if node.method in ("len", "to_int"): return "i64"
-                if node.method in ("contains",): return "i1"
-                if node.method in ("slice", "split", "concat"): return "i8*"
-            
-                # If we don't know the method, we MUST NOT guess i64.
-                # Throw an error so you can see exactly which method is missing types.
-                raise RubidiumNameError(f"Cannot infer type for method call '{node.method}' on object '{obj_name}'")
-
-            if isinstance(node, FnCall):
-                # Same logic for standard functions
-                if isinstance(node.name, str) and node.name in self.functions:
-                    fn = self.functions[node.name]
+        if isinstance(node, MethodCall):
+            obj_name = node.obj.name if hasattr(node.obj, 'name') else node.obj
+            if obj_name in self.instances:
+                class_name = self.instances[obj_name]
+                mangled = self.method_ir_name(class_name, node.method)
+                if mangled in self.functions:
+                    fn = self.functions[mangled]
                     return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
-                return "i64"
+            
+            if node.method in ("len", "to_int"): return "i64"
+            if node.method in ("contains",): return "i1"
+            if node.method in ("slice", "split", "concat"): return "i8*"
+            raise RubidiumNameError(f"Cannot infer type for method call '{node.method}' on object '{obj_name}'")
 
-            if isinstance(node, TypeCast): return self.rubi_type_to_ir(node.target_type)
-            if isinstance(node, BinOp):
-                lt, rt = self._infer_type(node.left), self._infer_type(node.right)
-                if lt == "i8*" and rt == "i8*" and node.op == "+": return "i8*"
-                if lt in ("float","double") or rt in ("float","double"): return "double"
-                return "i64"
+        if isinstance(node, FnCall):
+            if isinstance(node.name, str) and node.name in self.functions:
+                fn = self.functions[node.name]
+                return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
             return "i64"
+        return "i64"
 
     def collect_globals(self, stmts):
         for s in stmts: self._collect_global(s)
