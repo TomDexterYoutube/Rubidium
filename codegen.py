@@ -181,31 +181,52 @@ class CodeGen:
         ]
 
     def _infer_type(self, node):
-        if isinstance(node, Number): return "double" if isinstance(node.value, float) else "i64"
-        if isinstance(node, Bool): return "i1"
-        if isinstance(node, None_): return "i64"
-        if isinstance(node, Str): return "i8*"
-        if isinstance(node, (ListExpr, DictExpr)): return "%Box*"
-        if isinstance(node, (Input, FileRead)): return "i8*"
-        if isinstance(node, FnCall):
-            if isinstance(node.name, str) and node.name in self.functions:
-                fn = self.functions[node.name]
-                return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
-            if not isinstance(node.name, str) or (isinstance(node.name, str) and node.name in self.global_vars):
-                return "%Box*"
+            if isinstance(node, Number): return "double" if isinstance(node.value, float) else "i64"
+            if isinstance(node, Bool): return "i1"
+            if isinstance(node, None_): return "i64"
+            if isinstance(node, Str): return "i8*"
+            if isinstance(node, (ListExpr, DictExpr)): return "%Box*"
+            if isinstance(node, (Input, FileRead)): return "i8*"
+        
+            # FIX: Robust MethodCall type inference
+            if isinstance(node, MethodCall):
+                # Resolve object name
+                obj_name = node.obj.name if hasattr(node.obj, 'name') else node.obj
+            
+                # Check if this object is an instance of a class we know
+                if obj_name in self.instances:
+                    class_name = self.instances[obj_name]
+                    mangled = self.method_ir_name(class_name, node.method)
+                
+                    # Check our function registry for the actual return type
+                    if mangled in self.functions:
+                        fn = self.functions[mangled]
+                        # Return the real type found in the function definition
+                        return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
+            
+                # Hardcoded fallbacks for built-ins if not in registry
+                if node.method in ("len", "to_int"): return "i64"
+                if node.method in ("contains",): return "i1"
+                if node.method in ("slice", "split", "concat"): return "i8*"
+            
+                # If we don't know the method, we MUST NOT guess i64.
+                # Throw an error so you can see exactly which method is missing types.
+                raise RubidiumNameError(f"Cannot infer type for method call '{node.method}' on object '{obj_name}'")
+
+            if isinstance(node, FnCall):
+                # Same logic for standard functions
+                if isinstance(node.name, str) and node.name in self.functions:
+                    fn = self.functions[node.name]
+                    return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
+                return "i64"
+
+            if isinstance(node, TypeCast): return self.rubi_type_to_ir(node.target_type)
+            if isinstance(node, BinOp):
+                lt, rt = self._infer_type(node.left), self._infer_type(node.right)
+                if lt == "i8*" and rt == "i8*" and node.op == "+": return "i8*"
+                if lt in ("float","double") or rt in ("float","double"): return "double"
+                return "i64"
             return "i64"
-        if isinstance(node, MethodCall):
-            if node.method in ("len", "to_int"): return "i64"
-            if node.method in ("contains",): return "i1"
-            if node.method in ("slice", "split", "concat"): return "i8*"
-            return "i64"
-        if isinstance(node, TypeCast): return self.rubi_type_to_ir(node.target_type)
-        if isinstance(node, BinOp):
-            lt, rt = self._infer_type(node.left), self._infer_type(node.right)
-            if lt == "i8*" and rt == "i8*" and node.op == "+": return "i8*"
-            if lt in ("float","double") or rt in ("float","double"): return "double"
-            return "i64"
-        return "i64"
 
     def collect_globals(self, stmts):
         for s in stmts: self._collect_global(s)
@@ -800,36 +821,54 @@ class CodeGen:
         return tmp, ret_t
 
     def emit_method_call_expr(self, node):
-        obj_name = node.obj
-        if obj_name in self.instances:
-            class_name = self.instances[obj_name]
-            mangled    = self.method_ir_name(class_name, node.method)
-            if mangled in self.functions:
-                struct_t = self.class_ir_type(class_name)
-                ptr_str, _ = self.get_var_ptr(obj_name)
-                inst_ptr = self.new_tmp()
-                self.emit(f"  {inst_ptr} = load {struct_t}*, {struct_t}** {ptr_str}")
-                args_ir = [f"{struct_t}* {inst_ptr}"]
-                fn = self.functions[mangled]
-                for i, (a) in enumerate(node.args):
-                    v, t = self.emit_expr(a)
-                    if i + 1 < len(fn.params):
-                        expected_t = self.rubi_type_to_ir(fn.params[i+1][1])
-                        v = self.coerce(v, t, expected_t); args_ir.append(f"{expected_t} {v}")
-                    else: args_ir.append(f"{t} {v}")
-                ret_t = self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
-                tmp = self.new_tmp()
-                if ret_t == "void":
-                    self.emit(f"  call void @{mangled}({', '.join(args_ir)})")
-                    return "0", "i64"
-                self.emit(f"  {tmp} = call {ret_t} @{mangled}({', '.join(args_ir)})")
-                return tmp, ret_t
+            # FIX: Extract the name if node.obj is an AST Var object
+            # If node.obj is already a string, keep it as is.
+            obj_name = node.obj.name if hasattr(node.obj, 'name') else node.obj
+        
+            # Now proceed with the lookup using the actual string name
+            if obj_name in self.instances:
+                class_name = self.instances[obj_name]
+                mangled = self.method_ir_name(class_name, node.method)
+            
+                if mangled in self.functions:
+                    # ... (rest of your existing logic remains exactly the same)
+                    fn = self.functions[mangled]
+                    struct_t = self.class_ir_type(class_name)
+                    ptr_str, _ = self.get_var_ptr(obj_name)
+                
+                    inst_ptr = self.new_tmp()
+                    self.emit(f"  {inst_ptr} = load {struct_t}*, {struct_t}** {ptr_str}")
+                
+                    args_ir = [f"{struct_t}* {inst_ptr}"]
+                    for i, arg_node in enumerate(node.args):
+                        v, t = self.emit_expr(arg_node)
+                        if i + 1 < len(fn.params):
+                            expected_t = self.rubi_type_to_ir(fn.params[i + 1][1])
+                            v = self.coerce(v, t, expected_t)
+                            args_ir.append(f"{expected_t} {v}")
+                        else:
+                            args_ir.append(f"{t} {v}")
+                
+                    ret_t = self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
+                    tmp = self.new_tmp()
+                    if ret_t == "void":
+                        self.emit(f"  call void @{mangled}({', '.join(args_ir)})")
+                        return "0", "i64"
+                
+                    self.emit(f"  {tmp} = call {ret_t} @{mangled}({', '.join(args_ir)})")
+                    return tmp, ret_t
+            
+                raise RubidiumNameError(f"Class '{class_name}' has no method '{node.method}'")
 
-        try:
-            obj_val, obj_t = self.emit_expr(Var(obj_name))
-            if obj_t == "i8*": return self.emit_string_method(obj_val, node.method, node.args)
-        except RubidiumNameError: pass
-        return "0", "i64"
+            # 2. String Method fallback
+            try:
+                obj_val, obj_t = self.emit_expr(Var(obj_name))
+                if obj_t == "i8*":
+                    return self.emit_string_method(obj_val, node.method, node.args)
+            except RubidiumNameError:
+                pass
+
+            raise RubidiumNameError(f"Could not resolve method call '{node.method}' on '{obj_name}'")
 
     def emit_string_method(self, obj_val, method, args):
         if method == "len":
