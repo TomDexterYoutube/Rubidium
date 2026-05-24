@@ -48,8 +48,8 @@ name.drop()
 
 ```ruby
 let my_list list = [1, "two", 3.14]
-my_list(0).set(99) # Mutation
-print(my_list(0))
+my_list(1).set(99) # Mutation
+print(my_list(1))
 
 ```
 
