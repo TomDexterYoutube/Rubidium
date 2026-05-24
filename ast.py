@@ -64,6 +64,10 @@ class Print:
     def __init__(self, value):
         self.value = value
 
+class Println:
+    def __init__(self, value):
+        self.value = value
+
 class If:
     def __init__(self, cond, then_body, else_body):
         self.cond = cond

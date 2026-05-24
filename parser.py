@@ -129,6 +129,7 @@ class Parser:
         if t is None: return []
         if   t[0] == "LET":      return [self.var_decl()]
         elif t[0] == "PRINT":    return [self.print_stmt()]
+        elif t[0] == "PRINTLN":  return [self.println_stmt()]
         elif t[0] == "IF":       return [self.if_stmt()]
         elif t[0] == "WHILE":    return [self.while_stmt()]
         elif t[0] == "FOR":      return [self.for_stmt()]
@@ -146,7 +147,10 @@ class Parser:
         mut = bool(self.match("MUT"))
         name = self.match("IDENT")
         vtype = None
-        if self.peek() and self.peek()[0] == "TYPE":
+        if self.peek() and self.peek()[0] == "COLON":
+            self.match("COLON")
+            vtype = self.match("TYPE")
+        elif self.peek() and self.peek()[0] == "TYPE":
             vtype = self.match("TYPE")
         self.match("OP")
         value = self.expr()
@@ -158,6 +162,13 @@ class Parser:
         val = self.expr()
         self.match("RPAREN")
         return Print(val)
+
+    def println_stmt(self):
+        self.match("PRINTLN")
+        self.match("LPAREN")
+        val = self.expr()
+        self.match("RPAREN")
+        return Println(val)
 
     def if_stmt(self):
         self.match("IF")
@@ -204,7 +215,12 @@ class Parser:
     def try_stmt(self):
         self.match("TRY")
         self.match("LBRACE"); try_body = self.block(); self.match("RBRACE")
-        self.match("ON_ERROR")
+        # Accept both `error` (as IDENT) and `on_error` as the catch keyword
+        tok = self.peek()
+        if tok and tok[0] == "ON_ERROR":
+            self.match("ON_ERROR")
+        elif tok and tok[0] == "IDENT" and tok[1] == "error":
+            self.advance()  # consume `error`
         self.match("LBRACE"); err_body = self.block(); self.match("RBRACE")
         return Try(try_body, err_body)
 
@@ -230,6 +246,10 @@ class Parser:
 
         # Handle Drop intercept
         res = self.parse_identifier_chain(name)
+        # Handle field assignment: p.name = value
+        if isinstance(res, FieldAccess) and self.peek() and self.peek()[0] == "OP" and self.peek()[1] == "=":
+            self.match("OP")
+            return FieldAssign(res.obj, res.field, self.expr())
         if isinstance(res, FieldAccess) and res.field == "drop":
             return Drop(res.obj.name)
         if isinstance(res, MethodCall) and res.method == "drop":
@@ -323,11 +343,30 @@ class Parser:
             if tok[1] == "None": return None_()
             return Bool(tok[1] == "True")
         if tok[0] == "STRING":
-            self.advance(); return Str(tok[1][1:-1])
+            self.advance()
+            res = Str(tok[1][1:-1])
+            # Allow method chaining on string literals: "foo".len(), "foo".combine(...)
+            while self.peek() and self.peek()[0] == "DOT":
+                self.match("DOT")
+                attr = self.match("IDENT")
+                if self.peek() and self.peek()[0] == "LPAREN":
+                    self.match("LPAREN")
+                    args = []
+                    while self.peek() and self.peek()[0] != "RPAREN":
+                        args.append(self.expr())
+                        if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
+                    self.match("RPAREN")
+                    res = MethodCall(res, attr, args)
+                else:
+                    res = FieldAccess(res, attr)
+            return res
         if tok[0] == "NOT":
             self.advance(); return UnaryOp("not", self.factor())
         if tok[0] == "LPAREN":
             self.advance(); e = self.expr(); self.match("RPAREN"); return e
+        # TYPE tokens used as arguments (e.g. "404".to(i32) — i32 appears as TYPE token)
+        if tok[0] == "TYPE":
+            self.advance(); return Var(tok[1])
 
         if tok[0] == "IDENT":
             self.advance()

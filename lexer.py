@@ -16,6 +16,7 @@ TOKEN_SPEC = [
     ("IN",       r"in\b"),
     ("BREAK",    r"break\b"),
     ("RETURN",   r"return\b"),
+    ("PRINTLN",  r"println\b"),
     ("PRINT",    r"print\b"),
     ("RANGE",    r"range\b"),
     ("TRY",      r"try\b"),

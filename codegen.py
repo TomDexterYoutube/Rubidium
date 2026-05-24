@@ -14,6 +14,7 @@ declare i8* @unbox_s(%Box*)
 declare i8* @unbox_p(%Box*)
 declare %Box* @make_list()
 declare void @list_append(%Box*, %Box*)
+declare void @list_swap(%Box*, i32, i32)
 declare %Box* @make_dict()
 declare void @dict_set(%Box*, %Box*, %Box*)
 declare %Box* @collection_get(%Box*, %Box*)
@@ -25,6 +26,8 @@ declare void @box_drop(%Box*)
 declare i64 @time(i64*)
 declare i32 @rand()
 declare void @srand(i32)
+declare i32 @usleep(i32)
+declare i32 @sleep(i32)
 '''
 
 class RubidiumTypeError(Exception): pass
@@ -253,9 +256,14 @@ class CodeGen:
                     fn = self.functions[mangled]
                     return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
             
-            if node.method in ("len", "to_int"): return "i64"
-            if node.method in ("contains",): return "i1"
+            if node.method in ("len", "to_int", "to"): return "i64"
+            if node.method in ("contains", "has"): return "i1"
             if node.method in ("slice", "split", "concat", "combine"): return "i8*"
+            # Built-in module methods
+            if obj_name == "time": return "i64"
+            if obj_name == "random":
+                if node.method == "choice": return "%Box*"
+                return "i64"  # shuffle returns void/0
             
             raise RubidiumNameError(f"Cannot infer type for method call '{node.method}' on object '{obj_name}'")
 
@@ -340,11 +348,15 @@ class CodeGen:
         
         struct_t, ret_ir = self.class_ir_type(class_name), (self.rubi_type_to_ir(mfn.ret_type) if mfn.ret_type else "i64")
         param_str = ", ".join([f"{struct_t}* %param___self"] + [f"{self.rubi_type_to_ir(pt)} %param_{pn}" for pn, pt in mfn.params[1:]])
-        self.emit(f"define {ret_ir} @{mfn.name}({param_str}) {{")
+        self.emit(f"define {ret_ir} @{mfn.name}({param_str}) {{"  )
         self.emit("entry:")
         
-        self.emit(f"  %self_ptr = alloca {struct_t}*")
-        self.emit(f"  store {struct_t}* %param___self, {struct_t}** %self_ptr")
+        # Use ptr___self naming to match get_var_ptr convention for local_vars
+        self.emit(f"  %ptr___self = alloca {struct_t}*")
+        self.emit(f"  store {struct_t}* %param___self, {struct_t}** %ptr___self")
+        # Register __self so field access (Var("__self")) works inside method bodies
+        self.local_vars["__self"] = f"{struct_t}*"
+        self.instances["__self"] = class_name
         for pn, pt in mfn.params[1:]:
             ir_t = self.rubi_type_to_ir(pt)
             self.local_vars[pn] = ir_t
@@ -430,6 +442,7 @@ class CodeGen:
                 
         elif isinstance(node, FieldAssign): self.emit_field_assign(node)
         elif isinstance(node, Print): self.emit_print(node.value)
+        elif isinstance(node, Println): self.emit_println(node.value)
         elif isinstance(node, If): self.emit_if(node)
         elif isinstance(node, While): self.emit_while(node)
         elif isinstance(node, For): self.emit_for(node)
@@ -585,6 +598,37 @@ class CodeGen:
             self.emit(f'  call i32 @fflush(i8* null)')
         elif val_t == "i8*":
             self.emit(f'  call i32 @puts(i8* {val})')
+            self.emit(f'  call i32 @fflush(i8* null)')
+
+    def emit_println(self, value):
+        # println prints without newline; subsequent calls overwrite same line via \r
+        val, val_t = self.emit_expr(value)
+        if val_t in ("i64","i32","i16","i8","i1"):
+            fmt, flen = self.intern_str("\r%lld")
+            ptr = self.new_tmp()
+            self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
+            cv = self.coerce(val, val_t, "i64")
+            self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, i64 {cv})')
+            self.emit(f'  call i32 @fflush(i8* null)')
+        elif val_t in ("float","double"):
+            fmt, flen = self.intern_str("\r%g")
+            ptr = self.new_tmp()
+            self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
+            dv = self.coerce(val, val_t, "double")
+            self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, double {dv})')
+            self.emit(f'  call i32 @fflush(i8* null)')
+        elif val_t == "i8*":
+            fmt, flen = self.intern_str("\r%s")
+            ptr = self.new_tmp()
+            self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
+            self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, i8* {val})')
+            self.emit(f'  call i32 @fflush(i8* null)')
+        elif val_t == "%Box*":
+            # Box printing for println — use printf with \r instead of puts
+            fmt, flen = self.intern_str("\r<value>")
+            ptr = self.new_tmp()
+            self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
+            self.emit(f'  call i32 @printf(i8* {ptr})')
             self.emit(f'  call i32 @fflush(i8* null)')
 
     def to_bool(self, val, t):
@@ -840,7 +884,47 @@ class CodeGen:
         if node.name == "input":
             return self.emit_expr(Input(node.args[0] if node.args else None))
 
-        # 2. PRIORITY 2: Threading System Calls
+        if node.name == "random" and len(node.args) >= 2:
+            # random(min, max, type) — generate random number in [min, max]
+            # type arg (3rd) is optional and guides float vs int output
+            min_v, min_t = self.emit_expr(node.args[0])
+            max_v, max_t = self.emit_expr(node.args[1])
+            type_name = ""
+            if len(node.args) >= 3 and isinstance(node.args[2], Var):
+                type_name = node.args[2].name
+            is_float = type_name.startswith("f") or min_t in ("float","double") or max_t in ("float","double")
+            if is_float:
+                # (rand() / RAND_MAX) * (max - min) + min
+                r_raw = self.new_tmp(); r_f = self.new_tmp()
+                rmax_f = self.new_tmp(); ratio = self.new_tmp()
+                range_v = self.new_tmp(); result = self.new_tmp()
+                self.emit(f"  {r_raw} = call i32 @rand()")
+                self.emit(f"  {r_f} = sitofp i32 {r_raw} to double")
+                self.emit(f"  {rmax_f} = sitofp i32 2147483647 to double")
+                self.emit(f"  {ratio} = fdiv double {r_f}, {rmax_f}")
+                mn = self.coerce(min_v, min_t, "double")
+                mx = self.coerce(max_v, max_t, "double")
+                self.emit(f"  {range_v} = fsub double {mx}, {mn}")
+                self.emit(f"  {result} = fmul double {ratio}, {range_v}")
+                final = self.new_tmp()
+                self.emit(f"  {final} = fadd double {result}, {mn}")
+                return final, "double"
+            else:
+                # rand() % (max - min + 1) + min
+                mn = self.coerce(min_v, min_t, "i64")
+                mx = self.coerce(max_v, max_t, "i64")
+                r_raw = self.new_tmp(); r_i64 = self.new_tmp()
+                range_v = self.new_tmp(); range1 = self.new_tmp()
+                rem = self.new_tmp(); result = self.new_tmp()
+                self.emit(f"  {r_raw} = call i32 @rand()")
+                self.emit(f"  {r_i64} = sext i32 {r_raw} to i64")
+                self.emit(f"  {range_v} = sub i64 {mx}, {mn}")
+                self.emit(f"  {range1} = add i64 {range_v}, 1")
+                self.emit(f"  {rem} = srem i64 {r_i64}, {range1}")
+                self.emit(f"  {result} = add i64 {rem}, {mn}")
+                return result, "i64"
+
+
         if node.name == "thread" and len(node.args) == 2:
             func_call_node = node.args[0]
             tid_v, tid_t   = self.emit_expr(node.args[1])
@@ -896,22 +980,24 @@ class CodeGen:
             for a in node.args:
                 v, t = self.emit_expr(a); args_ir.append(f"{t} {v}")
             tmp = self.new_tmp()
-            if self.functions[target_name].ret_type is None:
-                 self.emit(f"  call void @{target_name}({', '.join(args_ir)})")
-                 return "0", "i64"
-            self.emit(f"  {tmp} = call i64 @{target_name}({', '.join(args_ir)})")
-            return tmp, "i64"
+            fn_ret = self.functions[target_name].ret_type
+            ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else "i64"
+            self.emit(f"  {tmp} = call {ret_ir} @{target_name}({', '.join(args_ir)})")
+            return tmp, ret_ir
 
         # 4. PRIORITY 4: Dynamic Collection Access
         # Only reach here if it's NOT a function, NOT a built-in
         if (node.name in self.local_vars or node.name in self.global_vars):
             col_v, col_t = self.emit_expr(Var(node.name))
-            idx_v, idx_t = self.emit_expr(node.args[0])
             col_b = self.coerce_to_box(col_v, col_t)
-            idx_b = self.coerce_to_box(idx_v, idx_t)
-            res = self.new_tmp()
-            self.emit(f"  {res} = call %Box* @collection_get(%Box* {col_b}, %Box* {idx_b})")
-            return res, "%Box*"
+            # Chain multiple get calls for nested access: col("key", 2) -> col["key"][2]
+            for arg in node.args:
+                idx_v, idx_t = self.emit_expr(arg)
+                idx_b = self.coerce_to_box(idx_v, idx_t)
+                res = self.new_tmp()
+                self.emit(f"  {res} = call %Box* @collection_get(%Box* {col_b}, %Box* {idx_b})")
+                col_b = res
+            return col_b, "%Box*"
 
         raise RubidiumNameError(f"Undefined function or variable: {node.name}")
 
@@ -923,6 +1009,58 @@ class CodeGen:
         # This bypasses the class method logic entirely
         if node.method == "set" and isinstance(node.obj, FnCall):
             return self.emit_collection_set(node)
+
+        # 2b. Handle built-in module method calls: time.sleep, random.shuffle, random.choice
+        if obj_name == "time" and node.method == "sleep":
+            secs_v, secs_t = self.emit_expr(node.args[0])
+            secs_v = self.coerce(secs_v, secs_t, "i64")
+            sec_i32 = self.new_tmp()
+            self.emit(f"  {sec_i32} = trunc i64 {secs_v} to i32")
+            self.emit(f"  call i32 @sleep(i32 {sec_i32})")
+            return "0", "i64"
+
+        if obj_name == "random":
+            if node.method == "shuffle":
+                # random.shuffle(list) — Fisher-Yates shuffle on collection
+                col_v, col_t = self.emit_expr(node.args[0])
+                col_b = self.coerce_to_box(col_v, col_t)
+                len_v = self.new_tmp()
+                self.emit(f"  {len_v} = call i32 @collection_len(%Box* {col_b})")
+                idx_ptr = self.new_tmp()
+                self.emit(f"  {idx_ptr} = alloca i32")
+                self.emit(f"  store i32 0, i32* {idx_ptr}")
+                cond_l, body_l, end_l = self.new_label("sfl_cond"), self.new_label("sfl_body"), self.new_label("sfl_end")
+                self.emit(f"  br label %{cond_l}\n{cond_l}:")
+                cur_i, cond = self.new_tmp(), self.new_tmp()
+                self.emit(f"  {cur_i} = load i32, i32* {idx_ptr}")
+                self.emit(f"  {cond} = icmp slt i32 {cur_i}, {len_v}")
+                self.emit(f"  br i1 {cond}, label %{body_l}, label %{end_l}\n{body_l}:")
+                # pick random j in [i, len)
+                range_v, r_raw, j_v, j_add = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
+                self.emit(f"  {range_v} = sub i32 {len_v}, {cur_i}")
+                self.emit(f"  {r_raw} = call i32 @rand()")
+                self.emit(f"  {j_v} = srem i32 {r_raw}, {range_v}")
+                self.emit(f"  {j_add} = add i32 {j_v}, {cur_i}")
+                # Safe swap using list_swap (no ownership issues)
+                self.emit(f"  call void @list_swap(%Box* {col_b}, i32 {cur_i}, i32 {j_add})")
+                inc_i = self.new_tmp()
+                self.emit(f"  {inc_i} = add i32 {cur_i}, 1")
+                self.emit(f"  store i32 {inc_i}, i32* {idx_ptr}")
+                self.emit(f"  br label %{cond_l}\n{end_l}:")
+                return "0", "i64"
+
+            if node.method == "choice":
+                # random.choice(collection) — pick random element/key
+                col_v, col_t = self.emit_expr(node.args[0])
+                col_b = self.coerce_to_box(col_v, col_t)
+                len_v = self.new_tmp()
+                self.emit(f"  {len_v} = call i32 @collection_len(%Box* {col_b})")
+                r_raw, r_idx = self.new_tmp(), self.new_tmp()
+                self.emit(f"  {r_raw} = call i32 @rand()")
+                self.emit(f"  {r_idx} = srem i32 {r_raw}, {len_v}")
+                result = self.new_tmp()
+                self.emit(f"  {result} = call %Box* @collection_get_at(%Box* {col_b}, i32 {r_idx})")
+                return result, "%Box*"
 
         # 3. Handle Class Method Calls
         if obj_name in self.instances:
@@ -992,11 +1130,7 @@ class CodeGen:
             self.emit(f"  {strstr_r} = call i8* @strstr(i8* {obj_val}, i8* {needle})")
             self.emit(f"  {tmp} = icmp ne i8* {strstr_r}, null")
             return tmp, "i1"
-        if method == "to" and len(args) == 0:
-            tmp = self.new_tmp()
-            self.emit(f"  {tmp} = call i64 @atol(i8* {obj_val})")
-            return tmp, "i64"
-        if method == "to_int":
+        if method == "to" or method == "to_int":
             tmp = self.new_tmp()
             self.emit(f"  {tmp} = call i64 @atol(i8* {obj_val})")
             return tmp, "i64"

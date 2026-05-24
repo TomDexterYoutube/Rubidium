@@ -67,6 +67,12 @@ void* unbox_p(Box* b) { return (b && b->type==3) ? b->p : NULL; }
 typedef struct { int magic; Box** items; int count; int cap; } RList;
 Box* make_list() { RList* l=malloc(sizeof(RList)); l->magic=1; l->count=0; l->cap=8; l->items=malloc(8*sizeof(Box*)); return box_p(l); }
 void list_append(Box* lst, Box* b) { RList* l=lst->p; if(l->count==l->cap){l->cap*=2; l->items=realloc(l->items,l->cap*sizeof(Box*));} l->items[l->count++]=b; }
+void list_swap(Box* lst, int i, int j) {
+    RList* l=lst->p;
+    if(i>=0 && i<l->count && j>=0 && j<l->count) {
+        Box* tmp=l->items[i]; l->items[i]=l->items[j]; l->items[j]=tmp;
+    }
+}
 Box* list_get(void* col, Box* idx) {
     RList* l=col; int i=idx->i - 1; /* 1-based indexing */
     if(i>=0 && i<l->count) return l->items[i];
