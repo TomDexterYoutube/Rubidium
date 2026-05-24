@@ -28,6 +28,8 @@ b = False
 let large_num i64 = y as i64
 let float_val f64 = 100 as f64
 
+# all variable are global execpt across files and ones in classes
+
 # -------------------------------
 # TYPE CHECKING
 # -------------------------------
@@ -35,7 +37,7 @@ let float_val f64 = 100 as f64
 # - assigning the wrong type raises a compile-time error
 # Example (will error):
 # let val i32 = 5
-# val = "hello"      # ❌ type mismatch
+# val = "hello"
 
 # -------------------------------
 # MATH & LOGIC
@@ -58,18 +60,15 @@ let greeting str = "Hello, "
 let target str = "World!"
 
 # String concatenation (returns a new heap-allocated string)
-let full_msg = greeting.concat(target)  # "Hello, World!"
+let full_msg = greeting.conbine(target)  # "Hello, World!"
 let combined = greeting + target        # "Hello, World!"
 
 # String methods
 let length i64 = full_msg.len()         # Returns length of string
-let has_world bool = full_msg.contains("World") # True
+let has_world bool = full_msg.has("World") # True
 let number_str str = "404"
-let num_val i64 = number_str.to_int()   # Converts "404" to 404
-
-# Slicing and Splitting
-let slice_str str = full_msg.slice(0, 5) # "Hello"
-let first_word str = full_msg.split(",") # "Hello"
+let num_val i64 = number_str.to(i32)   # Converts "404" to 404
+let number_str str = num_val.to(str)   # Converts 404 to "404"
 
 # -------------------------------
 # DYNAMIC COLLECTIONS (list, index, dict)
@@ -125,6 +124,11 @@ x.drop()
 my_list.drop()
 my_dict.drop()
 
+# you can drop spesific values too 
+my_list(2).drop()
+my_dict("one").drop()
+my_dict("one", 2).drop()
+
 # -------------------------------
 # CONDITIONALS
 # -------------------------------
@@ -170,12 +174,10 @@ for key in table {
 # -------------------------------
 # FUNCTIONS & SCOPING
 # -------------------------------
-# Top-level variables (across ANY imported file) are strictly global.
-let global_counter = 0
 
 # Function with parameters and return type:
 fn add(a: i32, b: i32) -> i32 {
-    # Variables inside functions are local and threaded safely
+    # Variables inside functions are global
     let local_var = a + b
     return local_var
 }
