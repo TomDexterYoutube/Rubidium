@@ -256,9 +256,9 @@ class CodeGen:
                     fn = self.functions[mangled]
                     return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
             
-            if node.method in ("len", "to_int", "to"): return "i64"
+            if node.method in ("len", "to"): return "i64"
             if node.method in ("contains", "has"): return "i1"
-            if node.method in ("slice", "split", "concat", "combine"): return "i8*"
+            if node.method in ("combine"): return "i8*"
             # Built-in module methods
             if obj_name == "time": return "i64"
             if obj_name == "random":
