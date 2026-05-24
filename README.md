@@ -1,6 +1,6 @@
 # Rubidium Programming Language
 
-**Rubidium** is a high-performance, statically-typed compiled language designed for efficiency and safety. It combines the readable, clean syntax of Python-like languages with the low-level control and memory safety patterns typically found in Rust.
+**Rubidium** is a high-performance, statically-typed compiled language designed for efficiency and ease of use. It combines the readable, clean syntax of Python-like languages with the low-level control and memory safety patterns typically found in Compiled languages.
 
 ---
 
