@@ -230,6 +230,19 @@ fn run_class() {
     class_one.my_func()
 }
 
+# with classes there is not self but instade since varable are local to a class in the class you just call them
+
+call my_class() {
+    let x = 10
+    print(x)
+}
+
+def main() {
+    let mut stuff = my_class()
+    print(stuff.x)
+    # outside the class you have to have the class name as well its the same with mutable files
+}
+
 # -------------------------------
 # HARDWARE THREADING
 # -------------------------------
