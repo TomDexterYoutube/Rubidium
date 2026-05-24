@@ -1,274 +1,660 @@
 # -----------------------------------------
 # Rubidium Programming Language Syntax
 # File extension: .rub
-# Python-style readability + Rust-style static typing and memory safety
+#
+# Goal:
+# - Python-style readability
+# - Rust-style performance
+# - Simple syntax
+# - Compiled language
 # -----------------------------------------
 
-# -------------------------------
+
+
+# =====================================================
 # VARIABLES & DATA TYPES
-# -------------------------------
-# Declare variables with optional types:
-# Integer types: i8, i16, i32, i64, i128, i256
-# Floating types: f4, f8, f16, f32, f64, f128, f256
-# String: str
-# Boolean: bool (True / False)
+# =====================================================
 
-let x = 10           # type inferred as i64
-let mut y i32 = 5    # mutable integer
-let name str = "Rubidium"
-let f f64 = 3.14
-let b bool = True    # Boolean type
+# Variables store data in memory.
 
-# Reassigning mutable variables:
-y = 15
-f = 2.718
-b = False
+# "let" creates an immutable variable.
+# Immutable means the value cannot change later.
 
-# Type Casting (as):
-let large_num i64 = y as i64
-let float_val f64 = 100 as f64
+let age: i32 = 17
 
-# all variable are global execpt across files and ones in classes
+println(age)
 
-# -------------------------------
-# TYPE CHECKING
-# -------------------------------
-# Rubidium performs compile-time type checking:
-# - assigning the wrong type raises a compile-time error
-# Example (will error):
-# let val i32 = 5
-# val = "hello"
+# Output:
+# 17
 
-# -------------------------------
-# MATH & LOGIC
-# -------------------------------
-# Standard operators: +, -, *, /
-# Operator precedence (BODMAS) applies
-let calc1 = 1 + 2 * 3       # equals 7
-let calc2 = (1 + 2) * 3     # equals 9
 
-# Comparison operators: ==, !=, >, <, >=, <=
-let check bool = calc1 > 5  # True
+# "mut" allows the variable to be changed.
 
-# Logical operators: and, or, not
-let cond bool = True and not False
+let mut score: i32 = 10
 
-# -------------------------------
-# STRINGS & BUILT-IN METHODS
-# -------------------------------
-let greeting str = "Hello, "
-let target str = "World!"
+score = 25
 
-# String concatenation (returns a new heap-allocated string)
-let full_msg = greeting.conbine(target)  # "Hello, World!"
-let combined = greeting + target        # "Hello, World!"
+println(score)
 
-# String methods
-let length i64 = full_msg.len()         # Returns length of string
-let has_world bool = full_msg.has("World") # True
-let number_str str = "404"
-let num_val i64 = number_str.to(i32)   # Converts "404" to 404
-let number_str str = num_val.to(str)   # Converts 404 to "404"
+# Output:
+# 25
 
-# -------------------------------
-# DYNAMIC COLLECTIONS (list, index, dict)
-# -------------------------------
-# Collections dynamically manage boxed memory under the hood.
 
-# 1. Lists (Arrays)
-let my_list list = ["64534", 2.124, "hi"]
-print(my_list(3))             # prints: hi
+# -----------------------------------------------------
+# BASIC DATA TYPES
+# -----------------------------------------------------
 
-# 2. Indexes (Key-Value pairs with mixed types)
-let my_index index = ["one": "hello", 2: "no", 2.3: 123]
-print(my_index("one"))        # prints: hello
+# Integer numbers
+let integer: i32 = 42
 
-# 3. Dicts (Structured Key-Value blocks)
-let my_dict dict = {
-    "nested" = [1, "hi", 4],
-    "no" = [1, 7, 4]
-}
+# Large integer
+let big_number: i64 = 999999999
 
-# Accessing Nested Collections
-print(my_dict("nested", 2))     # prints: hi (bracketless dot syntax)
+# Decimal numbers
+let pi: f32 = 3.14
 
-# Mutating Collections via .set()
-my_list(2).set("why")
-my_index("one").set("changed")
-my_dict("nested", 1).set(99)
+# More precise decimal
+let precise_pi: f64 = 3.1415926535
 
-# -------------------------------
-# PRINT & I/O
-# -------------------------------
-print(x)
-print("Hello, Rubidium!")
+# Single character
+let letter: char = 'A'
 
-# Standard Input
-let user_input str = input("Enter your name: ")
+# Text/string
+let message: str = "Hello"
 
-# File Operations
-file_write("data.txt", "Saving this to disk!")
-let file_contents str = file_read("data.txt")
-print(file_contents)
+# True or false
+let online: bool = true
 
-# -------------------------------
-# DEEP MEMORY DROPS
-# -------------------------------
-# Drop a variable:
-# x.drop() frees memory, variable no longer exists
-# Note: drop() is real and releases memory safely.
-x.drop()
+# Empty value
+let nothing: none = none
 
-# For collections and strings, .drop() recursively frees 
-# all nested boxes, arrays, and keys, preventing leaks!
-my_list.drop()
-my_dict.drop()
 
-# you can drop spesific values too 
-my_list(2).drop()
-my_dict("one").drop()
-my_dict("one", 2).drop()
+# =====================================================
+# PRINTING
+# =====================================================
 
-# -------------------------------
-# CONDITIONALS
-# -------------------------------
-if calc1 == 7 {
-    print("True")
-} else if calc1 > 10 {
-    print("Else if")
+# print() stays on the same line.
+
+print("Hello ")
+print("World")
+
+# Output:
+# Hello World
+
+
+# println() adds a new line after printing.
+
+println("Hello")
+println("World")
+
+# Output:
+# Hello
+# World
+
+
+# Formatted strings using f"..."
+
+let name: str = "Max"
+
+println(f"Hello {name}")
+
+# Output:
+# Hello Max
+
+
+
+# =====================================================
+# OPERATORS
+# =====================================================
+
+# Operators perform math or comparisons.
+
+# -----------------------------------------------------
+# MATH OPERATORS
+# -----------------------------------------------------
+
+let add: i32 = 5 + 2
+println(add)
+
+# Output:
+# 7
+
+
+let subtract: i32 = 10 - 3
+println(subtract)
+
+# Output:
+# 7
+
+
+let multiply: i32 = 4 * 5
+println(multiply)
+
+# Output:
+# 20
+
+
+let divide: f32 = 10 / 2
+println(divide)
+
+# Output:
+# 5
+
+
+let modulo: i32 = 10 % 3
+println(modulo)
+
+# Output:
+# 1
+
+
+# -----------------------------------------------------
+# COMPARISON OPERATORS
+# -----------------------------------------------------
+
+println(5 == 5)
+
+# Output:
+# true
+
+
+println(5 != 3)
+
+# Output:
+# true
+
+
+println(10 > 2)
+
+# Output:
+# true
+
+
+println(1 < 5)
+
+# Output:
+# true
+
+
+# -----------------------------------------------------
+# LOGICAL OPERATORS
+# -----------------------------------------------------
+
+println(true and false)
+
+# Output:
+# false
+
+
+println(true or false)
+
+# Output:
+# true
+
+
+println(not true)
+
+# Output:
+# false
+
+
+
+# =====================================================
+# CONDITIONS
+# =====================================================
+
+# if statements run code only if a condition is true.
+
+let temperature: i32 = 30
+
+if temperature > 25 {
+    println("Hot")
+} elif temperature > 15 {
+    println("Warm")
 } else {
-    print("False")
+    println("Cold")
 }
 
-# -------------------------------
-# LOOPS & ITERATION
-# -------------------------------
-# While loop:
-let mut count = 0
-while count < 5 {
-    print(count)
-    count = count + 1
+# Output:
+# Hot
+
+
+
+# =====================================================
+# LOOPS
+# =====================================================
+
+# -----------------------------------------------------
+# WHILE LOOP
+# -----------------------------------------------------
+
+# Repeats while condition is true.
+
+let mut x: i32 = 0
+
+while x < 3 {
+
+    println(x)
+
+    x += 1
 }
 
-# For loop (Numerical Range):
-for i in range(1, 10) {
-    if i == 5 {
-        break   # Exits the innermost loop
+# Output:
+# 0
+# 1
+# 2
+
+
+# -----------------------------------------------------
+# FOR LOOP
+# -----------------------------------------------------
+
+# range(start, end)
+
+for i in range(0, 5) {
+
+    println(i)
+}
+
+# Output:
+# 0
+# 1
+# 2
+# 3
+# 4
+
+
+# -----------------------------------------------------
+# LOOP
+# -----------------------------------------------------
+
+# Infinite loop until break.
+
+let mut counter: i32 = 0
+
+loop {
+
+    println(counter)
+
+    counter += 1
+
+    if counter == 3 {
+        break
     }
-    print(i)
 }
 
-# Collection Iteration (for-in loops):
-let items list = [10, 20, 30]
-for item in items {
-    print(item) # Prints 10, then 20, then 30
+# Output:
+# 0
+# 1
+# 2
+
+
+
+# =====================================================
+# FUNCTIONS
+# =====================================================
+
+# Functions store reusable code.
+
+fn greet(name: str) {
+
+    println(f"Hello {name}")
 }
 
-# Dict Iteration (yields the keys):
-let table dict = {"a" = 100, "b" = 200}
-for key in table {
-    let val = table(key) # Extract the value dynamically
-    print(val)
-}
+greet("Max")
 
-# -------------------------------
-# FUNCTIONS & SCOPING
-# -------------------------------
+# Output:
+# Hello Max
 
-# Function with parameters and return type:
+
+# Function with return value.
+
 fn add(a: i32, b: i32) -> i32 {
-    # Variables inside functions are global
-    let local_var = a + b
-    return local_var
+
+    return a + b
 }
 
-# Call function:
-let math_result = add(2, 3)
+let result: i32 = add(5, 3)
 
-# -------------------------------
-# ERROR HANDLING
-# -------------------------------
-# try and on_error blocks:
-try {
-    let fail i32 = 10 / 0   # division by zero
-} on_error {
-    print("An error occurred")
+println(result)
+
+# Output:
+# 8
+
+
+# Anonymous function (lambda)
+
+let square = fn(x: i32) -> i32 {
+
+    return x * x
 }
 
-# -------------------------------
+println(square(4))
+
+# Output:
+# 16
+
+
+
+# =====================================================
+# LISTS / ARRAYS
+# =====================================================
+
+# Lists store multiple values.
+
+let numbers: list = [1, 2, 3]
+
+println(numbers[0])
+
+# Output:
+# 1
+
+
+# Add item
+numbers.push(4)
+
+println(numbers)
+
+# Output:
+# [1, 2, 3, 4]
+
+
+# Remove last item
+numbers.pop()
+
+println(numbers)
+
+# Output:
+# [1, 2, 3]
+
+
+
+# =====================================================
+# DICTIONARIES
+# =====================================================
+
+# Dictionaries store key/value pairs.
+
+let user: dict = {
+
+    "name": "Max",
+    "age": 17
+}
+
+println(user["name"])
+
+# Output:
+# Max
+
+
+println(user["age"])
+
+# Output:
+# 17
+
+
+
+# =====================================================
+# STRUCTS
+# =====================================================
+
+# Structs group related data together.
+
+struct Player {
+
+    name: str
+    health: i32
+}
+
+let player: Player = Player {
+
+    name: "Steve",
+    health: 100
+}
+
+println(player.name)
+
+# Output:
+# Steve
+
+
+println(player.health)
+
+# Output:
+# 100
+
+
+
+# =====================================================
 # CLASSES
-# -------------------------------
-# Classes are like fully self-contained units
+# =====================================================
 
-class my_class() {
-    let mut obj_val i32 = 10
-    
-    fn my_func() {
-        print("Hello from class!")
+# Classes contain variables and functions.
+
+class Animal {
+
+    let mut name: str = "Dog"
+
+    fn speak(self) {
+
+        println("Bark")
     }
 }
 
-# Classes can be instantiated and used like this:
-fn run_class() {
-    let class_one = my_class()
-    print(class_one.obj_val)
-    class_one.obj_val = 99
-    class_one.my_func()
+let pet: Animal = Animal()
+
+pet.speak()
+
+# Output:
+# Bark
+
+
+
+# =====================================================
+# THREADING
+# =====================================================
+
+# spawn runs code on another thread.
+
+fn task() {
+
+    println("Running on another thread")
 }
 
-# -------------------------------
-# HARDWARE THREADING
-# -------------------------------
-# You can run code concurrently using real POSIX threading
+spawn task()
 
-fn task1() {
-    print("Task 1 Finished")
+# Output:
+# Running on another thread
+
+
+
+# =====================================================
+# FILES
+# =====================================================
+
+# Open file in write mode.
+
+let file: file = open("test.txt", "w")
+
+file.write("Hello")
+
+file.close()
+
+# File content:
+# Hello
+
+
+
+# =====================================================
+# ERROR HANDLING
+# =====================================================
+
+# try/catch prevents crashes.
+
+try {
+
+    let result: i32 = 10 / 0
+
+} catch err {
+
+    println("Error happened")
 }
 
-fn task2() {
-    print("Task 2 Finished")
+# Output:
+# Error happened
+
+
+
+# =====================================================
+# MODULES
+# =====================================================
+
+# use imports standard library modules.
+
+use math
+
+# import imports local user files.
+
+import player
+
+
+
+# =====================================================
+# MEMORY MANAGEMENT
+# =====================================================
+
+# drop() manually frees memory.
+
+let data: str = "Temporary Data"
+
+drop(data)
+
+
+
+# =====================================================
+# MATCH STATEMENTS
+# =====================================================
+
+# Similar to switch statements.
+
+let number: i32 = 2
+
+match number {
+
+    1 => println("One")
+    2 => println("Two")
+    _ => println("Other")
 }
 
-fn run_threads() {
-    # thread(function(), thread_id) runs the function asynchronously
-    thread(task1(), 1)
-    thread(task2(), 2)
-    
-    # Wait for specific thread IDs to return before moving on
-    thread.wait(1, 2)
+# Output:
+# Two
+
+
+
+# =====================================================
+# ENUMS
+# =====================================================
+
+# Enums store a fixed set of values.
+
+enum Direction {
+
+    Up
+    Down
+    Left
+    Right
 }
 
-# -------------------------------
-# MODULES & IMPORTS
-# -------------------------------
-# Use 'use' to include compiler-provided built-ins:
-use thread
+let direction: Direction = Direction.Up
 
-# Use 'import' to include your own external .rub files:
-# (e.g., this will load and compile math_tools.rub)
-import math_tools
+println(direction)
 
-# -------------------------------
-# MAIN ENTRY POINT
-# -------------------------------
-# The compiler strictly looks for main() as the execution entry point.
-fn main() {
-    print("Welcome to Rubidium!")
-    run_class()
-    run_threads()
+# Output:
+# Up
+
+
+
+# =====================================================
+# COMMENTS
+# =====================================================
+
+# Single line comment
+
+
+/*
+Multi-line
+comment
+*/
+
+
+
+# =====================================================
+# STRING OPERATIONS
+# =====================================================
+
+let first: str = "Rubi"
+let second: str = "dium"
+
+let combined: str = first + second
+
+println(combined)
+
+# Output:
+# Rubidium
+
+
+
+# =====================================================
+# TYPE CASTING
+# =====================================================
+
+# Convert one type into another.
+
+let text_number: str = "42"
+
+let converted: i32 = int(text_number)
+
+println(converted + 1)
+
+# Output:
+# 43
+
+
+
+# =====================================================
+# ASYNC
+# =====================================================
+
+# Async functions allow non-blocking code.
+
+async fn fetch_data() {
+
+    println("Fetching data...")
 }
 
-# -------------------------------
-# NOTES
-# -------------------------------
-# - All statements end with a newline (no semicolons)
-# - Variables can be mutable (mut) or immutable
-# - Functions support optional return types
-# - Math follows standard precedence rules
-# - if / else and loops use braces { }
-# - Strings in quotes: "text"
-# - drop() frees memory completely
-# - Type checking at compile time prevents type mismatches
-# - Boolean type: bool (True / False)
-# - Logical operators: and, or, not
-# - Error handling: try { ... } on_error { ... }
+await fetch_data()
+
+# Output:
+# Fetching data...
+
+
+
+# =====================================================
+# END
+# =====================================================
+
+# Rubidium aims to be:
+#
+# - Easy to read
+# - Fast to run
+# - Easy to learn
+# - Modern but simple
+#
+# Basically:
+# "What if Python went to the gym and learned memory safety
+# instead of becoming a gigantic interpreted spaghetti pile."
+#
+# Humanity keeps inventing languages because apparently
+# 4000 existing ones wasn't enough.
+# At least this one has a clear direction.
+# =====================================================
