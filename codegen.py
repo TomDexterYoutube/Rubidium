@@ -47,6 +47,39 @@ class CodeGen:
         self.functions    = {}
         self.loop_end_stack = []
         self.cur_class    = None
+        self._try_error_label = None  # set while inside a try body for div-by-zero guards
+        self._pending_trampolines = []  # trampoline fn_lines to emit after current function
+
+    def is_class_field(self, name):
+        if not self.cur_class: return False
+        cls = self.class_defs.get(self.cur_class)
+        if not cls: return False
+        for f in cls.fields:
+            if f.name == name: return True
+        return False
+
+    def _emit_input_line_helper(self):
+        self.fn_lines += [
+            "define i8* @_rubidium_input_line() {",
+            "  %buf = call i8* @malloc(i64 1024)",
+            "  %stdin = load i8*, i8** @_stdin_ptr", # Changed from @.stdin_ptr
+            "  %res = call i8* @fgets(i8* %buf, i32 1024, i8* %stdin)",
+            "  %len = call i64 @strlen(i8* %buf)",
+            "  %is_empty = icmp eq i64 %len, 0",
+            "  br i1 %is_empty, label %done, label %check_nl",
+            "check_nl:",
+            "  %last_char_idx = sub i64 %len, 1",
+            "  %last_char_ptr = getelementptr i8, i8* %buf, i64 %last_char_idx",
+            "  %last_char = load i8, i8* %last_char_ptr",
+            "  %is_nl = icmp eq i8 %last_char, 10",
+            "  br i1 %is_nl, label %strip, label %done",
+            "strip:",
+            "  store i8 0, i8* %last_char_ptr",
+            "  br label %done",
+            "done:",
+            "  ret i8* %buf",
+            "}"
+        ]
 
     def new_tmp(self):
         self.tmp_count += 1
@@ -95,6 +128,12 @@ class CodeGen:
             self.global_decls.append(f"@{name} = global {ir_type} 0")
 
     def get_var_ptr(self, name):
+        # Handle namespaced variables (math.PI -> math_PI)
+        if "." in name:
+            mangled = name.replace(".", "_")
+            if mangled in self.global_vars:
+                return f"@{mangled}", self.global_vars[mangled]
+        
         if name in self.local_vars: return f"%ptr_{name}", self.local_vars[name]
         if name in self.global_vars: return f"@{name}", self.global_vars[name]
         raise RubidiumNameError(f"Undefined variable '{name}'")
@@ -132,7 +171,7 @@ class CodeGen:
 
         self.global_decls += extern_decls.split("\n")
         self.global_decls += [
-            "", "declare i32 @printf(i8* noundef, ...)", "declare i32 @puts(i8* noundef)",
+            "", "declare i32 @printf(i8* noundef, ...)", "declare i32 @puts(i8* noundef)", "declare i32 @fflush(i8*)",
             "declare i8* @malloc(i64)", "declare void @free(i8*)", "declare i64 @strlen(i8*)",
             "declare i32 @scanf(i8*, ...)", "declare i8* @fgets(i8*, i32, i8*)",
             "declare i8* @strcpy(i8*, i8*)", "declare i32 @strcmp(i8*, i8*)",
@@ -143,8 +182,10 @@ class CodeGen:
             "declare i64 @fwrite(i8*, i64, i64, i8*)", "declare i64 @fseek(i8*, i64, i32)",
             "declare i64 @ftell(i8*)", "declare void @rewind(i8*)",
             "declare i32 @sprintf(i8*, i8*, ...)",
-            "@.stdin_ptr = external global i8*",
-            "@_thread_handles = global [1024 x i64] zeroinitializer", ""
+            "@_stdin_ptr = external global i8*", # Changed from @.stdin_ptr
+            "@_thread_handles = global [1024 x i64] zeroinitializer",
+            "@_thread_results = external global [1024 x %Box*]", # <--- ADD THIS LINE
+            ""
         ]
 
         self._emit_input_line_helper()
@@ -199,7 +240,12 @@ class CodeGen:
         if isinstance(node, (Input, FileRead)): return "i8*"
         
         if isinstance(node, MethodCall):
-            obj_name = node.obj.name if hasattr(node.obj, 'name') else node.obj
+            obj_name = node.obj.name if hasattr(node.obj, 'name') else str(node.obj)
+            
+            # --- DEBUGGING LINE ---
+            if "." in obj_name:
+                return "i64" # Namespaced call, treat as global function
+            
             if obj_name in self.instances:
                 class_name = self.instances[obj_name]
                 mangled = self.method_ir_name(class_name, node.method)
@@ -209,13 +255,32 @@ class CodeGen:
             
             if node.method in ("len", "to_int"): return "i64"
             if node.method in ("contains",): return "i1"
-            if node.method in ("slice", "split", "concat"): return "i8*"
+            if node.method in ("slice", "split", "concat", "combine"): return "i8*"
+            
             raise RubidiumNameError(f"Cannot infer type for method call '{node.method}' on object '{obj_name}'")
 
         if isinstance(node, FnCall):
-            if isinstance(node.name, str) and node.name in self.functions:
-                fn = self.functions[node.name]
+            # Normalization check
+            name = node.name.replace(".", "_") if isinstance(node.name, str) and "." in node.name else node.name
+            if isinstance(name, str) and name in self.functions:
+                fn = self.functions[name]
                 return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
+            return "i64"
+            
+        if isinstance(node, BinOp):
+            lt = self._infer_type(node.left)
+            rt = self._infer_type(node.right)
+            if lt == "i8*" or rt == "i8*": return "i8*"
+            if lt == "double" or rt == "double": return "double"
+            return lt
+        if isinstance(node, Compare): return "i1"
+        if isinstance(node, UnaryOp):
+            if node.op == "not": return "i1"
+            return self._infer_type(node.value)
+        if isinstance(node, TypeCast): return self.rubi_type_to_ir(node.target_type)
+        if isinstance(node, Var):
+            if node.name in self.local_vars: return self.local_vars[node.name]
+            if node.name in self.global_vars: return self.global_vars[node.name]
             return "i64"
         return "i64"
 
@@ -238,16 +303,6 @@ class CodeGen:
         elif isinstance(node, Try):
             for s in node.try_body: self._collect_global(s)
             for s in node.error_body: self._collect_global(s)
-
-    def _inject_init_call(self):
-        patched = []; in_main = False; injected = False
-        for line in self.fn_lines:
-            patched.append(line)
-            if line.strip() == "define i32 @main() {": in_main = True
-            elif in_main and not injected and line.strip() == "entry:":
-                patched.append("  call i64 @_rubidium_init()")
-                injected = True
-        self.fn_lines = patched
 
     def emit_fn(self, node):
         self.tmp_count, self.label_count, self.cur_fn, self.cur_class = 0, 0, node.name, None
@@ -273,6 +328,10 @@ class CodeGen:
             elif ret_ir == "i8*": self.emit("  ret i8* null")
             else: self.emit(f"  ret {ret_ir} null")
         self.emit("}\n")
+        # Flush any trampolines generated during this function
+        if self._pending_trampolines:
+            self.fn_lines += self._pending_trampolines
+            self._pending_trampolines = []
 
     def _emit_class_method(self, mfn, class_name):
         self.tmp_count, self.label_count, self.cur_fn, self.cur_class = 0, 0, mfn.name, class_name
@@ -314,8 +373,13 @@ class CodeGen:
             is_class = False
             cn = ""
             if isinstance(node.value, (ClassInstantiate, FnCall)):
-                cn = node.value.class_name if isinstance(node.value, ClassInstantiate) else (node.value.name if isinstance(node.value.name, str) else "")
-                if cn in self.class_defs: is_class = True
+                raw_cn = node.value.class_name if isinstance(node.value, ClassInstantiate) else (node.value.name if isinstance(node.value.name, str) else "")
+                if raw_cn in self.class_defs:
+                    cn = raw_cn
+                    is_class = True
+                elif f"main_{raw_cn}" in self.class_defs:
+                    cn = f"main_{raw_cn}"
+                    is_class = True
                     
             if self.cur_fn is not None and self.cur_fn != "_rubidium_init":
                 if is_class:
@@ -327,6 +391,7 @@ class CodeGen:
                     self.emit(f"  {ptr_str} = alloca {struct_t}*")
                     self.emit_class_init(ptr_str, cn)
                     return False
+                
                 ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
                 self.local_vars[node.name] = ir_t
                 if node.mutable: self.mutable_vars.add(node.name)
@@ -350,7 +415,12 @@ class CodeGen:
                 
         elif isinstance(node, Assign):
             if node.name in self.dropped_vars: raise RubidiumNameError(f"Var '{node.name}' is dropped")
-            if node.name in self.instances: pass
+            
+            # --- FIX: Check for Field Assignment ---
+            if self.is_class_field(node.name):
+                self.emit_field_assign(FieldAssign(Var("__self"), node.name, node.value))
+            # ----------------------------------------
+            elif node.name in self.instances: pass
             else:
                 if node.name not in self.mutable_vars: raise RubidiumTypeError(f"Immutable '{node.name}'")
                 ptr_str, ir_t = self.get_var_ptr(node.name)
@@ -365,18 +435,16 @@ class CodeGen:
         elif isinstance(node, For): self.emit_for(node)
         elif isinstance(node, Return):
             val, val_t = self.emit_expr(node.value)
-            expected = (self.rubi_type_to_ir(self.functions[self.cur_fn].ret_type) if self.functions[self.cur_fn].ret_type else val_t) if self.cur_fn in self.functions else val_t
+            expected = (self.rubi_type_to_ir(self.functions[self.cur_fn].ret_type) if self.cur_fn in self.functions and self.functions[self.cur_fn].ret_type else val_t)
             val = self.coerce(val, val_t, expected)
             self.emit(f"  ret {expected} {val}")
             return True
         elif isinstance(node, FnCall): self.emit_call_expr(node)
-        
         elif isinstance(node, MethodCall): 
             if node.method == "set" and isinstance(node.obj, FnCall):
                 self.emit_collection_set(node)
                 return False
             self.emit_method_call_expr(node)
-            
         elif isinstance(node, Drop):
             self.dropped_vars.add(node.name)
             ir_t = self.local_vars.get(node.name) or self.global_vars.get(node.name)
@@ -386,11 +454,6 @@ class CodeGen:
                 self.emit(f"  {val} = load {ir_t}, {ir_t}* {ptr_str}")
                 if ir_t == "%Box*": self.emit(f"  call void @box_drop(%Box* {val})")
                 elif ir_t == "i8*": self.emit(f"  call void @free(i8* {val})")
-                elif ir_t.endswith("*"):
-                    cast_val = self.new_tmp()
-                    self.emit(f"  {cast_val} = bitcast {ir_t} {val} to i8*")
-                    self.emit(f"  call void @free(i8* {cast_val})")
-                    
         elif isinstance(node, Break):
             if self.loop_end_stack: self.emit(f"  br label %{self.loop_end_stack[-1]}")
             return True
@@ -488,12 +551,13 @@ class CodeGen:
             self.emit(f"  store {ir_t} {val}, {ir_t}* {fptr}")
 
     def emit_field_assign(self, node):
-        if node.obj not in self.instances: return
-        class_name = self.instances[node.obj]
+        obj_name = node.obj.name if hasattr(node.obj, 'name') else node.obj
+        if obj_name not in self.instances: return
+        class_name = self.instances[obj_name]
         idx, ir_t  = self.field_index(class_name, node.field)
         struct_t   = self.class_ir_type(class_name)
         
-        ptr_str, _ = self.get_var_ptr(node.obj)
+        ptr_str, _ = self.get_var_ptr(obj_name)
         inst_ptr = self.new_tmp(); fptr = self.new_tmp()
         self.emit(f"  {inst_ptr} = load {struct_t}*, {struct_t}** {ptr_str}")
         self.emit(f"  {fptr} = getelementptr {struct_t}, {struct_t}* {inst_ptr}, i32 0, i32 {idx}")
@@ -503,21 +567,25 @@ class CodeGen:
 
     def emit_print(self, value):
         val, val_t = self.emit_expr(value)
-        if val_t == "%Box*": self.emit(f"  call void @print_boxed(%Box* {val})")
+        if val_t == "%Box*":
+            self.emit(f"  call void @print_boxed(%Box* {val})")  # print_boxed already calls fflush
         elif val_t in ("i64","i32","i16","i8","i1"):
             fmt, flen = self.intern_str("%lld\n")
             ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
             cv = self.coerce(val, val_t, "i64")
             self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, i64 {cv})')
+            self.emit(f'  call i32 @fflush(i8* null)')
         elif val_t in ("float","double"):
             fmt, flen = self.intern_str("%g\n")
             ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
             dv = self.coerce(val, val_t, "double")
             self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, double {dv})')
+            self.emit(f'  call i32 @fflush(i8* null)')
         elif val_t == "i8*":
             self.emit(f'  call i32 @puts(i8* {val})')
+            self.emit(f'  call i32 @fflush(i8* null)')
 
     def to_bool(self, val, t):
         if t == "i1": return val
@@ -618,9 +686,16 @@ class CodeGen:
             self.emit(f"  br label %{cond_l}\n{end_l}:")
 
     def emit_try(self, node):
+        # NOTE: Rubidium's try/on_error does NOT use LLVM invoke/landingpad.
+        # It cannot catch hardware exceptions like segfaults or FPE signals.
+        # What it CAN catch is explicit runtime division-by-zero: any sdiv
+        # inside the try body is emitted with a zero-check that branches to
+        # on_error instead of faulting. All other errors still crash.
         ok_l, err_l, end_l = self.new_label("tok"), self.new_label("terr"), self.new_label("tend")
+        self._try_error_label = err_l
         self.emit(f"  br label %{ok_l}\n{ok_l}:")
         self.emit_body(node.try_body)
+        self._try_error_label = None
         self.emit(f"  br label %{end_l}\n{err_l}:")
         self.emit_body(node.error_body)
         self.emit(f"  br label %{end_l}\n{end_l}:")
@@ -689,8 +764,15 @@ class CodeGen:
             self.emit(f"  store i8 0, i8* {term_ptr}")
             self.emit(f"  call i32 @fclose(i8* {fp})")
             return buf, "i8*"
+            
         if isinstance(node, Var):
             if node.name in self.dropped_vars: raise RubidiumNameError(f"Dropped '{node.name}'")
+            
+            # --- FIX: Implicitly access class field if it exists ---
+            if self.is_class_field(node.name):
+                return self.emit_field_access(Var("__self"), node.name)
+            # -------------------------------------------------------
+            
             ptr_str, ir_t = self.get_var_ptr(node.name)
             tmp = self.new_tmp()
             self.emit(f"  {tmp} = load {ir_t}, {ir_t}* {ptr_str}")
@@ -712,23 +794,27 @@ class CodeGen:
                 return tmp, t
             return val, t
         if isinstance(node, FnCall): return self.emit_call_expr(node)
-        
         if isinstance(node, MethodCall):
             if node.method == "set" and isinstance(node.obj, FnCall):
                 self.emit_collection_set(node)
                 return "0", "i64"
             return self.emit_method_call_expr(node)
-            
         if isinstance(node, TypeCast): return self.emit_type_cast(node)
         return "0", "i64"
 
-    def emit_field_access(self, obj_name, field_name):
-        if obj_name not in self.instances: raise RubidiumNameError(f"'{obj_name}' is not instance")
+    def emit_field_access(self, obj, field_name):
+        # Extract the name if it's an ast.Var object
+        obj_name = obj.name if hasattr(obj, 'name') else str(obj)
+        
+        if obj_name not in self.instances: 
+            raise RubidiumNameError(f"'{obj_name}' is not an instance")
+            
         class_name = self.instances[obj_name]
         idx, ir_t  = self.field_index(class_name, field_name)
         struct_t   = self.class_ir_type(class_name)
+        
         ptr_str, _ = self.get_var_ptr(obj_name)
-        inst_ptr, fptr, val = self.new_tmp(), self.new_tmp(), self.new_tmp()
+        inst_ptr = self.new_tmp(); fptr = self.new_tmp(); val = self.new_tmp()
         self.emit(f"  {inst_ptr} = load {struct_t}*, {struct_t}** {ptr_str}")
         self.emit(f"  {fptr} = getelementptr {struct_t}, {struct_t}* {inst_ptr}, i32 0, i32 {idx}")
         self.emit(f"  {val} = load {ir_t}, {ir_t}* {fptr}")
@@ -736,130 +822,158 @@ class CodeGen:
 
     def emit_call_expr(self, node):
         if isinstance(node.name, str):
-            if node.name == "print":
-                for a in node.args: self.emit_print(a)
-                return "0", "i64"
-            if node.name == "thread" and len(node.args) == 2:
-                fn_name = node.args[0].name
-                tid_val, _ = self.emit_expr(node.args[1])
-                tmp = self.new_tmp(); h_ptr = self.new_tmp()
-                self.emit(f"  {h_ptr} = getelementptr [1024 x i64], [1024 x i64]* @_thread_handles, i64 0, i64 {tid_val}")
-                self.emit(f"  {tmp} = call i32 @pthread_create(i64* {h_ptr}, i64* null, i8* (i8*)* bitcast (i64 (i64)* @{fn_name} to i8* (i8*)*), i8* null)")
-                return tmp, "i64"
+            node.name = node.name.replace(".", "_")
 
-        is_dynamic = False
-        if not isinstance(node.name, str): is_dynamic = True
-        elif (node.name in self.local_vars and self.local_vars[node.name] == "%Box*") or (node.name in self.global_vars and self.global_vars[node.name] == "%Box*"):
-            is_dynamic = True
-
-        if is_dynamic:
-            if isinstance(node.name, str) and len(node.args) == 1 and isinstance(node.args[0], FnCall) and isinstance(node.args[0].name, str):
-                if node.args[0].name not in self.functions and node.args[0].name not in self.global_vars and node.args[0].name not in self.local_vars:
-                    col, col_t = self.emit_expr(Var(node.name))
-                    key_str = node.args[0].name; key_lbl, key_len = self.intern_str(key_str)
-                    key_ptr = self.new_tmp(); key_b = self.new_tmp()
-                    self.emit(f"  {key_ptr} = getelementptr [{key_len} x i8], [{key_len} x i8]* {key_lbl}, i64 0, i64 0")
-                    self.emit(f"  {key_b} = call %Box* @box_s(i8* {key_ptr})")
-                    inner_col = self.new_tmp()
-                    self.emit(f"  {inner_col} = call %Box* @collection_get(%Box* {col}, %Box* {key_b})")
-                    idx_val, idx_t = self.emit_expr(node.args[0].args[0])
-                    idx_b = self.coerce_to_box(idx_val, idx_t)
-                    res = self.new_tmp()
-                    self.emit(f"  {res} = call %Box* @collection_get(%Box* {inner_col}, %Box* {idx_b})")
-                    return res, "%Box*"
-
-            if isinstance(node.name, str): callee_val, callee_t = self.emit_expr(Var(node.name))
-            else: callee_val, callee_t = self.emit_expr(node.name)
-            
-            callee_b = self.coerce_to_box(callee_val, callee_t)
-            
-            for arg in node.args:
-                if isinstance(arg, FnCall) and isinstance(arg.name, str) and arg.name not in self.functions and arg.name not in self.global_vars and arg.name not in self.local_vars:
-                    key_str = arg.name
-                    key_lbl, key_len = self.intern_str(key_str)
-                    key_ptr = self.new_tmp(); key_b = self.new_tmp()
-                    self.emit(f"  {key_ptr} = getelementptr [{key_len} x i8], [{key_len} x i8]* {key_lbl}, i64 0, i64 0")
-                    self.emit(f"  {key_b} = call %Box* @box_s(i8* {key_ptr})")
-                    next_col = self.new_tmp()
-                    self.emit(f"  {next_col} = call %Box* @collection_get(%Box* {callee_b}, %Box* {key_b})")
-                    callee_b = next_col
-                    
-                    idx_val, idx_t = self.emit_expr(arg.args[0])
-                    idx_b = self.coerce_to_box(idx_val, idx_t)
-                    next_col2 = self.new_tmp()
-                    self.emit(f"  {next_col2} = call %Box* @collection_get(%Box* {callee_b}, %Box* {idx_b})")
-                    callee_b = next_col2
-                else:
-                    arg_val, arg_t = self.emit_expr(arg)
-                    arg_b = self.coerce_to_box(arg_val, arg_t)
-                    next_col = self.new_tmp()
-                    self.emit(f"  {next_col} = call %Box* @collection_get(%Box* {callee_b}, %Box* {arg_b})")
-                    callee_b = next_col
-            return callee_b, "%Box*"
-
-        args_ir = []
-        for a in node.args:
-            v, t = self.emit_expr(a); args_ir.append(f"{t} {v}")
-        ret_t = "i64"
-        if node.name in self.functions:
-            fn = self.functions[node.name]
-            ret_t = self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
-        tmp = self.new_tmp()
-        if ret_t == "void":
-            self.emit(f"  call void @{node.name}({', '.join(args_ir)})")
+        # 1. PRIORITY 1: Hardcoded System Built-ins
+        # If it's one of these, it CANNOT be a collection or class method.
+        if node.name == "print":
+            # Direct to your print logic
+            val, t = self.emit_expr(node.args[0])
+            self.emit_print(node.args[0])
             return "0", "i64"
-        self.emit(f"  {tmp} = call {ret_t} @{node.name}({', '.join(args_ir)})")
-        return tmp, ret_t
+        
+        if node.name == "file_write":
+            temp_node = FileWrite(node.args[0], node.args[1])
+            self.emit_file_write(temp_node)
+            return "0", "i64"
+
+        if node.name == "input":
+            return self.emit_expr(Input(node.args[0] if node.args else None))
+
+        # 2. PRIORITY 2: Threading System Calls
+        if node.name == "thread" and len(node.args) == 2:
+            func_call_node = node.args[0]
+            tid_v, tid_t   = self.emit_expr(node.args[1])
+            tid_v = self.coerce(tid_v, tid_t, "i64")
+            # Store handle: _thread_handles[tid]
+            h_ptr = self.new_tmp()
+            self.emit(f"  {h_ptr} = getelementptr [1024 x i64], [1024 x i64]* @_thread_handles, i64 0, i64 {tid_v}")
+            # Build a wrapper: emit a trampoline that calls the function with no args via pthread
+            fn_name = func_call_node.name if isinstance(func_call_node, FnCall) else str(func_call_node)
+            tramp = f"_tramp_{fn_name}"
+            if tramp not in self.functions:
+                # defer trampoline emission until after the current function
+                self._pending_trampolines += [
+                    f"define i8* @{tramp}(i8* %_ignored) {{",
+                    "entry:",
+                    f"  call i64 @{fn_name}()",
+                    "  ret i8* null",
+                    "}", ""
+                ]
+                self.functions[tramp] = FnDef(tramp, [], None, [])
+            tramp_ptr = self.new_tmp()
+            self.emit(f"  {tramp_ptr} = bitcast i8* (i8*)* @{tramp} to i8* (i8*)*")
+            self.emit(f"  call i32 @pthread_create(i64* {h_ptr}, i64* null, i8* (i8*)* {tramp_ptr}, i8* null)")
+            return "0", "i64"
+
+        if node.name == "thread_wait":
+            for arg in node.args:
+                tid_v, tid_t = self.emit_expr(arg)
+                tid_v = self.coerce(tid_v, tid_t, "i64")
+                h_ptr = self.new_tmp(); h_val = self.new_tmp()
+                self.emit(f"  {h_ptr} = getelementptr [1024 x i64], [1024 x i64]* @_thread_handles, i64 0, i64 {tid_v}")
+                self.emit(f"  {h_val} = load i64, i64* {h_ptr}")
+                self.emit(f"  call i32 @pthread_join(i64 {h_val}, i8** null)")
+            return "0", "i64"
+
+        if node.name == "thread_result":
+            tid_v, tid_t = self.emit_expr(node.args[0])
+            tid_v = self.coerce(tid_v, tid_t, "i64")
+            r_ptr = self.new_tmp(); r_val = self.new_tmp()
+            self.emit(f"  {r_ptr} = getelementptr [1024 x %Box*], [1024 x %Box*]* @_thread_results, i64 0, i64 {tid_v}")
+            self.emit(f"  {r_val} = load %Box*, %Box** {r_ptr}")
+            return r_val, "%Box*"
+
+        # 3. PRIORITY 3: Actual Functions (main, user functions)
+        # We check if it exists in self.functions FIRST. 
+        # This prevents main() or user-defined functions from being caught by the collection logic.
+        target_name = node.name
+        if f"main_{node.name}" in self.functions:
+            target_name = f"main_{node.name}"
+        
+        if target_name in self.functions:
+            args_ir = []
+            for a in node.args:
+                v, t = self.emit_expr(a); args_ir.append(f"{t} {v}")
+            tmp = self.new_tmp()
+            if self.functions[target_name].ret_type is None:
+                 self.emit(f"  call void @{target_name}({', '.join(args_ir)})")
+                 return "0", "i64"
+            self.emit(f"  {tmp} = call i64 @{target_name}({', '.join(args_ir)})")
+            return tmp, "i64"
+
+        # 4. PRIORITY 4: Dynamic Collection Access
+        # Only reach here if it's NOT a function, NOT a built-in
+        if (node.name in self.local_vars or node.name in self.global_vars):
+            col_v, col_t = self.emit_expr(Var(node.name))
+            idx_v, idx_t = self.emit_expr(node.args[0])
+            col_b = self.coerce_to_box(col_v, col_t)
+            idx_b = self.coerce_to_box(idx_v, idx_t)
+            res = self.new_tmp()
+            self.emit(f"  {res} = call %Box* @collection_get(%Box* {col_b}, %Box* {idx_b})")
+            return res, "%Box*"
+
+        raise RubidiumNameError(f"Undefined function or variable: {node.name}")
 
     def emit_method_call_expr(self, node):
-            # FIX: Extract the name if node.obj is an AST Var object
-            # If node.obj is already a string, keep it as is.
-            obj_name = node.obj.name if hasattr(node.obj, 'name') else node.obj
+        # 1. Resolve the object name
+        obj_name = node.obj.name if hasattr(node.obj, 'name') else str(node.obj)
         
-            # Now proceed with the lookup using the actual string name
-            if obj_name in self.instances:
-                class_name = self.instances[obj_name]
-                mangled = self.method_ir_name(class_name, node.method)
-            
-                if mangled in self.functions:
-                    # ... (rest of your existing logic remains exactly the same)
-                    fn = self.functions[mangled]
-                    struct_t = self.class_ir_type(class_name)
-                    ptr_str, _ = self.get_var_ptr(obj_name)
-                
-                    inst_ptr = self.new_tmp()
-                    self.emit(f"  {inst_ptr} = load {struct_t}*, {struct_t}** {ptr_str}")
-                
-                    args_ir = [f"{struct_t}* {inst_ptr}"]
-                    for i, arg_node in enumerate(node.args):
-                        v, t = self.emit_expr(arg_node)
-                        if i + 1 < len(fn.params):
-                            expected_t = self.rubi_type_to_ir(fn.params[i + 1][1])
-                            v = self.coerce(v, t, expected_t)
-                            args_ir.append(f"{expected_t} {v}")
-                        else:
-                            args_ir.append(f"{t} {v}")
-                
-                    ret_t = self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
-                    tmp = self.new_tmp()
-                    if ret_t == "void":
-                        self.emit(f"  call void @{mangled}({', '.join(args_ir)})")
-                        return "0", "i64"
-                
-                    self.emit(f"  {tmp} = call {ret_t} @{mangled}({', '.join(args_ir)})")
-                    return tmp, ret_t
-            
+        # 2. Handle Collection 'set' method separately
+        # This bypasses the class method logic entirely
+        if node.method == "set" and isinstance(node.obj, FnCall):
+            return self.emit_collection_set(node)
+
+        # 3. Handle Class Method Calls
+        if obj_name in self.instances:
+            class_name = self.instances[obj_name]
+            mangled = self.method_ir_name(class_name, node.method)
+
+            if mangled in self.functions:
+                fn = self.functions[mangled]
+                struct_t = self.class_ir_type(class_name)
+                ptr_str, _ = self.get_var_ptr(obj_name)
+
+                inst_ptr = self.new_tmp()
+                self.emit(f"  {inst_ptr} = load {struct_t}*, {struct_t}** {ptr_str}")
+
+                args_ir = [f"{struct_t}* {inst_ptr}"]
+                for i, arg_node in enumerate(node.args):
+                    v, t = self.emit_expr(arg_node)
+                    if i + 1 < len(fn.params):
+                        expected_t = self.rubi_type_to_ir(fn.params[i + 1][1])
+                        v = self.coerce(v, t, expected_t)
+                        args_ir.append(f"{expected_t} {v}")
+                    else:
+                        args_ir.append(f"{t} {v}")
+
+                ret_t = self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
+                tmp = self.new_tmp()
+                if ret_t == "void":
+                    self.emit(f"  call void @{mangled}({', '.join(args_ir)})")
+                    return "0", "i64"
+                self.emit(f"  {tmp} = call {ret_t} @{mangled}({', '.join(args_ir)})")
+                return tmp, ret_t
+            else:
                 raise RubidiumNameError(f"Class '{class_name}' has no method '{node.method}'")
 
-            # 2. String Method fallback
-            try:
-                obj_val, obj_t = self.emit_expr(Var(obj_name))
-                if obj_t == "i8*":
-                    return self.emit_string_method(obj_val, node.method, node.args)
-            except RubidiumNameError:
-                pass
+         # 4. Fallback: String method OR module function call (e.g. math.add)
+        obj_val, obj_t = self.emit_expr(node.obj)
+        if obj_t == "i8*":
+            # Emit as string method; raises a clear RubidiumNameError on unknown methods
+            # instead of silently falling through to a confusing "Undefined function" error.
+            known_str_methods = ("len", "to_int", "contains", "slice", "split", "concat", "combine", "has", "to")
+            if node.method not in known_str_methods:
+                raise RubidiumNameError(
+                    f"Unknown string method '.{node.method}()'. "
+                    f"Available string methods: {', '.join(known_str_methods)}"
+                )
+            return self.emit_string_method(obj_val, node.method, node.args)
 
-            raise RubidiumNameError(f"Could not resolve method call '{node.method}' on '{obj_name}'")
+        # Not a string — treat as a module-namespaced function call (e.g. math.add -> math_add)
+        node.name = f"{obj_name}_{node.method}"
+        node.obj = None
+        return self.emit_call_expr(node)
 
     def emit_string_method(self, obj_val, method, args):
         if method == "len":
@@ -872,6 +986,16 @@ class CodeGen:
             self.emit(f"  {strstr_r} = call i8* @strstr(i8* {obj_val}, i8* {needle})")
             self.emit(f"  {tmp} = icmp ne i8* {strstr_r}, null")
             return tmp, "i1"
+        if method == "has" and len(args) == 1:
+            needle, _ = self.emit_expr(args[0])
+            strstr_r, tmp = self.new_tmp(), self.new_tmp()
+            self.emit(f"  {strstr_r} = call i8* @strstr(i8* {obj_val}, i8* {needle})")
+            self.emit(f"  {tmp} = icmp ne i8* {strstr_r}, null")
+            return tmp, "i1"
+        if method == "to" and len(args) == 0:
+            tmp = self.new_tmp()
+            self.emit(f"  {tmp} = call i64 @atol(i8* {obj_val})")
+            return tmp, "i64"
         if method == "to_int":
             tmp = self.new_tmp()
             self.emit(f"  {tmp} = call i64 @atol(i8* {obj_val})")
@@ -905,6 +1029,17 @@ class CodeGen:
             self.emit(f"  {dist}   = sub i64 {t_int}, {o_int}")
             self.emit(f"  {result} = call i8* @strndup(i8* {obj_val}, i64 {dist})")
             return result, "i8*"
+        if method == "combine" and len(args) == 1:
+            other, _ = self.emit_expr(args[0])
+            llen, rlen, total, total2, buf = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
+            self.emit(f"  {llen}  = call i64 @strlen(i8* {obj_val})")
+            self.emit(f"  {rlen}  = call i64 @strlen(i8* {other})")
+            self.emit(f"  {total} = add i64 {llen}, {rlen}")
+            self.emit(f"  {total2} = add i64 {total}, 1")
+            self.emit(f"  {buf}   = call i8* @malloc(i64 {total2})")
+            self.emit(f"  call i8* @strcpy(i8* {buf}, i8* {obj_val})")
+            self.emit(f"  call i8* @strcat(i8* {buf}, i8* {other})")
+            return buf, "i8*"
         return "0", "i64"
 
     def emit_type_cast(self, node):
@@ -969,6 +1104,13 @@ class CodeGen:
                 return tmp, "i1"
             instr = {"+":"add","-":"sub","*":"mul","/":"sdiv","%":"srem"}.get(node.op)
             if instr:
+                if node.op in ("/", "%") and self._try_error_label:
+                    # Runtime div-by-zero guard: branch to on_error instead of faulting
+                    is_zero = self.new_tmp()
+                    safe_l  = self.new_label("divok")
+                    self.emit(f"  {is_zero} = icmp eq i64 {r}, 0")
+                    self.emit(f"  br i1 {is_zero}, label %{self._try_error_label}, label %{safe_l}")
+                    self.emit(f"{safe_l}:")
                 self.emit(f"  {tmp} = {instr} i64 {l}, {r}")
                 return tmp, "i64"
         else:

@@ -6,15 +6,30 @@ import glob
 
 from lexer import tokenize
 from parser import Parser
-from ast import Import, Use
+from ast import Import, Use, VarDecl, FnDef, ClassDef
 from codegen import CodeGen, RubidiumTypeError, RubidiumNameError
 
-RUNTIME_C = """
+RUNTIME_C = r"""
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 typedef struct { int type; long long i; double f; char* s; void* p; } Box;
+
+Box* _thread_results[1024]; 
+
+void _set_thread_result(int tid, Box* val) {
+    if(tid >= 0 && tid < 1024) {
+        _thread_results[tid] = val;
+    }
+}
+
+// Global stdin pointer
+void* _stdin_ptr;
+
+__attribute__((constructor)) void init_runtime() {
+    _stdin_ptr = (void*)stdin;
+}
 
 void box_drop(Box* b) {
     if (!b) return;
@@ -53,7 +68,7 @@ typedef struct { int magic; Box** items; int count; int cap; } RList;
 Box* make_list() { RList* l=malloc(sizeof(RList)); l->magic=1; l->count=0; l->cap=8; l->items=malloc(8*sizeof(Box*)); return box_p(l); }
 void list_append(Box* lst, Box* b) { RList* l=lst->p; if(l->count==l->cap){l->cap*=2; l->items=realloc(l->items,l->cap*sizeof(Box*));} l->items[l->count++]=b; }
 Box* list_get(void* col, Box* idx) {
-    RList* l=col; int i=idx->i;
+    RList* l=col; int i=idx->i - 1; /* 1-based indexing */
     if(i>=0 && i<l->count) return l->items[i];
     return box_i(0);
 }
@@ -98,7 +113,7 @@ void collection_set(Box* col_box, Box* key, Box* val) {
     int* magic = (int*)col;
     if (*magic == 1) {
         RList* l = col;
-        int i = key->i;
+        int i = key->i - 1; /* 1-based indexing */
         if(i >= 0 && i < l->count) {
             box_drop(l->items[i]);
             l->items[i] = val;
@@ -135,24 +150,28 @@ Box* collection_get_at(Box* col_box, int idx) {
 }
 
 void print_boxed(Box* b) {
-    if(!b) { printf("null\\n"); return; }
-    if(b->type==0) printf("%lld\\n", b->i);
-    else if(b->type==1) printf("%g\\n", b->f);
-    else if(b->type==2) printf("%s\\n", b->s);
+    if(!b) { printf("null\n"); fflush(stdout); return; }
+    if(b->type==0) printf("%lld\n", b->i);
+    else if(b->type==1) printf("%g\n", b->f);
+    else if(b->type==2) printf("%s\n", b->s);
     else {
         int* magic = (int*)(b->p);
-        if(magic && *magic==1) printf("<list>\\n");
-        else if(magic && *magic==2) printf("<dict>\\n");
-        else printf("<object>\\n");
+        if(magic && *magic==1) printf("<list>\n");
+        else if(magic && *magic==2) printf("<dict>\n");
+        else printf("<object>\n");
     }
+    fflush(stdout);
 }
 """
 
-def parse_file(filepath, parsed_files, combined_ast):
+def parse_file(filepath, parsed_files, combined_ast, is_main=False):
     abs_path = os.path.abspath(filepath)
     if abs_path in parsed_files:
         return
     parsed_files.add(abs_path)
+    
+    # Generate module name from file (e.g., 'math_tools' from 'math_tools.rub')
+    mod_name = os.path.splitext(os.path.basename(filepath))[0]
     
     try:
         with open(filepath, "r") as f:
@@ -165,14 +184,16 @@ def parse_file(filepath, parsed_files, combined_ast):
     ast = Parser(tokens).parse()
     
     for node in ast:
+        # Prepend module name to avoid naming collisions (only for imported files, not main)
+        if not is_main and isinstance(node, (VarDecl, FnDef, ClassDef)):
+            node.name = f"{mod_name}_{node.name}"
+            
         if isinstance(node, Import):
-            # 'import' is for external user files - resolve and parse them
             mod_file = node.module_name.replace(".", os.sep) + ".rub"
             base_dir = os.path.dirname(filepath)
             mod_path = os.path.join(base_dir, mod_file) if base_dir else mod_file
             parse_file(mod_path, parsed_files, combined_ast)
         elif isinstance(node, Use):
-            # 'use' is for built-in modules only - do not search the disk
             continue
             
     combined_ast.extend(ast)
@@ -182,8 +203,8 @@ def compile_files(source_files, output=None):
         parsed_files = set()
         combined_ast = []
         
-        for source_file in source_files:
-            parse_file(source_file, parsed_files, combined_ast)
+        for i, source_file in enumerate(source_files):
+            parse_file(source_file, parsed_files, combined_ast, is_main=(i == 0))
 
         gen = CodeGen()
         ir_code = gen.gen(combined_ast)

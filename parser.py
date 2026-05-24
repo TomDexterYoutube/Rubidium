@@ -32,6 +32,45 @@ class Parser:
             else:                  stmts += self.stmt_list_item()
         return stmts
 
+    # --- Unified Identifier Logic ---
+    def parse_identifier_chain(self, name):
+        """Unified method for parsing variable access, dots, and calls."""
+        res = Var(name)
+        while self.peek():
+            t = self.peek()
+            if t[0] == "DOT":
+                self.advance()
+                attr = self.match("IDENT")
+                if self.peek() and self.peek()[0] == "LPAREN":
+                    self.match("LPAREN")
+                    args = []
+                    while self.peek() and self.peek()[0] != "RPAREN":
+                        args.append(self.expr())
+                        if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
+                    self.match("RPAREN")
+                    res = MethodCall(res, attr, args)
+                else:
+                    res = FieldAccess(res, attr)
+            elif t[0] == "LPAREN":
+                self.match("LPAREN")
+                args = []
+                while self.peek() and self.peek()[0] != "RPAREN":
+                    args.append(self.expr())
+                    if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
+                self.match("RPAREN")
+                
+                # Intercept specialized built-ins
+                if isinstance(res, Var):
+                    if res.name == "thread" and len(args) == 2: res = ThreadCall(args[0], args[1])
+                    elif res.name == "input": res = Input(args[0] if args else None)
+                    elif res.name == "file_read" and len(args) == 1: res = FileRead(args[0])
+                    else: res = FnCall(res.name, args)
+                else:
+                    res = FnCall(res, args)
+            else:
+                break
+        return res
+
     def import_stmt(self):
         self.match("IMPORT")
         name = self.match("IDENT")
@@ -96,6 +135,7 @@ class Parser:
         elif t[0] == "BREAK":    self.match("BREAK"); return [Break()]
         elif t[0] == "RETURN":   return [self.return_stmt()]
         elif t[0] == "TRY":      return [self.try_stmt()]
+        elif t[0] == "FN":       return [self.fn_def()]
         elif t[0] == "IDENT":    return [self.ident_stmt()]
         else:
             self.advance()
@@ -170,60 +210,31 @@ class Parser:
 
     def ident_stmt(self):
         name = self.match("IDENT")
-        res = Var(name)
-        while self.peek():
-            if self.peek()[0] == "DOT":
-                self.match("DOT")
-                attr = self.match("IDENT")
-                if attr == "drop":
-                    self.match("LPAREN"); self.match("RPAREN")
-                    if isinstance(res, Var): return Drop(res.name)
-                    return Drop(name)
-                    
-                if isinstance(res, Var) and res.name == "thread" and attr == "wait":
-                    self.match("LPAREN")
-                    ids = []
-                    while self.peek() and self.peek()[0] != "RPAREN":
-                        ids.append(self.expr())
-                        if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
-                    self.match("RPAREN")
-                    return ThreadWait(ids)
-                    
-                if self.peek() and self.peek()[0] == "LPAREN":
-                    self.match("LPAREN")
-                    args = []
-                    while self.peek() and self.peek()[0] != "RPAREN":
-                        args.append(self.expr())
-                        if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
-                    self.match("RPAREN")
-                    res = MethodCall(res, attr, args)
-                else:
-                    if self.peek() and self.peek()[0] == "OP" and self.peek()[1] == "=":
-                        self.match("OP")
-                        return FieldAssign(res.obj if isinstance(res, FieldAccess) else res, attr, self.expr())
-                    res = FieldAccess(res, attr)
-                    
-            elif self.peek()[0] == "LPAREN":
+        # Handle Assignment
+        if self.peek() and self.peek()[0] == "OP" and self.peek()[1] == "=":
+            self.match("OP")
+            return Assign(name, self.expr())
+
+        # Handle thread.wait(1, 2) -> ThreadWait
+        if name == "thread" and self.peek() and self.peek()[0] == "DOT":
+            self.match("DOT")
+            attr = self.match("IDENT")
+            if attr == "wait":
                 self.match("LPAREN")
-                args = []
+                ids = []
                 while self.peek() and self.peek()[0] != "RPAREN":
-                    args.append(self.expr())
+                    ids.append(self.expr())
                     if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                 self.match("RPAREN")
-                
-                if isinstance(res, Var):
-                    if res.name == "thread" and len(args) == 2: return ThreadCall(args[0], args[1])
-                    if res.name == "file_write" and len(args) == 2: return FileWrite(args[0], args[1])
-                    res = FnCall(res.name, args)
-                else:
-                    res = FnCall(res, args)
-                    
-            elif self.peek()[0] == "OP" and self.peek()[1] == "=":
-                self.match("OP")
-                if isinstance(res, Var): return Assign(res.name, self.expr())
-                break
-            else:
-                break
+                return ThreadWait(ids)
+
+        # Handle Drop intercept
+        res = self.parse_identifier_chain(name)
+        if isinstance(res, FieldAccess) and res.field == "drop":
+            return Drop(res.obj.name)
+        if isinstance(res, MethodCall) and res.method == "drop":
+            obj_name = res.obj.name if hasattr(res.obj, "name") else str(res.obj)
+            return Drop(obj_name)
         return res
 
     def expr(self):       return self.logical_or()
@@ -321,6 +332,20 @@ class Parser:
         if tok[0] == "IDENT":
             self.advance()
             name = tok[1]
+            # Handle thread.wait(...) in expression context
+            if name == "thread" and self.peek() and self.peek()[0] == "DOT":
+                saved_pos = self.pos
+                self.match("DOT")
+                attr = self.match("IDENT")
+                if attr == "wait":
+                    self.match("LPAREN")
+                    ids = []
+                    while self.peek() and self.peek()[0] != "RPAREN":
+                        ids.append(self.expr())
+                        if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
+                    self.match("RPAREN")
+                    return ThreadWait(ids)
+                self.pos = saved_pos
             res = Var(name)
             while self.peek():
                 if self.peek()[0] == "DOT":
