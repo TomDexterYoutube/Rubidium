@@ -13,6 +13,12 @@ class Str:
     def __init__(self, value):
         self.value = value
 
+class InterpolatedStr:
+    """Represents i"..." strings with {expr} interpolation.
+    parts is a list of alternating Str and expression nodes."""
+    def __init__(self, parts):
+        self.parts = parts
+
 class Var:
     def __init__(self, name):
         self.name = name

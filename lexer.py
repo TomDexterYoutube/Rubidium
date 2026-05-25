@@ -2,6 +2,7 @@ import re
 
 TOKEN_SPEC = [
     ("NUMBER",   r"\d+\.\d+|\d+"),
+    ("ISTRING",  r'i"[^"]*"'),
     ("STRING",   r'"[^"]*"'),
     ("BOOL",     r"True|False|None"),
 
@@ -29,7 +30,7 @@ TOKEN_SPEC = [
     ("OR",       r"or\b"),
     ("NOT",      r"not\b"),
 
-    ("TYPE",     r"\b(?:i8|i16|i32|i64|i128|i256|f4|f8|f16|f32|f64|f128|f256|str|bool|list|index|dict)\b"),
+    ("TYPE",     r"\b(?:i4|i8|i16|i32|i64|i128|i256|f4|f8|f16|f32|f64|f128|f256|str|bool|list|index|dict)\b"),
 
     ("IDENT",    r"[a-zA-Z_][a-zA-Z0-9_]*"),
 

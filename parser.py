@@ -360,6 +360,13 @@ class Parser:
                 else:
                     res = FieldAccess(res, attr)
             return res
+        if tok[0] == "ISTRING":
+            self.advance()
+            # tok[1] is like i"Hello {x} world {y}"
+            # Strip the leading i and the surrounding quotes
+            raw = tok[1][2:-1]  # remove i" and "
+            return self._parse_istring_parts(raw)
+
         if tok[0] == "NOT":
             self.advance(); return UnaryOp("not", self.factor())
         if tok[0] == "LPAREN":
@@ -421,3 +428,31 @@ class Parser:
 
         self.advance()
         return Number(0)
+
+    def _parse_istring_parts(self, raw):
+        """Parse an i"..." string body into an InterpolatedStr node.
+        Splits on {identifier} patterns. Each piece is either a Str literal
+        or a Var node (simple variable reference)."""
+        import re
+        parts = []
+        # Split on {varname} tokens - support simple identifiers only
+        pattern = re.compile(r'\{([a-zA-Z_][a-zA-Z0-9_]*)\}')
+        last = 0
+        for m in pattern.finditer(raw):
+            # text before this placeholder
+            before = raw[last:m.start()]
+            if before:
+                parts.append(Str(before))
+            parts.append(Var(m.group(1)))
+            last = m.end()
+        # trailing text
+        after = raw[last:]
+        if after:
+            parts.append(Str(after))
+        # If nothing was parsed (no interpolations), just return a plain Str
+        if not parts:
+            return Str(raw)
+        # If only one part and it's a Str, return it directly
+        if len(parts) == 1 and isinstance(parts[0], Str):
+            return parts[0]
+        return InterpolatedStr(parts)

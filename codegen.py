@@ -97,6 +97,7 @@ class CodeGen:
 
     def rubi_type_to_ir(self, t):
         if t in ("list", "index", "dict"):         return "%Box*"
+        if t == "i4":                              return "i8"  # 4-bit stored in 8-bit
         if t == "i8":                              return "i8"
         if t == "i16":                             return "i16"
         if t in ("i32", None):                     return "i64"
@@ -239,6 +240,7 @@ class CodeGen:
         if isinstance(node, Bool): return "i1"
         if isinstance(node, None_): return "i64"
         if isinstance(node, Str): return "i8*"
+        if isinstance(node, InterpolatedStr): return "i8*"
         if isinstance(node, (ListExpr, DictExpr)): return "%Box*"
         if isinstance(node, (Input, FileRead)): return "i8*"
         
@@ -765,6 +767,47 @@ class CodeGen:
             lbl, blen = self.intern_str(node.value); ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{blen} x i8], [{blen} x i8]* {lbl}, i64 0, i64 0')
             return ptr, "i8*"
+        if isinstance(node, InterpolatedStr):
+            # Build result by concatenating all parts
+            # Start with an empty string, then strcat each part
+            # Pre-compute total length at runtime and malloc once
+            # For simplicity: build iteratively with malloc+strcpy+strcat
+            # First convert all parts to i8* strings
+            part_vals = []
+            for part in node.parts:
+                pv, pt = self.emit_expr(part)
+                pv = self.coerce_to_string(pv, pt)
+                part_vals.append(pv)
+            # Sum all lengths
+            if len(part_vals) == 0:
+                empty_lbl, elen = self.intern_str("")
+                ep = self.new_tmp()
+                self.emit(f'  {ep} = getelementptr [{elen} x i8], [{elen} x i8]* {empty_lbl}, i64 0, i64 0')
+                return ep, "i8*"
+            if len(part_vals) == 1:
+                return part_vals[0], "i8*"
+            # Sum lengths of all parts
+            total = self.new_tmp()
+            lens = [self.new_tmp() for _ in part_vals]
+            for i, pv in enumerate(part_vals):
+                self.emit(f"  {lens[i]} = call i64 @strlen(i8* {pv})")
+            # Add them up
+            acc = lens[0]
+            for i in range(1, len(lens)):
+                nacc = self.new_tmp()
+                self.emit(f"  {nacc} = add i64 {acc}, {lens[i]}")
+                acc = nacc
+            total_plus1 = self.new_tmp()
+            self.emit(f"  {total_plus1} = add i64 {acc}, 1")
+            buf = self.new_tmp()
+            self.emit(f"  {buf} = call i8* @malloc(i64 {total_plus1})")
+            # Copy first part
+            self.emit(f"  call i8* @strcpy(i8* {buf}, i8* {part_vals[0]})")
+            # Concatenate remaining parts
+            for pv in part_vals[1:]:
+                self.emit(f"  call i8* @strcat(i8* {buf}, i8* {pv})")
+            return buf, "i8*"
+
         if isinstance(node, ListExpr):
             lst = self.new_tmp()
             self.emit(f"  {lst} = call %Box* @make_list()")
@@ -788,6 +831,7 @@ class CodeGen:
                     fmt, flen = self.intern_str("%s"); ptr = self.new_tmp()
                     self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
                     self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, i8* {pv})')
+                    self.emit(f'  call i32 @fflush(i8* null)')
             result = self.new_tmp()
             self.emit(f"  {result} = call i8* @_rubidium_input_line()")
             return result, "i8*"
@@ -1009,6 +1053,10 @@ class CodeGen:
         # This bypasses the class method logic entirely
         if node.method == "set" and isinstance(node.obj, FnCall):
             return self.emit_collection_set(node)
+        
+        # 2a. Handle FieldAccess.set(value) for class fields (e.g., class_one.obj_val.set(99))
+        if node.method == "set" and isinstance(node.obj, FieldAccess):
+            return self.emit_field_assign(FieldAssign(node.obj.obj, node.obj.field, node.args[0]))
 
         # 2b. Handle built-in module method calls: time.sleep, random.shuffle, random.choice
         if obj_name == "time" and node.method == "sleep":
@@ -1217,16 +1265,42 @@ class CodeGen:
 
     def emit_binop(self, node):
         l, lt = self.emit_expr(node.left); r, rt = self.emit_expr(node.right)
-        if lt == "i8*" and rt == "i8*" and node.op == "+":
-            llen, rlen, total, total2, buf = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
-            self.emit(f"  {llen} = call i64 @strlen(i8* {l})")
-            self.emit(f"  {rlen} = call i64 @strlen(i8* {r})")
-            self.emit(f"  {total} = add i64 {llen}, {rlen}")
-            self.emit(f"  {total2} = add i64 {total}, 1")
-            self.emit(f"  {buf} = call i8* @malloc(i64 {total2})")
-            self.emit(f"  call i8* @strcpy(i8* {buf}, i8* {l})")
-            self.emit(f"  call i8* @strcat(i8* {buf}, i8* {r})")
-            return buf, "i8*"
+        if node.op == "+":
+            # String + String -> String concatenation
+            if lt == "i8*" and rt == "i8*":
+                llen, rlen, total, total2, buf = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
+                self.emit(f"  {llen} = call i64 @strlen(i8* {l})")
+                self.emit(f"  {rlen} = call i64 @strlen(i8* {r})")
+                self.emit(f"  {total} = add i64 {llen}, {rlen}")
+                self.emit(f"  {total2} = add i64 {total}, 1")
+                self.emit(f"  {buf} = call i8* @malloc(i64 {total2})")
+                self.emit(f"  call i8* @strcpy(i8* {buf}, i8* {l})")
+                self.emit(f"  call i8* @strcat(i8* {buf}, i8* {r})")
+                return buf, "i8*"
+            # String + Other -> Convert other to string and concatenate  
+            if lt == "i8*" and rt != "i8*":
+                str_r = self.coerce_to_string(r, rt)
+                llen, rlen, total, total2, buf = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
+                self.emit(f"  {llen} = call i64 @strlen(i8* {l})")
+                self.emit(f"  {rlen} = call i64 @strlen(i8* {str_r})")
+                self.emit(f"  {total} = add i64 {llen}, {rlen}")
+                self.emit(f"  {total2} = add i64 {total}, 1")
+                self.emit(f"  {buf} = call i8* @malloc(i64 {total2})")
+                self.emit(f"  call i8* @strcpy(i8* {buf}, i8* {l})")
+                self.emit(f"  call i8* @strcat(i8* {buf}, i8* {str_r})")
+                return buf, "i8*"
+            # Other + String -> Convert other to string and concatenate
+            if lt != "i8*" and rt == "i8*":
+                str_l = self.coerce_to_string(l, lt)
+                llen, rlen, total, total2, buf = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
+                self.emit(f"  {llen} = call i64 @strlen(i8* {str_l})")
+                self.emit(f"  {rlen} = call i64 @strlen(i8* {r})")
+                self.emit(f"  {total} = add i64 {llen}, {rlen}")
+                self.emit(f"  {total2} = add i64 {total}, 1")
+                self.emit(f"  {buf} = call i8* @malloc(i64 {total2})")
+                self.emit(f"  call i8* @strcpy(i8* {buf}, i8* {str_l})")
+                self.emit(f"  call i8* @strcat(i8* {buf}, i8* {r})")
+                return buf, "i8*"
         common = "double" if (lt in ("float","double") or rt in ("float","double")) else "i64"
         l = self.coerce(l, lt, common); r = self.coerce(r, rt, common)
         tmp = self.new_tmp()
@@ -1290,6 +1364,31 @@ class CodeGen:
             self.emit(f"  {tmp} = call %Box* @box_p(i8* {v})")
         return tmp
 
+    def coerce_to_string(self, val, t):
+        """Convert a value of any type to a string (i8*)"""
+        if t == "i8*":
+            return val
+        tmp = self.new_tmp()
+        buf = self.new_tmp()
+        if t in ("i1", "i8", "i16", "i32", "i64"):
+            fmt_lbl, flen = self.intern_str("%lld")
+            fmt_ptr = self.new_tmp()
+            self.emit(f"  {buf} = call i8* @malloc(i64 32)")
+            self.emit(f"  {fmt_ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt_lbl}, i64 0, i64 0")
+            cv = self.coerce(val, t, "i64")
+            self.emit(f"  {tmp} = call i32 (i8*, i8*, ...) @sprintf(i8* {buf}, i8* {fmt_ptr}, i64 {cv})")
+            return buf
+        elif t in ("float", "double"):
+            fmt_lbl, flen = self.intern_str("%g")
+            fmt_ptr = self.new_tmp()
+            self.emit(f"  {buf} = call i8* @malloc(i64 32)")
+            self.emit(f"  {fmt_ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt_lbl}, i64 0, i64 0")
+            dv = self.coerce(val, t, "double")
+            self.emit(f"  {tmp} = call i32 (i8*, i8*, ...) @sprintf(i8* {buf}, i8* {fmt_ptr}, double {dv})")
+            return buf
+        else:
+            return val
+
     def coerce(self, val, from_t, to_t):
         if from_t == to_t: return val
         tmp = self.new_tmp()
@@ -1316,7 +1415,24 @@ class CodeGen:
             self.emit(f"  {tmp2} = bitcast i8* {tmp} to {to_t}")
             return tmp2
         if to_t == "%Box*": return self.coerce_to_box(val, from_t)
-        int_types = {"i1","i8","i16","i32","i64"}
+        int_types = {"i1","i4","i8","i16","i32","i64"}
+        # i4 is stored as i8, so handle it specially
+        if from_t == "i4" and to_t in int_types:
+            if to_t == "i4":
+                return val
+            tmp2 = self.new_tmp()
+            self.emit(f"  {tmp2} = sext i8 {val} to i64")  # i4 is stored as i8, sign-extend to i64
+            if to_t == "i64":
+                return tmp2
+            tmp3 = self.new_tmp()
+            self.emit(f"  {tmp3} = trunc i64 {tmp2} to {to_t}")
+            return tmp3
+        if to_t == "i4":
+            # Converting to i4 - store as i8 (lower 4 bits)
+            if from_t in int_types:
+                tmp2 = self.new_tmp()
+                self.emit(f"  {tmp2} = trunc {from_t} {val} to i8")  # Truncate to i8
+                return tmp2
         if from_t in int_types and to_t in int_types:
             instr = "zext" if from_t == "i1" else ("sext" if int(to_t[1:]) > int(from_t[1:]) else "trunc")
             self.emit(f"  {tmp} = {instr} {from_t} {val} to {to_t}")
