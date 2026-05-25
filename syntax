@@ -7,6 +7,7 @@
 # -------------------------------
 # VARIABLES & DATA TYPES
 # -------------------------------
+
 # Declare variables with optional types:
 # Integer types: i8, i16, i32, i64, i128, i256
 # Floating types: f4, f8, f16, f32, f64, f128, f256
@@ -33,6 +34,7 @@ let float_val: f64 = 100 as f64
 # -------------------------------
 # TYPE CHECKING
 # -------------------------------
+
 # Rubidium performs compile-time type checking:
 # - assigning the wrong type raises a compile-time error
 # Example (will error):
@@ -42,6 +44,7 @@ let float_val: f64 = 100 as f64
 # -------------------------------
 # MATH & LOGIC
 # -------------------------------
+
 # Standard operators: +, -, *, /
 # Operator precedence (BODMAS) applies
 let calc1 = 1 + 2 * 3       # equals 7
@@ -56,6 +59,7 @@ let cond: bool = True and not False
 # -------------------------------
 # STRINGS & BUILT-IN METHODS
 # -------------------------------
+
 let greeting: str = "Hello, "
 let target: str = "World!"
 
@@ -72,6 +76,7 @@ let num_val: i64 = number_str.to(i32)   # Converts "404" to 404
 # -------------------------------
 # DYNAMIC COLLECTIONS (list, index, dict)
 # -------------------------------
+
 # Collections dynamically manage boxed memory under the hood.
 
 # 1. Lists (Arrays)
@@ -101,8 +106,14 @@ my_dict("nested", 1).set(99)
 # -------------------------------
 # PRINT & I/O
 # -------------------------------
+
 print(x)
 print("Hello, Rubidium!")
+
+# Print outputs text then moves to a new line if x = 10 then the2 lines of code above would give
+# Output:
+10
+Hello, Rubidium!
 
 println("Hi")
 println(0)
@@ -133,6 +144,7 @@ print(file_contents)
 # -------------------------------
 # DEEP MEMORY DROPS
 # -------------------------------
+
 # Drop a variable:
 # x.drop() frees memory, variable no longer exists
 x.drop()
@@ -145,6 +157,7 @@ my_dict.drop()
 # -------------------------------
 # CONDITIONALS
 # -------------------------------
+
 if calc1 == 7 {
     print("True")
 } else if calc1 > 10 {
@@ -156,6 +169,7 @@ if calc1 == 7 {
 # -------------------------------
 # LOOPS & ITERATION
 # -------------------------------
+
 # While loop:
 let mut count = 0
 while count < 5 {
@@ -200,6 +214,7 @@ let math_result = add(2, 3)
 # -------------------------------
 # ERROR HANDLING
 # -------------------------------
+
 # try and error blocks:
 try {
     let fail: i32 = 10 / 0   # division by zero
@@ -212,6 +227,7 @@ try {
 # -------------------------------
 # CLASSES
 # -------------------------------
+
 # Classes are like fully self-contained units
 
 class my_class() {
@@ -243,9 +259,12 @@ def main() {
     # outside the class you have to have the class name as well its the same with mutable files
 }
 
+
+
 # -------------------------------
 # HARDWARE THREADING
 # -------------------------------
+
 # You can run code concurrently using real POSIX threading
 
 fn task1() {
@@ -266,11 +285,48 @@ fn run_threads() {
 }
 
 # -------------------------------
+# RANDOM
+# -------------------------------
+
+# The built in random moudule is very useful
+
+data = random(0, 1, f32)
+
+# The use if show here the minum value the max value and the type
+# In this example it can only be a number
+
+random.shuffle(my_list)
+# This randomizes the values in the list
+# This only works on Lists
+
+random.choice(my_list())
+random.choice(my_index())
+# This picks a random value for list it picks a random value
+# For a index it would pick a random idenifer
+
+random.choice(my_dict())
+random.choice(my_dict("my_idenifer"))
+# for the first example it picks a random idenifer
+# for the second it would pick a random value that is in the idenifer
+
+# -------------------------------
+# WAIT
+# -------------------------------
+
+time.sleep(10)
+# waits ten seconds
+
+# -------------------------------
 # MODULES & IMPORTS
 # -------------------------------
-# Use 'use' to include compiler-provided built-ins:
-use thread
 
+# Use 'use' to include compiler-provided built-ins:
+# It must by include by use for the following
+use thread
+use random
+use time
+
+# If use is not there it must not work 
 # Use 'import' to include your own external .rub files:
 # (e.g., this will load and compile math_tools.rub)
 import math_tools
