@@ -168,6 +168,14 @@ println(0)
 #
 # Bye
 
+# You can also put varbables like this
+
+print("Hello" + x)
+# OR
+print(i"Hello {x}"
+
+# This also works with println
+
 # Standard input
 
 let user_input: str = input("Enter your name: ")
