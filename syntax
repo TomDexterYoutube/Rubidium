@@ -1,59 +1,73 @@
 # -----------------------------------------
 # Rubidium Programming Language Syntax
 # File extension: .rub
-# Python-style readability + Rust-style static typing and memory safety
+# Designed for beginners. Built to scale into real systems programming.
 # -----------------------------------------
 
 # -------------------------------
 # VARIABLES & DATA TYPES
 # -------------------------------
 
-# Declare variables with optional types:
-# Integer types: i8, i16, i32, i64, i128, i256
-# Floating types: f4, f8, f16, f32, f64, f128, f256
-# String: str
-# Boolean: bool (True / False)
+# Declare variables with optional types.
+#
+# Integer types:
+# i8, i16, i32, i64, i128, i256
+#
+# Floating-point types:
+# f4, f8, f16, f32, f64, f128, f256
+#
+# Other built-in types:
+# str   = String
+# bool  = True / False
 
-let x = 10           # type inferred as i32
-let mut y: i32 = 5    # mutable integer
+let x = 10                  # Type inferred as i32
+let mut y: i32 = 5          # Mutable integer
 let name: str = "Rubidium"
-let f: f64 = 3.14
-let b: bool = True    # Boolean type
+let mut f: f64 = 3.14
+let mut b: bool = True
 
-# Reassigning mutable variables:
+# Reassigning mutable variables
 y = 15
 f = 2.718
 b = False
 
-# Type Casting (as):
+# Type casting using 'as'
 let large_num: i64 = y as i64
 let float_val: f64 = 100 as f64
 
-# all variable are global execpt across files and ones in classes
+# Variables are global by default.
+# Functions, classes, and imported files create isolated scopes.
 
 # -------------------------------
 # TYPE CHECKING
 # -------------------------------
 
-# Rubidium performs compile-time type checking:
-# - assigning the wrong type raises a compile-time error
+# Rubidium performs compile-time type checking.
+# Assigning the wrong type will raise a compiler error.
+
 # Example (will error):
 # let val: i32 = 5
-# val = "hello"      # type mismatch
+# val = "hello"
 
 # -------------------------------
 # MATH & LOGIC
 # -------------------------------
 
-# Standard operators: +, -, *, /
+# Standard operators:
+# +, -, *, /
+
 # Operator precedence (BODMAS) applies
 let calc1 = 1 + 2 * 3       # equals 7
 let calc2 = (1 + 2) * 3     # equals 9
 
-# Comparison operators: ==, !=, >, <, >=, <=
-let check: bool = calc1 > 5  # True
+# Comparison operators:
+# ==, !=, >, <, >=, <=
 
-# Logical operators: and, or, not
+let check: bool = calc1 > 5
+
+# Logical operators:
+# and, or, not
+
 let cond: bool = True and not False
 
 # -------------------------------
@@ -63,94 +77,123 @@ let cond: bool = True and not False
 let greeting: str = "Hello, "
 let target: str = "World!"
 
-# String concatenation (returns a new heap-allocated string)
-let full_msg = greeting.combine(target)  # "Hello, World!"
-let combined = greeting + target        # "Hello, World!"
+# String concatenation
+# Returns a new heap-allocated string
+
+let full_msg = greeting.combine(target)
+let combined = greeting + target
 
 # String methods
-let length: i64 = full_msg.len()         # Returns length of string
-let has_world: bool = full_msg.has("World") # True
+
+let length: i64 = full_msg.len()
+let has_world: bool = full_msg.has("World")
+
 let number_str: str = "404"
-let num_val: i64 = number_str.to(i32)   # Converts "404" to 404
+let num_val: i64 = number_str.to(i32)
 
 # -------------------------------
-# DYNAMIC COLLECTIONS (list, index, dict)
+# DYNAMIC COLLECTIONS
+# (list, index, dict)
 # -------------------------------
 
-# Collections dynamically manage boxed memory under the hood.
+# Collections dynamically manage boxed memory internally.
+
+# Lists start at index 1 instead of 0.
+# This matches how humans naturally count sequences.
 
 # 1. Lists (Arrays)
+
 let my_list: list = ["64534", 2.124, "hi"]
+
 print(my_list(3))             # prints: hi
 
-# 2. Indexes (Key-Value pairs with mixed types)
-let my_index: index = ["one": "hello", 2: "no", 2.3: 123]
+# 2. Indexes
+# Key-value collections with mixed key and value types
+
+let my_index: index = [
+    "one": "hello",
+    2: "no",
+    2.3: 123
+]
+
 print(my_index("one"))        # prints: hello
 
-# 3. Dicts (Structured Key-Value blocks)
+# 3. Dicts
+# Structured key-value collections
+
 let my_dict: dict = {
     "nested" = [1, "hi", 4],
     "no" = [1, 7, 4]
 }
 
-# Accessing Nested Collections
-print(my_dict("nested", 2))     # prints: hi (bracketless dot syntax)
+# Accessing nested collections
 
-# Mutating Collections via .set()
+print(my_dict("nested", 2))   # prints: hi
+
+# Mutating collections using .set()
+
 my_list(2).set("why")
 my_index("one").set("changed")
 my_dict("nested", 1).set(99)
 
-# with lists and dicts the first thing is always 1 not 0 
-
 # -------------------------------
-# PRINT & I/O
+# PRINT & INPUT / OUTPUT
 # -------------------------------
 
 print(x)
 print("Hello, Rubidium!")
 
-# Print outputs text then moves to a new line if x = 10 then the2 lines of code above would give
-# Output:
-10
-Hello, Rubidium!
+# print() outputs text and moves to a new line.
+#
+# Example output:
+#
+# 10
+# Hello, Rubidium!
 
 println("Hi")
 println(0)
 
-# println() prints text or values to the console
-# without creating a new line.
-
-# If println() is called again, the previous text
-# on that line is cleared and replaced.
+# println() updates the current console line
+# instead of creating a new one.
+#
+# Calling println() again replaces the previous
+# text on that line.
 
 # Example:
+#
 # println("Hi")
 # println("Bye")
-
+#
 # Output:
+#
 # Bye
 
-# Standard Input
+# Standard input
+
 let user_input: str = input("Enter your name: ")
 
-# File Operations
+# File operations
+
 file_write("data.txt", "Saving this to disk!")
+
 let file_contents str = file_read("data.txt")
+
 print(file_contents)
 
-# "\n" would cause a newline
+# "\n" creates a new line
 
 # -------------------------------
 # DEEP MEMORY DROPS
 # -------------------------------
 
-# Drop a variable:
-# x.drop() frees memory, variable no longer exists
+# .drop() frees memory immediately.
+# The variable will no longer exist after being dropped.
+
 x.drop()
 
-# For collections and strings, .drop() recursively frees 
-# all nested boxes, arrays, and keys, preventing leaks!
+# Collections and strings recursively free all
+# nested boxes, arrays, and keys.
+
 my_list.drop()
 my_dict.drop()
 
@@ -170,31 +213,46 @@ if calc1 == 7 {
 # LOOPS & ITERATION
 # -------------------------------
 
-# While loop:
+# While loop
+
 let mut count = 0
+
 while count < 5 {
     print(count)
     count = count + 1
 }
 
-# For loop (Numerical Range):
+# Numerical range loop
+
 for i in range(1, 10) {
+
     if i == 5 {
-        break   # Exits the innermost loop
+        break
     }
+
     print(i)
 }
 
-# Collection Iteration (for-in loops):
+# List iteration
+
 let items: list = [10, 20, 30]
+
 for item in items {
-    print(item) # Prints 10, then 20, then 30
+    print(item)
 }
 
-# Dict Iteration (yields the keys):
-let table: dict = {"a" = 100, "b" = 200}
+# Dict iteration
+# Iteration returns the keys
+
+let table: dict = {
+    "a" = 100,
+    "b" = 200
+}
+
 for key in table {
-    let val = table(key) # Extract the value dynamically
+
+    let val = table(key)
+
     print(val)
 }
 
@@ -202,70 +260,94 @@ for key in table {
 # FUNCTIONS & SCOPING
 # -------------------------------
 
-# Function with parameters and return type:
+# Function with parameters and return type
+
 fn add(a: i32, b: i32) -> i32 {
+
     let local_var = a + b
+
     return local_var
 }
 
-# Call function:
+# Calling a function
+
 let math_result = add(2, 3)
 
 # -------------------------------
 # ERROR HANDLING
 # -------------------------------
 
-# try and error blocks:
+# try/error blocks
+
 try {
-    let fail: i32 = 10 / 0   # division by zero
+
+    let fail: i32 = 10 / 0
+
 } error {
+
     print("An error occurred" + error)
 }
 
-# the error block shows the error that occurred as a str 
+# The error block exposes the error as a string.
 
 # -------------------------------
 # CLASSES
 # -------------------------------
 
-# Classes are like fully self-contained units
+# Classes are self-contained object structures.
 
 class my_class() {
+
     let mut obj_val: i32 = 10
-    
+
     fn my_func() {
         print("Hello from class!")
     }
 }
 
-# Classes can be instantiated and used like this:
+# Creating and using a class instance
+
 fn run_class() {
+
     let class_one = my_class()
+
     print(class_one.obj_val)
-    class_one.obj_val = 99
+
+    class_one.obj_val.set(99)
+
     class_one.my_func()
 }
 
-# with classes there is not self but instade since varable are local to a class in the class you just call them
+# Inside a class there is no 'self'.
+# Class variables are directly accessible
+# from inside the class scope.
 
-call my_class() {
+class my_class() {
+
     let x = 10
-    print(x)
 }
 
-def main() {
+fn main() {
+
     let mut stuff = my_class()
+
     print(stuff.x)
-    # outside the class you have to have the class name as well its the same with mutable files
 }
 
-
+# Mutation rules:
+#
+# - If the class instance is immutable,
+#   all contained variables are immutable.
+#
+# - If the class instance is mutable,
+#   only variables declared with 'mut'
+#   can be changed.
 
 # -------------------------------
 # HARDWARE THREADING
 # -------------------------------
 
-# You can run code concurrently using real POSIX threading
+# Rubidium supports real POSIX threading.
 
 fn task1() {
     print("Task 1 Finished")
@@ -276,11 +358,15 @@ fn task2() {
 }
 
 fn run_threads() {
-    # thread(function(), thread_id) runs the function asynchronously
+
+    # thread(function(), thread_id)
+    # runs the function asynchronously
+
     thread(task1(), 1)
     thread(task2(), 2)
-    
-    # Wait for specific thread IDs to return before moving on
+
+    # Wait for specific threads to finish
+
     thread.wait(1, 2)
 }
 
@@ -288,55 +374,64 @@ fn run_threads() {
 # RANDOM
 # -------------------------------
 
-# The built in random moudule is very useful
+# The built-in random module provides
+# random number generation and utilities.
 
 data = random(0, 1, f32)
 
-# The use if show here the minum value the max value and the type
-# In this example it can only be a number
+# random(min, max, type)
+#
+# Example:
+# random(0, 1, f32)
+
+# Randomize list order
 
 random.shuffle(my_list)
-# This randomizes the values in the list
-# This only works on Lists
 
-random.choice(my_list())
-random.choice(my_index())
-# This picks a random value for list it picks a random value
-# For a index it would pick a random idenifer
+# Picks a random value or identifier
 
-random.choice(my_dict())
+random.choice(my_list)
+random.choice(my_index)
+
+random.choice(my_dict)
 random.choice(my_dict("my_idenifer"))
-# for the first example it picks a random idenifer
-# for the second it would pick a random value that is in the idenifer
 
 # -------------------------------
-# WAIT
+# WAIT / TIME
 # -------------------------------
 
 time.sleep(10)
-# waits ten seconds
+
+# Waits for 10 seconds
 
 # -------------------------------
 # MODULES & IMPORTS
 # -------------------------------
 
-# Use 'use' to include compiler-provided built-ins:
-# It must by include by use for the following
+# Use 'use' to enable compiler-provided modules.
+
 use thread
 use random
 use time
 
-# If use is not there it must not work 
-# Use 'import' to include your own external .rub files:
-# (e.g., this will load and compile math_tools.rub)
+# If a module is not included with 'use',
+# it cannot be accessed.
+
+# Use 'import' to load external .rub files
+
 import math_tools
 
 # -------------------------------
 # MAIN ENTRY POINT
 # -------------------------------
-# The compiler strictly looks for main() as the execution entry point.
+
+# The compiler always looks for main()
+# as the program entry point.
+
 fn main() {
+
     print("Welcome to Rubidium!")
+
     run_class()
     run_threads()
 }
@@ -344,14 +439,16 @@ fn main() {
 # -------------------------------
 # NOTES
 # -------------------------------
-# - All statements end with a newline (no semicolons)
-# - Variables can be mutable (mut) or immutable
+
+# - Statements end with a newline
+# - Semicolons are not required
+# - Variables can be mutable or immutable
 # - Functions support optional return types
 # - Math follows standard precedence rules
 # - if / else and loops use braces { }
-# - Strings in quotes: "text"
-# - drop() frees memory completely
-# - Type checking at compile time prevents type mismatches
-# - Boolean type: bool (True / False)
-# - Logical operators: and, or, not
-# - Error handling: try { ... } on_error { ... }
+# - Strings use double quotes
+# - .drop() immediately frees memory
+# - Type checking happens at compile time
+# - Boolean values are True and False
+# - Logical operators are and, or, and not
+# - Error handling uses try/error blocks
