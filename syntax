@@ -11,10 +11,10 @@
 # Declare variables with optional types.
 #
 # Integer types:
-# i8, i16, i32, i64, i128, i256
+# i32, i64, i128, i256, f512, f1024, f2048
 #
 # Floating-point types:
-# f4, f8, f16, f32, f64, f128, f256
+# f32, f64, f128, f256, f512, f1024, f2048
 #
 # Other built-in types:
 # str   = String
@@ -55,6 +55,7 @@ let float_val: f64 = 100 as f64
 
 # Standard operators:
 # +, -, *, /
+# Also ** for to the power of and */ for square root
 
 # Operator precedence (BODMAS) applies
 let calc1 = 1 + 2 * 3       # equals 7
@@ -172,7 +173,7 @@ println(0)
 
 print("Hello" + x)
 # OR
-print(i"Hello {x}"
+print(i"Hello {x}")
 
 # This also works with println
 
@@ -408,9 +409,61 @@ random.choice(my_dict("my_idenifer"))
 # WAIT / TIME
 # -------------------------------
 
-time.sleep(10)
+time.wait(10)
 
 # Waits for 10 seconds
+
+time.timer_start(1, f64)
+
+# Starts a named timer. The number is the timer ID (like thread IDs).
+# Multiple timers can run at once using different IDs.
+
+time.timer_pause(1)
+
+# Pauses the timer with the given ID
+
+time.timer_stop(1)
+
+# Stops the timer with the given ID.
+
+let elapsed = time.timer_read(1)
+
+# Reads the elapsed time in Senconds then . miliseconds for the given timer ID.
+# Returns as the float type spesifed in this eg would be f64.
+
+# -------------------------------
+# OS
+# -------------------------------
+
+os.start(1)
+# Starts a terminal for rubidium, this is a os terminal for eg on linux with bash it would start a bash terminal for rubidium with the idenifer 1
+# This terminal is not visible it is only for Rubidium
+
+os.run(1, "ls -a")
+
+# Runs commands in the terminal
+
+let data = os.run(1, "sudo apt update")
+
+# this would run the command then return all the outputs since apt would need a y to continue you do
+
+let data = os.run(1, "sudo apt update", "y")
+
+# This would send y as soon as there is a chance for input
+
+os(1).drop()
+
+# Dropping works the same as variables
+
+# Now the terminal is the same for rubidium as opening a terminal emulator on your computer all the env and OVERRIDE=1 and such work the same
+
+# If you hate yourself this also works for the run syntax
+
+let result = os.run({
+    cmd: "apt",
+    args: ["update"],
+    input: "y\n"
+})
 
 # -------------------------------
 # MODULES & IMPORTS
@@ -421,6 +474,8 @@ time.sleep(10)
 use thread
 use random
 use time
+use os
+use FFI
 
 # If a module is not included with 'use',
 # it cannot be accessed.
@@ -445,9 +500,44 @@ fn main() {
 }
 
 # -------------------------------
+# FFI
+# -------------------------------
+
+# For C, C++, C# and my favorite flavor of pain (the least brain hurt): RUST
+
+let c_file = FFI("data/file.so")
+
+# This loads the shared library into the identifier `c_file`.
+
+# If a function declaration starts with an identifier
+# that was created using FFI(...),
+# then the compiler treats it as a foreign function binding.
+
+fn c_file printfn(var: str) -> i32
+
+# Meaning:
+# - c_file = loaded foreign library
+# - printfn = function symbol inside the library
+# - (var: str) -> i32 = type signature for ABI mapping and type checking
+#
+# This does NOT define a normal function.
+# It creates a binding to an external function.
+
+# After binding, the function can be called like a normal function.
+
+printfn("hello")
+
+# This executes the bound foreign function from the external library.
+
+# -------------------------------
 # NOTES
 # -------------------------------
 
+# - FFI libraries are loaded using FFI("path").
+# - Bound functions are resolved at compile/load time.
+# - The first identifier in the fn statement must be an FFI handle.
+# - The second identifier is the symbol name inside the library.
+# - The function signature is used for type safety and ABI layout.
 # - Statements end with a newline
 # - Semicolons are not required
 # - Variables can be mutable or immutable
