@@ -20,6 +20,7 @@ declare void @dict_set(%Box*, %Box*, %Box*)
 declare %Box* @collection_get(%Box*, %Box*)
 declare void @collection_set(%Box*, %Box*, %Box*)
 declare void @print_boxed(%Box*)
+declare i8* @box_to_cstr(%Box*)
 declare i32 @collection_len(%Box*)
 declare %Box* @collection_get_at(%Box*, i32)
 declare void @box_drop(%Box*)
@@ -57,6 +58,7 @@ class CodeGen:
         self.functions    = {}
         self.loop_end_stack = []
         self.cur_class    = None
+        self._alloca_emitted = set()  # local var names that already have an alloca in current fn
         self._try_error_label = None  # set while inside a try body for div-by-zero guards
         self._pending_trampolines = []  # trampoline fn_lines to emit after current function
 
@@ -102,14 +104,48 @@ class CodeGen:
     def emit(self, line):
         self.fn_lines.append(line)
 
+    # -------------------------------------------------------
+    # Type system: rank-based promotion for mixed-width math
+    # -------------------------------------------------------
+    # Integer IR types are exact LLVM widths (iN).
+    # Float types: f32→float, f64→double, f128+→fp128
+    # (LLVM only has native float/double/fp128; f256+ map to fp128)
+    _INT_IR = {"i32": "i32", "i64": "i64", "i128": "i128",
+               "i256": "i256", "i512": "i512", "i1024": "i1024", "i2048": "i2048"}
+    _FLT_IR = {"f32": "float", "f64": "double",
+               "f128": "fp128", "f256": "fp128", "f512": "fp128",
+               "f1024": "fp128", "f2048": "fp128"}
+    # Rank: higher = wider. Floats outrank all ints.
+    _TYPE_RANK = {
+        "i1": 0, "i32": 1, "i64": 2, "i128": 3,
+        "i256": 4, "i512": 5, "i1024": 6, "i2048": 7,
+        "float": 10, "double": 11, "fp128": 12,
+    }
+    # Which IR types are integers vs floats
+    _INT_IR_SET  = {"i1", "i32", "i64", "i128", "i256", "i512", "i1024", "i2048"}
+    _FLOAT_IR_SET = {"float", "double", "fp128"}
+
     def rubi_type_to_ir(self, t):
-        if t in ("list", "index", "dict"):         return "%Box*"
-        if t == "i32":                            return "i64"
-        if t in ("i64", "i128", "i256"):           return "i64"
-        if t in ("f32", "f64", "f128", "f256", "f512", "f1024", "f2048"): return "double"
-        if t == "bool":                            return "i1"
-        if t == "str":                             return "i8*"
+        if t in ("list", "index", "dict"): return "%Box*"
+        if t == "bool":  return "i1"
+        if t == "str":   return "i8*"
+        if t in self._INT_IR:  return self._INT_IR[t]
+        if t in self._FLT_IR:  return self._FLT_IR[t]
+        # Fallback: already an IR type (e.g. "i64" from internal use)
+        if t in self._TYPE_RANK: return t
         return "i64"
+
+    def promote_type(self, a, b):
+        """Return the higher-ranked IR type for mixed-width arithmetic."""
+        ra = self._TYPE_RANK.get(a, 2)   # default to i64 rank
+        rb = self._TYPE_RANK.get(b, 2)
+        # If one is float, result is always float
+        if a in self._FLOAT_IR_SET or b in self._FLOAT_IR_SET:
+            if a in self._FLOAT_IR_SET and b in self._FLOAT_IR_SET:
+                return a if ra >= rb else b
+            return a if a in self._FLOAT_IR_SET else b
+        # Both ints
+        return a if ra >= rb else b
 
     def intern_str(self, text):
         raw = text.replace("\\n", "\n").replace("\\t", "\t")
@@ -192,6 +228,11 @@ class CodeGen:
             "@_stdin_ptr = external global i8*", # Changed from @.stdin_ptr
             "@_thread_handles = global [1024 x i64] zeroinitializer",
             "@_thread_results = external global [1024 x %Box*]", # <--- ADD THIS LINE
+            "declare void @os_start(i64)",
+            "declare i8* @os_run(i64, i8*, i8*)",
+            "declare void @os_terminal_drop(i64)",
+            "declare i64 @ffi_load(i8*)",
+            "declare i64 @ffi_sym(i64, i8*)",
             ""
         ]
 
@@ -206,13 +247,14 @@ class CodeGen:
             "  ret void", "}", ""
         ]
         
-        top_init = [s for s in stmts if not isinstance(s, (FnDef, ClassDef, Import, Use))]
+        top_init = [s for s in stmts if not isinstance(s, (FnDef, ClassDef, Import, Use, FFIBind))]
         self.cur_fn = None
         self.local_vars = {}
         self.emit_fn(FnDef("_rubidium_init", [], None, top_init))
 
         for s in stmts:
             if isinstance(s, FnDef): self.emit_fn(s)
+            elif isinstance(s, FFIBind): self.emit_ffi_bind(s)
 
         for cls in self.class_defs.values():
             for m in cls.methods:
@@ -319,6 +361,9 @@ class CodeGen:
             ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
             self.declare_global(node.name, ir_t)
             if node.mutable: self.mutable_vars.add(node.name)
+        elif isinstance(node, FFIBind):
+            # Pre-register the bound symbol so calls resolve in collect pass
+            self.functions[node.symbol_name] = FnDef(node.symbol_name, node.params, node.ret_type, [])
         elif isinstance(node, If):
             for s in node.then_body: self._collect_global(s)
             for s in (node.else_body or []): self._collect_global(s)
@@ -335,6 +380,7 @@ class CodeGen:
         self.tmp_count, self.label_count, self.cur_fn, self.cur_class = 0, 0, node.name, None
         self.local_vars = {}
         self.dropped_vars = set()
+        self._alloca_emitted = set()  # track which local names have had alloca emitted
         
         ret_ir = "i32" if node.name == "main" else (self.rubi_type_to_ir(node.ret_type) if node.ret_type else "i64")
         param_ir = ", ".join(f"{self.rubi_type_to_ir(pt)} %param_{pn}" for pn, pt in node.params)
@@ -364,6 +410,7 @@ class CodeGen:
         self.tmp_count, self.label_count, self.cur_fn, self.cur_class = 0, 0, mfn.name, class_name
         self.local_vars = {}
         self.dropped_vars = set()
+        self._alloca_emitted = set()
         
         struct_t, ret_ir = self.class_ir_type(class_name), (self.rubi_type_to_ir(mfn.ret_type) if mfn.ret_type else "i64")
         param_str = ", ".join([f"{struct_t}* %param___self"] + [f"{self.rubi_type_to_ir(pt)} %param_{pn}" for pn, pt in mfn.params[1:]])
@@ -427,10 +474,18 @@ class CodeGen:
                 self.local_vars[node.name] = ir_t
                 if node.mutable: self.mutable_vars.add(node.name)
                 ptr_str = f"%ptr_{node.name}"
-                self.emit(f"  {ptr_str} = alloca {ir_t}")
+                if node.name not in self._alloca_emitted:
+                    self.emit(f"  {ptr_str} = alloca {ir_t}")
+                    self._alloca_emitted.add(node.name)
                 val, val_t = self.emit_expr(node.value)
                 val = self.coerce(val, val_t, ir_t)
                 self.emit(f"  store {ir_t} {val}, {ir_t}* {ptr_str}")
+                # FFI handle — also persist to a global slot so FFI wrappers can read it
+                if isinstance(node.value, FFILoad):
+                    slot = f"@_ffi_slot_{node.name}"
+                    if not any(d.startswith(slot) for d in self.global_decls):
+                        self.global_decls.append(f"{slot} = global i64 -1")
+                    self.emit(f"  store i64 {val}, i64* {slot}")
             else:
                 if is_class:
                     struct_t = self.class_ir_type(cn)
@@ -443,6 +498,12 @@ class CodeGen:
                 val, val_t = self.emit_expr(node.value)
                 val = self.coerce(val, val_t, ir_t)
                 self.emit(f"  store {ir_t} {val}, {ir_t}* @{node.name}")
+                # FFI handle — also persist to global slot for wrapper access
+                if isinstance(node.value, FFILoad):
+                    slot = f"@_ffi_slot_{node.name}"
+                    if not any(d.startswith(slot) for d in self.global_decls):
+                        self.global_decls.append(f"{slot} = global i64 -1")
+                    self.emit(f"  store i64 {val}, i64* {slot}")
                 
         elif isinstance(node, Assign):
             if node.name in self.dropped_vars: raise RubidiumNameError(f"Var '{node.name}' is dropped")
@@ -498,6 +559,20 @@ class CodeGen:
                 tid_v = self.coerce(tid_v, tid_t, "i64")
                 self.emit(f"  call void @_thread_smart_wait(i64 {tid_v})")
         elif isinstance(node, FileWrite): self.emit_file_write(node)
+        elif isinstance(node, OsStart):
+            id_v, id_t = self.emit_expr(node.id_expr)
+            id_v = self.coerce(id_v, id_t, "i64")
+            self.emit(f"  call void @os_start(i64 {id_v})")
+        elif isinstance(node, OsRun):
+            self.emit_os_run(node)
+        elif isinstance(node, OsDrop):
+            id_v, id_t = self.emit_expr(node.id_expr)
+            id_v = self.coerce(id_v, id_t, "i64")
+            self.emit(f"  call void @os_terminal_drop(i64 {id_v})")
+        elif isinstance(node, FFIBind):
+            self.emit_ffi_bind(node)
+        elif isinstance(node, Use):
+            pass  # module activation — tracked at parse time, no IR needed
         return False
 
     def emit_collection_set(self, method_call_node):
@@ -689,9 +764,14 @@ class CodeGen:
             
             item_t = "%Box*"
             if self.cur_fn is not None and self.cur_fn != "_rubidium_init":
-                self.local_vars[node.var] = item_t
                 var_ptr = f"%ptr_{node.var}"
-                self.emit(f"  {var_ptr} = alloca {item_t}")
+                if node.var not in self._alloca_emitted:
+                    self.local_vars[node.var] = item_t
+                    self.emit(f"  {var_ptr} = alloca {item_t}")
+                    self._alloca_emitted.add(node.var)
+                else:
+                    # Already alloca'd — just update the type in case it changed
+                    self.local_vars[node.var] = item_t
             else:
                 self.declare_global(node.var, item_t)
                 var_ptr = f"@{node.var}"
@@ -725,9 +805,13 @@ class CodeGen:
             sv = self.coerce(sv, st, "i64"); ev = self.coerce(ev, et, "i64")
             
             if self.cur_fn is not None and self.cur_fn != "_rubidium_init":
-                self.local_vars[node.var] = "i64"
                 var_ptr = f"%ptr_{node.var}"
-                self.emit(f"  {var_ptr} = alloca i64")
+                if node.var not in self._alloca_emitted:
+                    self.local_vars[node.var] = "i64"
+                    self.emit(f"  {var_ptr} = alloca i64")
+                    self._alloca_emitted.add(node.var)
+                else:
+                    self.local_vars[node.var] = "i64"
             else:
                 self.declare_global(node.var, "i64")
                 var_ptr = f"@{node.var}"
@@ -777,6 +861,129 @@ class CodeGen:
         self.emit(f"  {clen} = call i64 @strlen(i8* {cont_val})")
         self.emit(f"  call i64 @fwrite(i8* {cont_val}, i64 1, i64 {clen}, i8* {fp})")
         self.emit(f"  call i32 @fclose(i8* {fp})")
+
+    def _os_run_core(self, node):
+        """Shared logic: emit os_run() call, return (result_tmp, "i8*")"""
+        null_lbl, null_len = self.intern_str("")
+        null_ptr = self.new_tmp()
+        self.emit(f"  {null_ptr} = getelementptr [{null_len} x i8], [{null_len} x i8]* {null_lbl}, i64 0, i64 0")
+        if node.struct_args is not None:
+            # os.run({ cmd: "...", args: [...], input: "..." })
+            # Build the command string: cmd + " " + joined args
+            fields = node.struct_args
+            cmd_v, cmd_t = self.emit_expr(fields["cmd"])
+            cmd_s = self.coerce(cmd_v, cmd_t, "i8*")
+            # If args present, build "cmd arg1 arg2 ..."
+            if "args" in fields:
+                args_node = fields["args"]
+                args_v, args_t = self.emit_expr(args_node)
+                args_b = self.coerce_to_box(args_v, args_t)
+                # Build full cmd string by concatenating: cmd + " " + each arg
+                sp_lbl, sp_len = self.intern_str(" ")
+                sp_ptr = self.new_tmp()
+                self.emit(f"  {sp_ptr} = getelementptr [{sp_len} x i8], [{sp_len} x i8]* {sp_lbl}, i64 0, i64 0")
+                len_cmd = self.new_tmp(); len_args = self.new_tmp()
+                len_v = self.new_tmp(); buf_sz = self.new_tmp(); buf = self.new_tmp()
+                self.emit(f"  {len_cmd} = call i64 @strlen(i8* {cmd_s})")
+                # For simplicity, get first arg only (syntax says args: ["update"])
+                first_arg_b = self.new_tmp()
+                self.emit(f"  {first_arg_b} = call %Box* @collection_get_at(%Box* {args_b}, i32 0)")
+                first_arg_s = self.new_tmp()
+                self.emit(f"  {first_arg_s} = call i8* @unbox_s(%Box* {first_arg_b})")
+                self.emit(f"  {len_args} = call i64 @strlen(i8* {first_arg_s})")
+                self.emit(f"  {len_v} = add i64 {len_cmd}, {len_args}")
+                self.emit(f"  {buf_sz} = add i64 {len_v}, 2")  # space + null
+                self.emit(f"  {buf} = call i8* @malloc(i64 {buf_sz})")
+                self.emit(f"  call i8* @strcpy(i8* {buf}, i8* {cmd_s})")
+                self.emit(f"  call i8* @strcat(i8* {buf}, i8* {sp_ptr})")
+                self.emit(f"  call i8* @strcat(i8* {buf}, i8* {first_arg_s})")
+                cmd_s = buf
+            input_s = null_ptr
+            if "input" in fields:
+                inp_v, inp_t = self.emit_expr(fields["input"])
+                input_s = self.coerce(inp_v, inp_t, "i8*")
+            # id is not needed for struct form — use terminal 0 by default or detect from context
+            # The syntax shows no id for struct form; use a special value sentinel -1 which os_run handles
+            res = self.new_tmp()
+            self.emit(f"  {res} = call i8* @os_run(i64 0, i8* {cmd_s}, i8* {input_s})")
+            return res, "i8*"
+        else:
+            id_v, id_t = self.emit_expr(node.id_expr)
+            id_v = self.coerce(id_v, id_t, "i64")
+            cmd_v, cmd_t = self.emit_expr(node.cmd_expr)
+            cmd_s = self.coerce(cmd_v, cmd_t, "i8*")
+            if node.input_expr is not None:
+                inp_v, inp_t = self.emit_expr(node.input_expr)
+                inp_s = self.coerce(inp_v, inp_t, "i8*")
+            else:
+                inp_s = null_ptr
+            res = self.new_tmp()
+            self.emit(f"  {res} = call i8* @os_run(i64 {id_v}, i8* {cmd_s}, i8* {inp_s})")
+            return res, "i8*"
+
+    def emit_os_run(self, node):
+        """Statement form: os.run(...) — result discarded"""
+        self._os_run_core(node)
+
+    def emit_os_run_expr(self, node):
+        """Expression form: let data = os.run(...) — result is string"""
+        return self._os_run_core(node)
+
+    def emit_ffi_bind(self, node):
+        """
+        FFI binding: fn lib symbol(params) -> ret
+        Emits an LLVM function that:
+          1. Calls ffi_sym(handle_idx, "symbol") to get the function pointer
+          2. Bitcasts it to the right function type
+          3. Calls it with the provided args
+        We store the binding so calling symbol(args) works normally afterwards.
+        """
+        # Build param IR types
+        param_ir_types = [self.rubi_type_to_ir(pt) for _, pt in node.params]
+        ret_ir = self.rubi_type_to_ir(node.ret_type) if node.ret_type else "i64"
+        fn_ptr_t = f"{ret_ir} ({', '.join(param_ir_types)})*" if param_ir_types else f"{ret_ir} ()*"
+        fn_name = node.symbol_name
+        params_ir = ", ".join(f"{pt} %p{i}" for i, pt in enumerate(param_ir_types))
+
+        # Register immediately so calls in the same scope resolve
+        self.functions[fn_name] = FnDef(fn_name, node.params, node.ret_type, [])
+
+        # Buffer the wrapper — flush after current function closes (like trampolines)
+        # so we don't emit a define inside another define
+        pending = []
+        pending.append(f"\ndefine {ret_ir} @{fn_name}({params_ir}) {{")
+        pending.append("entry:")
+
+        # Get handle index from the dedicated global slot written when FFI("path") ran.
+        # Using the slot (not a local alloca) means the wrapper always finds it.
+        slot_name = f"@_ffi_slot_{node.handle_name}"
+        # Declare the slot if not yet declared (collect pass may run before emit_ffi_bind)
+        if not any(d.startswith(slot_name) for d in self.global_decls):
+            self.global_decls.append(f"@_ffi_slot_{node.handle_name} = global i64 -1")
+        handle_var_v = f"%ffi_h_{self.new_tmp()[1:]}"
+        pending.append(f"  {handle_var_v} = load i64, i64* {slot_name}")
+
+        # Intern the symbol name string constant
+        sym_lbl, sym_len = self.intern_str(node.symbol_name)
+        sym_ptr_t = f"%ffi_sp_{self.new_tmp()[1:]}"
+        pending.append(f"  {sym_ptr_t} = getelementptr [{sym_len} x i8], [{sym_len} x i8]* {sym_lbl}, i64 0, i64 0")
+
+        # Get raw fn pointer as i64 via ffi_sym
+        raw_fp = f"%ffi_raw_{self.new_tmp()[1:]}"
+        pending.append(f"  {raw_fp} = call i64 @ffi_sym(i64 {handle_var_v}, i8* {sym_ptr_t})")
+
+        # Bitcast i64 → fn ptr type
+        fp_cast = f"%ffi_fp_{self.new_tmp()[1:]}"
+        pending.append(f"  {fp_cast} = inttoptr i64 {raw_fp} to {fn_ptr_t}")
+
+        # Call the foreign function
+        args_str = ", ".join(f"{pt} %p{i}" for i, pt in enumerate(param_ir_types))
+        call_tmp = f"%ffi_ret_{self.new_tmp()[1:]}"
+        pending.append(f"  {call_tmp} = call {ret_ir} {fp_cast}({args_str})")
+        pending.append(f"  ret {ret_ir} {call_tmp}")
+        pending.append("}")
+
+        self._pending_trampolines += pending
 
     def emit_expr(self, node):
         if isinstance(node, Number):
@@ -915,6 +1122,14 @@ class CodeGen:
                 return "0", "i64"
             return self.emit_method_call_expr(node)
         if isinstance(node, TypeCast): return self.emit_type_cast(node)
+        if isinstance(node, FFILoad):
+            path_v, path_t = self.emit_expr(node.path_expr)
+            path_s = self.coerce(path_v, path_t, "i8*")
+            tmp = self.new_tmp()
+            self.emit(f"  {tmp} = call i64 @ffi_load(i8* {path_s})")
+            return tmp, "i64"
+        if isinstance(node, OsRun):
+            return self.emit_os_run_expr(node)
         return "0", "i64"
 
     def emit_field_access(self, obj, field_name):
@@ -1327,6 +1542,31 @@ class CodeGen:
 
     def emit_binop(self, node):
         l, lt = self.emit_expr(node.left); r, rt = self.emit_expr(node.right)
+
+        # If either side is Box*, unbox to a concrete type first.
+        # For arithmetic ops we unbox to numeric; for + we check box type at runtime.
+        # Simple approach: unbox Box* to i64 for arithmetic, to i8* for string context.
+        # For +, if the other operand is i8* or the box might be a string, use box_to_cstr.
+        if node.op == "+":
+            # Unbox any Box* to string when mixed with i8*
+            if lt == "%Box*" and rt == "i8*":
+                l = self.coerce_to_string(l, lt); lt = "i8*"
+            elif lt == "i8*" and rt == "%Box*":
+                r = self.coerce_to_string(r, rt); rt = "i8*"
+            elif lt == "%Box*" and rt == "%Box*":
+                # Both boxed — convert both to string (covers int+int→concat in string context)
+                l = self.coerce_to_string(l, lt); lt = "i8*"
+                r = self.coerce_to_string(r, rt); rt = "i8*"
+        # For non-string arithmetic, unbox Box* to i64/double
+        if lt == "%Box*" and node.op not in ("+",) :
+            l = self.coerce(l, lt, "i64"); lt = "i64"
+        if rt == "%Box*" and node.op not in ("+",):
+            r = self.coerce(r, rt, "i64"); rt = "i64"
+        # After unboxing, re-check: if both are now i64 and op is +, it's numeric add (correct)
+        # If one is still Box* after + special-casing above, unbox to i64
+        if lt == "%Box*": l = self.coerce(l, lt, "i64"); lt = "i64"
+        if rt == "%Box*": r = self.coerce(r, rt, "i64"); rt = "i64"
+
         if node.op == "+":
             # String + String -> String concatenation
             if lt == "i8*" and rt == "i8*":
@@ -1439,6 +1679,10 @@ class CodeGen:
             return val
         tmp = self.new_tmp()
         buf = self.new_tmp()
+        if t == "%Box*":
+            # Box* → use runtime helper that inspects box type and formats correctly
+            self.emit(f"  {tmp} = call i8* @box_to_cstr(%Box* {val})")
+            return tmp
         if t in ("i1", "i64"):
             fmt_lbl, flen = self.intern_str("%lld")
             fmt_ptr = self.new_tmp()
@@ -1461,56 +1705,64 @@ class CodeGen:
     def coerce(self, val, from_t, to_t):
         if from_t == to_t: return val
         tmp = self.new_tmp()
+
+        # ---- Unbox Box* to concrete type ----
         if from_t == "%Box*":
-            if to_t in ("i1", "i32", "i64"):
-                self.emit(f"  {tmp} = call i64 @unbox_i(%Box* {val})")
-                if to_t == "i64":
-                    return tmp
-                if to_t == "i32":
-                    tmp2 = self.new_tmp()
-                    self.emit(f"  {tmp2} = trunc i64 {tmp} to i32")
-                    return tmp2
+            if to_t in self._INT_IR_SET:
+                # Unbox to i64 then widen/narrow
+                i64_tmp = self.new_tmp()
+                self.emit(f"  {i64_tmp} = call i64 @unbox_i(%Box* {val})")
+                if to_t == "i64": return i64_tmp
                 if to_t == "i1":
-                    tmp2 = self.new_tmp()
-                    self.emit(f"  {tmp2} = trunc i64 {tmp} to i1")
-                    return tmp2
-                return tmp
-            if to_t in ("float", "double"):
-                self.emit(f"  {tmp} = call double @unbox_f(%Box* {val})")
+                    self.emit(f"  {tmp} = trunc i64 {i64_tmp} to i1"); return tmp
+                if to_t == "i32":
+                    self.emit(f"  {tmp} = trunc i64 {i64_tmp} to i32"); return tmp
+                # Wider than i64 — sext
+                self.emit(f"  {tmp} = sext i64 {i64_tmp} to {to_t}"); return tmp
+            if to_t in self._FLOAT_IR_SET:
+                dbl_tmp = self.new_tmp()
+                self.emit(f"  {dbl_tmp} = call double @unbox_f(%Box* {val})")
+                if to_t == "double": return dbl_tmp
                 if to_t == "float":
-                    tmp2 = self.new_tmp()
-                    self.emit(f"  {tmp2} = fptrunc double {tmp} to float")
-                    return tmp2
-                return tmp
+                    self.emit(f"  {tmp} = fptrunc double {dbl_tmp} to float"); return tmp
+                if to_t == "fp128":
+                    self.emit(f"  {tmp} = fpext double {dbl_tmp} to fp128"); return tmp
+                return dbl_tmp
             if to_t == "i8*":
-                self.emit(f"  {tmp} = call i8* @unbox_s(%Box* {val})")
-                return tmp
-            self.emit(f"  {tmp} = call i8* @unbox_p(%Box* {val})")
-            tmp2 = self.new_tmp()
-            self.emit(f"  {tmp2} = bitcast i8* {tmp} to {to_t}")
-            return tmp2
+                self.emit(f"  {tmp} = call i8* @unbox_s(%Box* {val})"); return tmp
+            # Pointer cast
+            p_tmp = self.new_tmp()
+            self.emit(f"  {p_tmp} = call i8* @unbox_p(%Box* {val})")
+            self.emit(f"  {tmp} = bitcast i8* {p_tmp} to {to_t}"); return tmp
+
         if to_t == "%Box*": return self.coerce_to_box(val, from_t)
-        int_types = {"i1", "i32", "i64"}
-        if from_t in int_types and to_t in int_types:
-            if from_t == "i64" and to_t == "i32":
-                self.emit(f"  {tmp} = trunc i64 {val} to i32"); return tmp
-            if from_t == "i64" and to_t == "i1":
-                self.emit(f"  {tmp} = trunc i64 {val} to i1"); return tmp
-            if from_t == "i32" and to_t == "i64":
-                self.emit(f"  {tmp} = sext i32 {val} to i64"); return tmp
-            if from_t == "i32" and to_t == "i1":
-                self.emit(f"  {tmp} = trunc i32 {val} to i1"); return tmp
-            if from_t == "i1" and to_t == "i64":
-                self.emit(f"  {tmp} = zext i1 {val} to i64"); return tmp
-            if from_t == "i1" and to_t == "i32":
-                self.emit(f"  {tmp} = zext i1 {val} to i32"); return tmp
-            return val
-        if from_t in int_types and to_t in ("float","double"):
+
+        # ---- Integer ↔ Integer ----
+        if from_t in self._INT_IR_SET and to_t in self._INT_IR_SET:
+            fr = self._TYPE_RANK.get(from_t, 2)
+            tr = self._TYPE_RANK.get(to_t, 2)
+            if fr == tr: return val
+            if fr > tr:  # narrowing → trunc
+                self.emit(f"  {tmp} = trunc {from_t} {val} to {to_t}"); return tmp
+            else:        # widening → sext
+                self.emit(f"  {tmp} = sext {from_t} {val} to {to_t}"); return tmp
+
+        # ---- Float ↔ Float ----
+        if from_t in self._FLOAT_IR_SET and to_t in self._FLOAT_IR_SET:
+            fr = self._TYPE_RANK.get(from_t, 11)
+            tr = self._TYPE_RANK.get(to_t, 11)
+            if fr == tr: return val
+            if fr > tr:
+                self.emit(f"  {tmp} = fptrunc {from_t} {val} to {to_t}"); return tmp
+            else:
+                self.emit(f"  {tmp} = fpext {from_t} {val} to {to_t}"); return tmp
+
+        # ---- Integer → Float ----
+        if from_t in self._INT_IR_SET and to_t in self._FLOAT_IR_SET:
             self.emit(f"  {tmp} = sitofp {from_t} {val} to {to_t}"); return tmp
-        if from_t == "float" and to_t == "double":
-            self.emit(f"  {tmp} = fpext float {val} to double"); return tmp
-        if from_t == "double" and to_t == "float":
-            self.emit(f"  {tmp} = fptrunc double {val} to float"); return tmp
-        if from_t in ("float","double") and to_t in int_types:
+
+        # ---- Float → Integer ----
+        if from_t in self._FLOAT_IR_SET and to_t in self._INT_IR_SET:
             self.emit(f"  {tmp} = fptosi {from_t} {val} to {to_t}"); return tmp
+
         return val

@@ -99,6 +99,26 @@ class Parser:
     def fn_def(self):
         self.match("FN")
         name = self.match("IDENT")
+        # FFI binding: fn handle_name symbol_name(params) -> ret  (no body brace)
+        # Detected when the token after `name` is another IDENT (not LPAREN)
+        if self.peek() and self.peek()[0] == "IDENT":
+            symbol_name = self.match("IDENT")
+            self.match("LPAREN")
+            params = []
+            while self.peek() and self.peek()[0] != "RPAREN":
+                pname = self.match("IDENT") or self.match("TYPE")
+                self.match("COLON")
+                ptype = self.match("TYPE")
+                params.append((pname, ptype))
+                if self.peek() and self.peek()[0] == "COMMA":
+                    self.match("COMMA")
+            self.match("RPAREN")
+            ret_type = None
+            if self.peek() and self.peek()[1] == "->":
+                self.match("OP")
+                ret_type = self.match("TYPE")
+            return FFIBind(name, symbol_name, params, ret_type)
+        # Normal function
         self.match("LPAREN")
         params = []
         while self.peek() and self.peek()[0] != "RPAREN":
@@ -254,6 +274,10 @@ class Parser:
                 self.match("RPAREN")
                 return ThreadWait(ids)
 
+        # Handle os.start(n), os.run(...), os(n).drop()
+        if name == "os":
+            return self._parse_os_stmt()
+
         # Handle Drop intercept
         res = self.parse_identifier_chain(name)
         # Handle field assignment: p.name = value
@@ -266,6 +290,59 @@ class Parser:
             obj_name = res.obj.name if hasattr(res.obj, "name") else str(res.obj)
             return Drop(obj_name)
         return res
+
+    def _parse_os_stmt(self):
+        """Parse os.start(n), os.run(n, ...), os(n).drop()"""
+        # os(n).drop()
+        if self.peek() and self.peek()[0] == "LPAREN":
+            self.match("LPAREN")
+            id_expr = self.expr()
+            self.match("RPAREN")
+            self.match("DOT")
+            method = self.match("IDENT")
+            if method == "drop":
+                return OsDrop(id_expr)
+            raise SyntaxError(f"Unknown os() method: {method}")
+        # os.start(...) or os.run(...)
+        self.match("DOT")
+        method = self.match("IDENT")
+        if method == "start":
+            self.match("LPAREN")
+            id_expr = self.expr()
+            self.match("RPAREN")
+            return OsStart(id_expr)
+        if method == "run":
+            self.match("LPAREN")
+            # Detect struct form: os.run({ cmd: ..., args: ..., input: ... })
+            if self.peek() and self.peek()[0] == "LBRACE":
+                struct_args = self._parse_os_run_struct()
+                self.match("RPAREN")
+                return OsRun(None, None, struct_args=struct_args)
+            # Normal form: os.run(id, cmd) or os.run(id, cmd, input)
+            id_expr = self.expr()
+            self.match("COMMA")
+            cmd_expr = self.expr()
+            input_expr = None
+            if self.peek() and self.peek()[0] == "COMMA":
+                self.match("COMMA")
+                input_expr = self.expr()
+            self.match("RPAREN")
+            return OsRun(id_expr, cmd_expr, input_expr=input_expr)
+        raise SyntaxError(f"Unknown os module method: {method}")
+
+    def _parse_os_run_struct(self):
+        """Parse { cmd: expr, args: [...], input: expr }"""
+        self.match("LBRACE")
+        fields = {}
+        while self.peek() and self.peek()[0] != "RBRACE":
+            key = self.match("IDENT")
+            self.match("COLON")
+            val = self.expr()
+            fields[key] = val
+            if self.peek() and self.peek()[0] == "COMMA":
+                self.match("COMMA")
+        self.match("RBRACE")
+        return fields
 
     def expr(self):       return self.logical_or()
     def logical_or(self):
@@ -436,6 +513,33 @@ class Parser:
         if tok[0] == "IDENT":
             self.advance()
             name = tok[1]
+            # FFI("path") load expression
+            if name == "FFI" and self.peek() and self.peek()[0] == "LPAREN":
+                self.match("LPAREN")
+                path_expr = self.expr()
+                self.match("RPAREN")
+                return FFILoad(path_expr)
+            # os.run(...) in expression context
+            if name == "os" and self.peek() and self.peek()[0] == "DOT":
+                saved = self.pos
+                self.match("DOT")
+                method = self.match("IDENT")
+                if method == "run":
+                    self.match("LPAREN")
+                    if self.peek() and self.peek()[0] == "LBRACE":
+                        struct_args = self._parse_os_run_struct()
+                        self.match("RPAREN")
+                        return OsRun(None, None, struct_args=struct_args)
+                    id_expr = self.expr()
+                    self.match("COMMA")
+                    cmd_expr = self.expr()
+                    input_expr = None
+                    if self.peek() and self.peek()[0] == "COMMA":
+                        self.match("COMMA")
+                        input_expr = self.expr()
+                    self.match("RPAREN")
+                    return OsRun(id_expr, cmd_expr, input_expr=input_expr)
+                self.pos = saved
             # Handle thread.wait(...) in expression context
             if name == "thread" and self.peek() and self.peek()[0] == "DOT":
                 saved_pos = self.pos

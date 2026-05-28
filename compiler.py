@@ -262,6 +262,158 @@ void print_boxed(Box* b) {
     }
     fflush(stdout);
 }
+
+// Convert a Box* to a heap-allocated C string for string concatenation.
+// Caller must free() the result.
+char* box_to_cstr(Box* b) {
+    if(!b) { char* r = malloc(5); strcpy(r,"null"); return r; }
+    char* buf = malloc(64);
+    if(b->type==0)      { snprintf(buf, 64, "%lld", b->i); }
+    else if(b->type==1) { snprintf(buf, 64, "%g",   b->f); }
+    else if(b->type==2) { free(buf); return strdup(b->s ? b->s : ""); }
+    else                { free(buf); buf = malloc(7); strcpy(buf,"<obj>"); }
+    return buf;
+}
+
+// -------------------------------------------------------
+// OS MODULE — hidden shell sessions per ID
+// -------------------------------------------------------
+#include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <errno.h>
+
+typedef struct {
+    pid_t pid;
+    int stdin_fd;   // write end — send commands to shell
+    int stdout_fd;  // read end  — read output from shell
+    int active;
+} OsTerminal;
+
+static OsTerminal _os_terminals[1024];
+
+__attribute__((constructor)) void init_os_terminals() {
+    for(int i=0;i<1024;i++) { _os_terminals[i].active=0; _os_terminals[i].pid=0; }
+}
+
+void os_start(long long id) {
+    if(id<0||id>=1024) return;
+    if(_os_terminals[id].active) return; // already started
+
+    int to_child[2], from_child[2];
+    if(pipe(to_child)<0 || pipe(from_child)<0) return;
+
+    pid_t pid = fork();
+    if(pid == 0) {
+        // Child: replace stdin/stdout with pipes
+        dup2(to_child[0], STDIN_FILENO);
+        dup2(from_child[1], STDOUT_FILENO);
+        dup2(from_child[1], STDERR_FILENO);
+        close(to_child[0]); close(to_child[1]);
+        close(from_child[0]); close(from_child[1]);
+        // Find available shell
+        char* shells[] = {"/bin/bash", "/bin/sh", NULL};
+        for(int i=0; shells[i]; i++) {
+            if(access(shells[i], X_OK)==0) { execl(shells[i], shells[i], NULL); }
+        }
+        _exit(127);
+    }
+    // Parent
+    close(to_child[0]);
+    close(from_child[1]);
+    _os_terminals[id].pid = pid;
+    _os_terminals[id].stdin_fd = to_child[1];
+    _os_terminals[id].stdout_fd = from_child[0];
+    _os_terminals[id].active = 1;
+    // Set stdout_fd to non-blocking for reads
+    fcntl(from_child[0], F_SETFL, O_NONBLOCK);
+    // Brief settle
+    usleep(50000);
+}
+
+// Run a command in the terminal, optionally sending `input` to stdin.
+// Returns all output as a heap-allocated string. Caller should free.
+char* os_run(long long id, const char* cmd, const char* input) {
+    if(id<0||id>=1024||!_os_terminals[id].active) return strdup("");
+
+    OsTerminal* t = &_os_terminals[id];
+
+    // Write command + newline
+    write(t->stdin_fd, cmd, strlen(cmd));
+    write(t->stdin_fd, "\n", 1);
+    // If there's interactive input to send, write it after a short delay
+    if(input && strlen(input)>0) {
+        usleep(200000);
+        write(t->stdin_fd, input, strlen(input));
+        if(input[strlen(input)-1]!='\n') write(t->stdin_fd, "\n", 1);
+    }
+
+    // Collect output with timeout
+    char buf[4096];
+    char* out = malloc(1);
+    out[0]='\0';
+    size_t out_len=0;
+    int retries=30; // up to 1.5s total
+    while(retries-->0) {
+        usleep(50000);
+        ssize_t n = read(t->stdout_fd, buf, sizeof(buf)-1);
+        if(n>0) {
+            buf[n]='\0';
+            out = realloc(out, out_len+n+1);
+            memcpy(out+out_len, buf, n);
+            out_len+=n; out[out_len]='\0';
+            retries=5; // got data, keep reading a bit more
+        } else if(n<0 && errno==EAGAIN) {
+            if(out_len>0 && retries<10) break; // got some output, we're done
+        }
+    }
+    return out; // caller must free
+}
+
+void os_terminal_drop(long long id) {
+    if(id<0||id>=1024||!_os_terminals[id].active) return;
+    OsTerminal* t = &_os_terminals[id];
+    write(t->stdin_fd, "exit\n", 5);
+    usleep(100000);
+    close(t->stdin_fd);
+    close(t->stdout_fd);
+    waitpid(t->pid, NULL, WNOHANG);
+    t->active=0;
+}
+
+// -------------------------------------------------------
+// FFI MODULE — dynamic library loading
+// -------------------------------------------------------
+#include <dlfcn.h>
+#include <stdint.h>
+
+static void* _ffi_handles[1024];
+static int _ffi_handle_count = 0;
+
+// Load a shared library, return a slot index (used as the "handle" in Rubidium)
+long long ffi_load(const char* path) {
+    void* h = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+    if(!h) {
+        fprintf(stderr, "[FFI] dlopen failed: %s\n", dlerror());
+        return -1;
+    }
+    if(_ffi_handle_count >= 1024) { dlclose(h); return -1; }
+    int idx = _ffi_handle_count++;
+    _ffi_handles[idx] = h;
+    return idx;
+}
+
+// Resolve a symbol from a loaded FFI handle (returns raw function pointer as i64)
+long long ffi_sym(long long handle_idx, const char* symbol) {
+    if(handle_idx<0||handle_idx>=1024||!_ffi_handles[handle_idx]) return 0;
+    dlerror(); // clear errors
+    void* sym = dlsym(_ffi_handles[handle_idx], symbol);
+    if(!sym) {
+        fprintf(stderr, "[FFI] dlsym('%s') failed: %s\n", symbol, dlerror());
+        return 0;
+    }
+    return (long long)(uintptr_t)sym;
+}
 """
 
 def parse_file(filepath, parsed_files, combined_ast, is_main=False):
@@ -322,7 +474,7 @@ def compile_files(source_files, output=None):
 
         try:
             result = subprocess.run(
-                ["clang", ir_path, c_path, "-o", output_bin, "-O2", "-pthread"],
+                ["clang", ir_path, c_path, "-o", output_bin, "-O2", "-pthread", "-ldl"],
                 capture_output=True, text=True
             )
         finally:

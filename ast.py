@@ -176,3 +176,33 @@ class FileWrite:
     def __init__(self, path_expr, content_expr):
         self.path_expr = path_expr
         self.content_expr = content_expr
+
+# OS module nodes
+class OsStart:
+    def __init__(self, id_expr):
+        self.id_expr = id_expr
+
+class OsRun:
+    def __init__(self, id_expr, cmd_expr, input_expr=None, struct_args=None):
+        self.id_expr = id_expr          # None if struct style
+        self.cmd_expr = cmd_expr        # None if struct style
+        self.input_expr = input_expr    # optional stdin string
+        self.struct_args = struct_args  # dict of {cmd, args, input} for struct form
+
+class OsDrop:
+    def __init__(self, id_expr):
+        self.id_expr = id_expr
+
+# FFI nodes
+class FFILoad:
+    """let lib = FFI("path.so") — loads a shared library via dlopen"""
+    def __init__(self, path_expr):
+        self.path_expr = path_expr
+
+class FFIBind:
+    """fn lib symbol(params) -> ret — binds a symbol from a loaded FFI handle"""
+    def __init__(self, handle_name, symbol_name, params, ret_type):
+        self.handle_name = handle_name
+        self.symbol_name = symbol_name
+        self.params = params
+        self.ret_type = ret_type
