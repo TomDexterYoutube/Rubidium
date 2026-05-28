@@ -41,6 +41,7 @@ Rubidium aims to remove a lot of the unnecessary pain found in traditional syste
 * **Simple class system**
 * **Built-in file I/O**
 * **Structured error handling**
+* **FFI if you feel Rubidium wasn't enough 
 
 ---
 
@@ -81,24 +82,26 @@ y = 15
 ## Integer Types
 
 ```text
-i8
-i16
+
 i32
 i64
 i128
 i256
+i512
+i1024
+i2048
 ```
 
 ## Floating Point Types
 
 ```text
-f4
-f8
-f16
 f32
 f64
 f128
 f256
+f512
+f1024
+f2048
 ```
 
 ## Other Types
@@ -139,7 +142,7 @@ let state = True and not False
 Supported operators:
 
 ```text
-+  -  *  /
++  -  *  / ** */
 == != > < >= <=
 and or not
 ```
@@ -510,13 +513,10 @@ fn main() {
 
 # Current Goals
 
-* Native compiler backend
-* Better module system
-* Improved memory ownership rules
 * Standard library expansion
 * Better tooling and diagnostics
-* Cross-platform compilation
 * Package manager
+* Try and make less buggy and more usable 
 
 ---
 
