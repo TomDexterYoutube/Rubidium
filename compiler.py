@@ -13,6 +13,9 @@ RUNTIME_C = r"""
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+#include <time.h>
+#include <pthread.h>
 
 typedef struct { int type; long long i; double f; char* s; void* p; } Box;
 
@@ -27,8 +30,60 @@ void _set_thread_result(int tid, Box* val) {
 // Global stdin pointer
 void* _stdin_ptr;
 
+// Main thread id — set at startup so we can detect if thread.wait is called from main
+pthread_t _main_thread_id;
+
+// _thread_handles is declared in the LLVM IR globals; declare extern here for C access
+extern long long _thread_handles[1024];
+
+// Timer state: array of timers storing start time and accumulated time
+double _timer_starts[1024];
+double _timer_accum[1024];
+int _timer_running[1024];
+
 __attribute__((constructor)) void init_runtime() {
     _stdin_ptr = (void*)stdin;
+    _main_thread_id = pthread_self();
+    for(int i = 0; i < 1024; i++) {
+        _timer_starts[i] = 0.0;
+        _timer_accum[i] = 0.0;
+        _timer_running[i] = 0;
+    }
+}
+
+// Waiter: background thread that joins a target thread and then exits.
+// Used so a non-main thread can "wait" on a child without blocking main.
+typedef struct { long long tid; } _WaiterArg;
+
+static void* _waiter_thread_fn(void* arg) {
+    _WaiterArg* wa = (_WaiterArg*)arg;
+    long long tid = wa->tid;
+    free(wa);
+    if(tid >= 0 && tid < 1024) {
+        pthread_join((pthread_t)_thread_handles[tid], NULL);
+    }
+    return NULL;
+}
+
+// _thread_smart_wait: if called from the main thread, block (normal join).
+// If called from any other thread, spawn a detached background waiter and
+// return immediately so the caller (and main) keep running.
+void _thread_smart_wait(long long tid) {
+    if(tid < 0 || tid >= 1024) return;
+    pthread_t handle = (pthread_t)_thread_handles[tid];
+    if(pthread_equal(pthread_self(), _main_thread_id)) {
+        // Called from main — block until target thread is done
+        pthread_join(handle, NULL);
+    } else {
+        // Called from a child thread — hand the join off to a detached waiter
+        // so main is never blocked by this wait
+        _WaiterArg* wa = malloc(sizeof(_WaiterArg));
+        wa->tid = tid;
+        pthread_t waiter;
+        pthread_create(&waiter, NULL, _waiter_thread_fn, wa);
+        pthread_detach(waiter);
+        // Return immediately — caller thread continues
+    }
 }
 
 void box_drop(Box* b) {
@@ -153,6 +208,45 @@ Box* collection_get_at(Box* col_box, int idx) {
         if(idx>=0 && idx<d->count) return d->keys[idx];
     }
     return box_i(0);
+}
+
+// Timer functions
+void time_timer_start(int tid, double type_hint) {
+    if(tid >= 0 && tid < 1024) {
+        _timer_starts[tid] = clock() / (double)CLOCKS_PER_SEC;
+        _timer_running[tid] = 1;
+    }
+}
+
+void time_timer_pause(int tid) {
+    if(tid >= 0 && tid < 1024 && _timer_running[tid]) {
+        double now = clock() / (double)CLOCKS_PER_SEC;
+        _timer_accum[tid] += now - _timer_starts[tid];
+        _timer_running[tid] = 0;
+    }
+}
+
+void time_timer_stop(int tid) {
+    if(tid >= 0 && tid < 1024) {
+        if(_timer_running[tid]) {
+            double now = clock() / (double)CLOCKS_PER_SEC;
+            _timer_accum[tid] += now - _timer_starts[tid];
+        }
+        _timer_running[tid] = 0;
+    }
+}
+
+double time_timer_read(int tid) {
+    double result = 0.0;
+    if(tid >= 0 && tid < 1024) {
+        if(_timer_running[tid]) {
+            double now = clock() / (double)CLOCKS_PER_SEC;
+            result = _timer_accum[tid] + (now - _timer_starts[tid]);
+        } else {
+            result = _timer_accum[tid];
+        }
+    }
+    return result;
 }
 
 void print_boxed(Box* b) {

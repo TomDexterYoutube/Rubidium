@@ -137,7 +137,7 @@ class Parser:
         elif t[0] == "RETURN":   return [self.return_stmt()]
         elif t[0] == "TRY":      return [self.try_stmt()]
         elif t[0] == "FN":       return [self.fn_def()]
-        elif t[0] == "IDENT":    return [self.ident_stmt()]
+        elif t[0] == "IDENT" or t[0] == "TYPE":    return [self.ident_stmt()]
         else:
             self.advance()
             return []
@@ -145,7 +145,12 @@ class Parser:
     def var_decl(self):
         self.match("LET")
         mut = bool(self.match("MUT"))
-        name = self.match("IDENT")
+        # Accept both IDENT and TYPE tokens for variable names (e.g., "list" is a TYPE but can be a variable name)
+        tok = self.peek()
+        if tok and tok[0] in ("IDENT", "TYPE"):
+            name = self.match(tok[0])  # match returns the value
+        else:
+            name = self.match("IDENT")
         vtype = None
         if self.peek() and self.peek()[0] == "COLON":
             self.match("COLON")
@@ -225,7 +230,12 @@ class Parser:
         return Try(try_body, err_body)
 
     def ident_stmt(self):
-        name = self.match("IDENT")
+        # Accept both IDENT and TYPE tokens for variable names (e.g., "list" is a TYPE but can be a variable name)
+        tok = self.peek()
+        if tok and tok[0] in ("IDENT", "TYPE"):
+            name = self.match(tok[0])
+        else:
+            name = self.match("IDENT")
         # Handle Assignment
         if self.peek() and self.peek()[0] == "OP" and self.peek()[1] == "=":
             self.match("OP")
@@ -285,13 +295,27 @@ class Parser:
         return left
     def term(self):
         left = self.factor()
-        while self.peek() and self.peek()[1] in ("*","/"):
-            op = self.match("OP"); left = BinOp(left, op, self.factor())
+        while self.peek() and self.peek()[1] in ("*","/","**"):
+            op = self.match("OP")
+            if op == "**":
+                left = BinOp(left, "**", self.factor())
+            else:
+                left = BinOp(left, op, self.factor())
         return left
 
     def factor(self):
         tok = self.peek()
         if tok is None: return Number(0)
+
+        # Handle square root operator (unary) - must be checked BEFORE general OP handling
+        if tok[0] == "OP" and tok[1] == "*/":
+            op = self.match("OP")
+            return UnaryOp("*/", self.factor())
+
+        # Unary minus: -expr
+        if tok[0] == "OP" and tok[1] == "-":
+            self.match("OP")
+            return UnaryOp("-", self.factor())
 
         if tok[0] == "LBRACKET":
             self.advance()
@@ -372,8 +396,42 @@ class Parser:
         if tok[0] == "LPAREN":
             self.advance(); e = self.expr(); self.match("RPAREN"); return e
         # TYPE tokens used as arguments (e.g. "404".to(i32) — i32 appears as TYPE token)
+        # Also handle TYPE tokens used as variable names (e.g., "list" is a type but can be a variable)
         if tok[0] == "TYPE":
-            self.advance(); return Var(tok[1])
+            self.advance()
+            name = tok[1]
+            res = Var(name)
+            # Check for collection access like list(a + 1) or method calls
+            while self.peek():
+                if self.peek()[0] == "DOT":
+                    self.match("DOT")
+                    attr = self.match("IDENT")
+                    if self.peek() and self.peek()[0] == "LPAREN":
+                        self.match("LPAREN")
+                        args = []
+                        while self.peek() and self.peek()[0] != "RPAREN":
+                            args.append(self.expr())
+                            if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
+                        self.match("RPAREN")
+                        res = MethodCall(res, attr, args)
+                    else:
+                        res = FieldAccess(res, attr)
+                elif self.peek()[0] == "LPAREN":
+                    # TYPE as variable name followed by call - treat as FnCall for collection access
+                    self.match("LPAREN")
+                    args = []
+                    while self.peek() and self.peek()[0] != "RPAREN":
+                        args.append(self.expr())
+                        if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
+                    self.match("RPAREN")
+                    res = FnCall(name, args)
+                    # Continue loop to allow method chaining on collection access
+                    if self.peek() and self.peek()[0] == "DOT":
+                        continue
+                    break
+                else:
+                    break
+            return res
 
         if tok[0] == "IDENT":
             self.advance()

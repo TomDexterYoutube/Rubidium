@@ -28,6 +28,13 @@ declare i32 @rand()
 declare void @srand(i32)
 declare i32 @usleep(i32)
 declare i32 @sleep(i32)
+declare double @pow(double, double)
+declare double @sqrt(double)
+declare void @time_timer_start(i64, double)
+declare void @time_timer_pause(i64)
+declare void @time_timer_stop(i64)
+declare double @time_timer_read(i64)
+declare void @_thread_smart_wait(i64)
 '''
 
 class RubidiumTypeError(Exception): pass
@@ -97,13 +104,9 @@ class CodeGen:
 
     def rubi_type_to_ir(self, t):
         if t in ("list", "index", "dict"):         return "%Box*"
-        if t == "i4":                              return "i8"  # 4-bit stored in 8-bit
-        if t == "i8":                              return "i8"
-        if t == "i16":                             return "i16"
-        if t in ("i32", None):                     return "i64"
+        if t == "i32":                            return "i64"
         if t in ("i64", "i128", "i256"):           return "i64"
-        if t in ("f4", "f8", "f16", "f32"):        return "float"
-        if t in ("f64", "f128", "f256"):           return "double"
+        if t in ("f32", "f64", "f128", "f256", "f512", "f1024", "f2048"): return "double"
         if t == "bool":                            return "i1"
         if t == "str":                             return "i8*"
         return "i64"
@@ -261,7 +264,7 @@ class CodeGen:
             if node.method in ("len", "to"): return "i64"
             if node.method in ("contains", "has"): return "i1"
             if node.method in ("combine"): return "i8*"
-            # Built-in module methods
+# Built-in module methods
             if obj_name == "time": return "i64"
             if obj_name == "random":
                 if node.method == "choice": return "%Box*"
@@ -272,9 +275,23 @@ class CodeGen:
         if isinstance(node, FnCall):
             # Normalization check
             name = node.name.replace(".", "_") if isinstance(node.name, str) and "." in node.name else node.name
-            if isinstance(name, str) and name in self.functions:
-                fn = self.functions[name]
-                return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
+            if isinstance(name, str):
+                if name == "random":
+                    # Check if third arg is a float type (TYPE token parsed as Var)
+                    type_name = ""
+                    if len(node.args) >= 3:
+                        arg3 = node.args[2]
+                        if isinstance(arg3, Var) and arg3.name in ("f32", "f64", "f128", "f256", "f512", "f1024", "f2048"):
+                            type_name = arg3.name
+                        elif isinstance(arg3, Str):
+                            type_name = arg3.value
+                    is_float = type_name.startswith("f")
+                    if is_float:
+                        return "double"
+                    return "i64"
+                if name in self.functions:
+                    fn = self.functions[name]
+                    return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
             return "i64"
             
         if isinstance(node, BinOp):
@@ -479,10 +496,7 @@ class CodeGen:
             for texpr in node.thread_ids:
                 tid_v, tid_t = self.emit_expr(texpr)
                 tid_v = self.coerce(tid_v, tid_t, "i64")
-                h_ptr = self.new_tmp(); h_val = self.new_tmp()
-                self.emit(f"  {h_ptr} = getelementptr [1024 x i64], [1024 x i64]* @_thread_handles, i64 0, i64 {tid_v}")
-                self.emit(f"  {h_val} = load i64, i64* {h_ptr}")
-                self.emit(f"  call i32 @pthread_join(i64 {h_val}, i8** null)")
+                self.emit(f"  call void @_thread_smart_wait(i64 {tid_v})")
         elif isinstance(node, FileWrite): self.emit_file_write(node)
         return False
 
@@ -584,7 +598,7 @@ class CodeGen:
         val, val_t = self.emit_expr(value)
         if val_t == "%Box*":
             self.emit(f"  call void @print_boxed(%Box* {val})")  # print_boxed already calls fflush
-        elif val_t in ("i64","i32","i16","i8","i1"):
+        elif val_t in ("i64","i1"):
             fmt, flen = self.intern_str("%lld\n")
             ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
@@ -605,7 +619,7 @@ class CodeGen:
     def emit_println(self, value):
         # println prints without newline; subsequent calls overwrite same line via \r
         val, val_t = self.emit_expr(value)
-        if val_t in ("i64","i32","i16","i8","i1"):
+        if val_t in ("i64","i1"):
             fmt, flen = self.intern_str("\r%lld")
             ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
@@ -743,6 +757,13 @@ class CodeGen:
         self.emit_body(node.try_body)
         self._try_error_label = None
         self.emit(f"  br label %{end_l}\n{err_l}:")
+        # Declare 'error' variable as a string in the error scope
+        err_str = "Division by zero"
+        err_lbl, err_len = self.intern_str(err_str)
+        err_ptr = self.new_tmp()
+        self.emit(f"  %{err_ptr[1:]} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
+        self.declare_global("error", "i8*")
+        self.emit(f'  store i8* %{err_ptr[1:]}, i8** @error')
         self.emit_body(node.error_body)
         self.emit(f"  br label %{end_l}\n{end_l}:")
 
@@ -871,15 +892,21 @@ class CodeGen:
         if isinstance(node, Compare): return self.emit_compare(node)
         if isinstance(node, UnaryOp):
             val, t = self.emit_expr(node.value)
-            if node.op == "not":
-                v = self.to_bool(val, t); tmp = self.new_tmp()
-                self.emit(f"  {tmp} = xor i1 {v}, 1")
-                return tmp, "i1"
             if node.op == "-":
                 tmp = self.new_tmp()
                 if t in ("float","double"): self.emit(f"  {tmp} = fneg {t} {val}")
                 else: self.emit(f"  {tmp} = sub {t} 0, {val}")
                 return tmp, t
+            if node.op == "*/":
+                # Square root operator - call sqrt() from math library
+                val_d = self.coerce(val, t, "double")
+                tmp = self.new_tmp()
+                self.emit(f"  {tmp} = call double @sqrt(double {val_d})")
+                return tmp, "double"
+            if node.op == "not":
+                v = self.to_bool(val, t); tmp = self.new_tmp()
+                self.emit(f"  {tmp} = xor i1 {v}, 1")
+                return tmp, "i1"
             return val, t
         if isinstance(node, FnCall): return self.emit_call_expr(node)
         if isinstance(node, MethodCall):
@@ -998,10 +1025,7 @@ class CodeGen:
             for arg in node.args:
                 tid_v, tid_t = self.emit_expr(arg)
                 tid_v = self.coerce(tid_v, tid_t, "i64")
-                h_ptr = self.new_tmp(); h_val = self.new_tmp()
-                self.emit(f"  {h_ptr} = getelementptr [1024 x i64], [1024 x i64]* @_thread_handles, i64 0, i64 {tid_v}")
-                self.emit(f"  {h_val} = load i64, i64* {h_ptr}")
-                self.emit(f"  call i32 @pthread_join(i64 {h_val}, i8** null)")
+                self.emit(f"  call void @_thread_smart_wait(i64 {tid_v})")
             return "0", "i64"
 
         if node.name == "thread_result":
@@ -1059,13 +1083,44 @@ class CodeGen:
             return self.emit_field_assign(FieldAssign(node.obj.obj, node.obj.field, node.args[0]))
 
         # 2b. Handle built-in module method calls: time.sleep, random.shuffle, random.choice
-        if obj_name == "time" and node.method == "sleep":
-            secs_v, secs_t = self.emit_expr(node.args[0])
-            secs_v = self.coerce(secs_v, secs_t, "i64")
-            sec_i32 = self.new_tmp()
-            self.emit(f"  {sec_i32} = trunc i64 {secs_v} to i32")
-            self.emit(f"  call i32 @sleep(i32 {sec_i32})")
-            return "0", "i64"
+        if obj_name == "time":
+            if node.method == "sleep":
+                secs_v, secs_t = self.emit_expr(node.args[0])
+                secs_v = self.coerce(secs_v, secs_t, "i64")
+                sec_i32 = self.new_tmp()
+                self.emit(f"  {sec_i32} = trunc i64 {secs_v} to i32")
+                self.emit(f"  call i32 @sleep(i32 {sec_i32})")
+                return "0", "i64"
+            if node.method == "wait":
+                # Syntax says time.wait(n) waits for n seconds - use sleep, not usleep
+                secs_v, secs_t = self.emit_expr(node.args[0])
+                secs_v = self.coerce(secs_v, secs_t, "i64")
+                sec_i32 = self.new_tmp()
+                self.emit(f"  {sec_i32} = trunc i64 {secs_v} to i32")
+                self.emit(f"  call i32 @sleep(i32 {sec_i32})")
+                return "0", "i64"
+            if node.method == "timer_start":
+                tid_v, tid_t = self.emit_expr(node.args[0])
+                tid_v = self.coerce(tid_v, tid_t, "i64")
+                # type_hint is second arg but we just need it for type checking
+                self.emit(f"  call void @time_timer_start(i64 {tid_v}, double 0.0)")
+                return "0", "i64"
+            if node.method == "timer_pause":
+                tid_v, tid_t = self.emit_expr(node.args[0])
+                tid_v = self.coerce(tid_v, tid_t, "i64")
+                self.emit(f"  call void @time_timer_pause(i64 {tid_v})")
+                return "0", "i64"
+            if node.method == "timer_stop":
+                tid_v, tid_t = self.emit_expr(node.args[0])
+                tid_v = self.coerce(tid_v, tid_t, "i64")
+                self.emit(f"  call void @time_timer_stop(i64 {tid_v})")
+                return "0", "i64"
+            if node.method == "timer_read":
+                tid_v, tid_t = self.emit_expr(node.args[0])
+                tid_v = self.coerce(tid_v, tid_t, "i64")
+                tmp = self.new_tmp()
+                self.emit(f"  {tmp} = call double @time_timer_read(i64 {tid_v})")
+                return tmp, "double"
 
         if obj_name == "random":
             if node.method == "shuffle":
@@ -1229,19 +1284,26 @@ class CodeGen:
         to_t = self.rubi_type_to_ir(node.target_type)
         tmp = self.new_tmp()
         if from_t == to_t: return val, to_t
-        if from_t in ("i1","i8","i16","i32","i64") and to_t in ("float","double"):
+        # Box* casts: delegate to coerce() which handles unbox_f/unbox_i/unbox_s
+        if from_t == "%Box*":
+            return self.coerce(val, from_t, to_t), to_t
+        if from_t in ("i1","i64") and to_t in ("float","double"):
             self.emit(f"  {tmp} = sitofp {from_t} {val} to {to_t}"); return tmp, to_t
-        if from_t in ("float","double") and to_t in ("i1","i8","i16","i32","i64"):
+        if from_t in ("float","double") and to_t in ("i1","i64"):
             self.emit(f"  {tmp} = fptosi {from_t} {val} to {to_t}"); return tmp, to_t
         if from_t == "float" and to_t == "double":
             self.emit(f"  {tmp} = fpext float {val} to double"); return tmp, to_t
         if from_t == "double" and to_t == "float":
             self.emit(f"  {tmp} = fptrunc double {val} to float"); return tmp, to_t
-        int_sizes = {"i1":1,"i8":8,"i16":16,"i32":32,"i64":64}
+        int_sizes = {"i1":1,"i64":64}
         if from_t in int_sizes and to_t in int_sizes:
-            instr = "sext" if int_sizes[to_t] > int_sizes[from_t] else "trunc"
-            self.emit(f"  {tmp} = {instr} {from_t} {val} to {to_t}"); return tmp, to_t
-        if from_t in ("i1","i8","i16","i32","i64") and to_t == "i8*":
+            # i1 and i64 need proper conversion
+            if from_t == "i64" and to_t == "i1":
+                self.emit(f"  {tmp} = trunc i64 {val} to i1"); return tmp, to_t
+            if from_t == "i1" and to_t == "i64":
+                self.emit(f"  {tmp} = zext i1 {val} to i64"); return tmp, to_t
+            return val
+        if from_t in ("i1","i64") and to_t == "i8*":
             buf, fmt_ptr = self.new_tmp(), self.new_tmp()
             fmt_lbl, flen = self.intern_str("%lld")
             self.emit(f"  {buf} = call i8* @malloc(i64 32)")
@@ -1257,7 +1319,7 @@ class CodeGen:
             dv = self.coerce(val, from_t, "double")
             self.emit(f"  call i32 (i8*, i8*, ...) @sprintf(i8* {buf}, i8* {fmt_ptr}, double {dv})")
             return buf, "i8*"
-        if from_t == "i8*" and to_t in ("i1","i8","i16","i32","i64"):
+        if from_t == "i8*" and to_t in ("i1","i64"):
             t2 = self.new_tmp()
             self.emit(f"  {t2} = call i64 @atol(i8* {val})")
             return self.coerce(t2, "i64", to_t), to_t
@@ -1321,6 +1383,13 @@ class CodeGen:
                     self.emit(f"{safe_l}:")
                 self.emit(f"  {tmp} = {instr} i64 {l}, {r}")
                 return tmp, "i64"
+            # Handle power operator (**)
+            if node.op == "**":
+                # Call pow() from math library
+                l_d = self.coerce(l, "i64", "double")
+                r_d = self.coerce(r, "i64", "double")
+                self.emit(f"  {tmp} = call double @pow(double {l_d}, double {r_d})")
+                return tmp, "double"
         else:
             instr = {"+":"fadd","-":"fsub","*":"fmul","/":"fdiv"}.get(node.op)
             if instr:
@@ -1350,7 +1419,7 @@ class CodeGen:
     def coerce_to_box(self, val, t):
         if t == "%Box*": return val
         tmp = self.new_tmp()
-        if t in ("i1", "i8", "i16", "i32", "i64"):
+        if t in ("i1", "i64"):
             v = self.coerce(val, t, "i64")
             self.emit(f"  {tmp} = call %Box* @box_i(i64 {v})")
         elif t in ("float", "double"):
@@ -1370,7 +1439,7 @@ class CodeGen:
             return val
         tmp = self.new_tmp()
         buf = self.new_tmp()
-        if t in ("i1", "i8", "i16", "i32", "i64"):
+        if t in ("i1", "i64"):
             fmt_lbl, flen = self.intern_str("%lld")
             fmt_ptr = self.new_tmp()
             self.emit(f"  {buf} = call i8* @malloc(i64 32)")
@@ -1393,11 +1462,17 @@ class CodeGen:
         if from_t == to_t: return val
         tmp = self.new_tmp()
         if from_t == "%Box*":
-            if to_t in ("i1", "i8", "i16", "i32", "i64"):
+            if to_t in ("i1", "i32", "i64"):
                 self.emit(f"  {tmp} = call i64 @unbox_i(%Box* {val})")
-                if to_t != "i64":
+                if to_t == "i64":
+                    return tmp
+                if to_t == "i32":
                     tmp2 = self.new_tmp()
-                    self.emit(f"  {tmp2} = trunc i64 {tmp} to {to_t}")
+                    self.emit(f"  {tmp2} = trunc i64 {tmp} to i32")
+                    return tmp2
+                if to_t == "i1":
+                    tmp2 = self.new_tmp()
+                    self.emit(f"  {tmp2} = trunc i64 {tmp} to i1")
                     return tmp2
                 return tmp
             if to_t in ("float", "double"):
@@ -1415,28 +1490,21 @@ class CodeGen:
             self.emit(f"  {tmp2} = bitcast i8* {tmp} to {to_t}")
             return tmp2
         if to_t == "%Box*": return self.coerce_to_box(val, from_t)
-        int_types = {"i1","i4","i8","i16","i32","i64"}
-        # i4 is stored as i8, so handle it specially
-        if from_t == "i4" and to_t in int_types:
-            if to_t == "i4":
-                return val
-            tmp2 = self.new_tmp()
-            self.emit(f"  {tmp2} = sext i8 {val} to i64")  # i4 is stored as i8, sign-extend to i64
-            if to_t == "i64":
-                return tmp2
-            tmp3 = self.new_tmp()
-            self.emit(f"  {tmp3} = trunc i64 {tmp2} to {to_t}")
-            return tmp3
-        if to_t == "i4":
-            # Converting to i4 - store as i8 (lower 4 bits)
-            if from_t in int_types:
-                tmp2 = self.new_tmp()
-                self.emit(f"  {tmp2} = trunc {from_t} {val} to i8")  # Truncate to i8
-                return tmp2
+        int_types = {"i1", "i32", "i64"}
         if from_t in int_types and to_t in int_types:
-            instr = "zext" if from_t == "i1" else ("sext" if int(to_t[1:]) > int(from_t[1:]) else "trunc")
-            self.emit(f"  {tmp} = {instr} {from_t} {val} to {to_t}")
-            return tmp
+            if from_t == "i64" and to_t == "i32":
+                self.emit(f"  {tmp} = trunc i64 {val} to i32"); return tmp
+            if from_t == "i64" and to_t == "i1":
+                self.emit(f"  {tmp} = trunc i64 {val} to i1"); return tmp
+            if from_t == "i32" and to_t == "i64":
+                self.emit(f"  {tmp} = sext i32 {val} to i64"); return tmp
+            if from_t == "i32" and to_t == "i1":
+                self.emit(f"  {tmp} = trunc i32 {val} to i1"); return tmp
+            if from_t == "i1" and to_t == "i64":
+                self.emit(f"  {tmp} = zext i1 {val} to i64"); return tmp
+            if from_t == "i1" and to_t == "i32":
+                self.emit(f"  {tmp} = zext i1 {val} to i32"); return tmp
+            return val
         if from_t in int_types and to_t in ("float","double"):
             self.emit(f"  {tmp} = sitofp {from_t} {val} to {to_t}"); return tmp
         if from_t == "float" and to_t == "double":

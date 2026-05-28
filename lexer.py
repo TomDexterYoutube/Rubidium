@@ -30,11 +30,11 @@ TOKEN_SPEC = [
     ("OR",       r"or\b"),
     ("NOT",      r"not\b"),
 
-    ("TYPE",     r"\b(?:i4|i8|i16|i32|i64|i128|i256|f4|f8|f16|f32|f64|f128|f256|str|bool|list|index|dict)\b"),
+    ("TYPE",     r"\b(?:i32|i64|i128|i256|f32|f64|f128|f256|f512|f1024|f2048|str|bool|list|index|dict)\b"),
 
     ("IDENT",    r"[a-zA-Z_][a-zA-Z0-9_]*"),
 
-    ("OP",       r"==|!=|<=|>=|->|=|\+|-|\*|/|<|>"),
+    ("OP",       r"==|!=|<=|>=|->|=|\+|-|\*\*|\*/|\*|/|<|>"),
     ("LPAREN",   r"\("),
     ("RPAREN",   r"\)"),
     ("LBRACE",   r"\{"),
