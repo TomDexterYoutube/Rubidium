@@ -176,6 +176,8 @@ class CodeGen:
         self.global_vars[name] = ir_type
         if ir_type.endswith("*"):
             self.global_decls.append(f"@{name} = global {ir_type} null")
+        elif ir_type == "fp128":
+            self.global_decls.append(f"@{name} = global {ir_type} 0xL00000000000000000000000000000000")
         elif ir_type in ("float", "double"):
             self.global_decls.append(f"@{name} = global {ir_type} 0.0")
         else:
@@ -392,6 +394,9 @@ class CodeGen:
         elif isinstance(node, Try):
             for s in node.try_body: self._collect_global(s)
             for s in node.error_body: self._collect_global(s)
+        elif isinstance(node, FnDef):
+            # Variable pool: let declarations inside regular functions go to the global pool
+            for s in node.body: self._collect_global(s)
         elif isinstance(node, FileOpen):
             if node.var_name:
                 self._file_handle_vars[node.var_name] = -1  # sentinel during collect pass
@@ -482,7 +487,8 @@ class CodeGen:
                     cn = f"main_{raw_cn}"
                     is_class = True
                     
-            if self.cur_fn is not None and self.cur_fn != "_rubidium_init":
+            if self.cur_fn is not None and self.cur_fn != "_rubidium_init" and self.cur_class is not None:
+                # Inside a class method — keep variables local (class instances isolate memory)
                 if is_class:
                     struct_t = self.class_ir_type(cn)
                     self.instances[node.name] = cn
@@ -560,6 +566,9 @@ class CodeGen:
             if node.method == "set" and isinstance(node.obj, FnCall):
                 self.emit_collection_set(node)
                 return False
+            if node.method == "add" and isinstance(node.obj, FnCall):
+                self.emit_collection_add(node)
+                return False
             self.emit_method_call_expr(node)
         elif isinstance(node, Drop):
             self.dropped_vars.add(node.name)
@@ -582,6 +591,8 @@ class CodeGen:
                 tid_v = self.coerce(tid_v, tid_t, "i64")
                 self.emit(f"  call void @_thread_smart_wait(i64 {tid_v})")
         elif isinstance(node, FileWrite): self.emit_file_write(node)
+        elif isinstance(node, FileHandleStmt):
+            self.emit_file_handle_method(node.var_name, node.method, node.args)
         elif isinstance(node, FileOpen): self.emit_file_open(node)
         elif isinstance(node, FileExists): self.emit_file_exists(node)
         elif isinstance(node, FileDelete): self.emit_file_delete(node)
@@ -665,6 +676,43 @@ class CodeGen:
             
         return "0", "i64"
 
+    def emit_collection_add(self, method_call_node):
+        access_node = method_call_node.obj
+        val_nodes = method_call_node.args
+        
+        keys = []
+        curr = access_node
+        while isinstance(curr, FnCall):
+            keys = curr.args + keys
+            curr = curr.name
+        
+        if isinstance(curr, str): 
+            col_v, col_t = self.emit_expr(Var(curr))
+        else: 
+            col_v, col_t = self.emit_expr(curr)
+        col_b = self.coerce_to_box(col_v, col_t)
+        
+        for arg in keys:
+            k_v, k_t = self.emit_expr(arg)
+            k_b = self.coerce_to_box(k_v, k_t)
+            next_col = self.new_tmp()
+            self.emit(f"  {next_col} = call %Box* @collection_get(%Box* {col_b}, %Box* {k_b})")
+            col_b = next_col
+        
+        if method_call_node.method == "add":
+            if len(val_nodes) == 1:
+                val_v, val_t = self.emit_expr(val_nodes[0])
+                val_b = self.coerce_to_box(val_v, val_t)
+                self.emit(f"  call void @list_append(%Box* {col_b}, %Box* {val_b})")
+            elif len(val_nodes) == 2:
+                key_v, key_t = self.emit_expr(val_nodes[0])
+                val_v, val_t = self.emit_expr(val_nodes[1])
+                key_b = self.coerce_to_box(key_v, key_t)
+                val_b = self.coerce_to_box(val_v, val_t)
+                self.emit(f"  call void @dict_set(%Box* {col_b}, %Box* {key_b}, %Box* {val_b})")
+        
+        return "0", "i64"
+
     def emit_class_init(self, ptr_str, class_name):
         cls = self.class_defs[class_name]
         struct_t = self.class_ir_type(class_name)
@@ -698,17 +746,34 @@ class CodeGen:
         self.emit(f"  store {ir_t} {val}, {ir_t}* {fptr}")
 
     def emit_print(self, value):
+         # If printing a dropped variable, emit error message only
+         if isinstance(value, Var) and value.name in self.dropped_vars:
+             err_lbl, err_len = self.intern_str("ERROR: variable does not exist\\n")
+             ptr = self.new_tmp()
+             self.emit(f"  {ptr} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
+             self.emit(f"  call i32 (i8*, ...) @printf(i8* {ptr})")
+             return
          val, val_t = self.emit_expr(value)
          if val_t == "%Box*":
              self.emit(f"  call void @print_boxed(%Box* {val})")  # print_boxed already calls fflush
-         elif val_t in ("i32", "i64", "i1"):
+         elif val_t == "i1":
+             # Print True or False
+             true_lbl, true_len = self.intern_str("True\n")
+             false_lbl, false_len = self.intern_str("False\n")
+             true_ptr = self.new_tmp(); false_ptr = self.new_tmp(); sel_ptr = self.new_tmp()
+             self.emit(f"  {true_ptr} = getelementptr [{true_len} x i8], [{true_len} x i8]* {true_lbl}, i64 0, i64 0")
+             self.emit(f"  {false_ptr} = getelementptr [{false_len} x i8], [{false_len} x i8]* {false_lbl}, i64 0, i64 0")
+             self.emit(f"  {sel_ptr} = select i1 {val}, i8* {true_ptr}, i8* {false_ptr}")
+             self.emit(f"  call i32 (i8*, ...) @printf(i8* {sel_ptr})")
+             self.emit(f"  call i32 @fflush(i8* null)")
+         elif val_t in ("i32", "i64", "i128", "i256", "i512", "i1024", "i2048"):
              cv = self.coerce(val, val_t, "i64")
              fmt, flen = self.intern_str("%lld\n")
              ptr = self.new_tmp()
              self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
              self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, i64 {cv})')
              self.emit(f'  call i32 @fflush(i8* null)')
-         elif val_t in ("float","double"):
+         elif val_t in ("float", "double", "fp128"):
              fmt, flen = self.intern_str("%g\n")
              ptr = self.new_tmp()
              self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
@@ -722,14 +787,14 @@ class CodeGen:
     def emit_println(self, value):
         # println prints without newline; subsequent calls overwrite same line via \r
         val, val_t = self.emit_expr(value)
-        if val_t in ("i32", "i64", "i1"):
+        if val_t in ("i32", "i64", "i1", "i128", "i256", "i512", "i1024", "i2048"):
             fmt, flen = self.intern_str("\r%lld")
             ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
             cv = self.coerce(val, val_t, "i64")
             self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, i64 {cv})')
             self.emit(f'  call i32 @fflush(i8* null)')
-        elif val_t in ("float","double"):
+        elif val_t in ("float", "double", "fp128"):
             fmt, flen = self.intern_str("\r%g")
             ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
@@ -907,6 +972,18 @@ class CodeGen:
         self.emit(f"  call i64 @file_open(i64 {slot}, i8* {path_s})")
         # Register this var_name as a file handle pointing to this slot
         self._file_handle_vars[node.var_name] = slot
+        # Allocate the variable in local/global scope so Var(f) can be resolved
+        slot_val = str(slot)
+        if node.var_name not in self.local_vars and node.var_name not in self.global_vars:
+            if self.cur_fn is not None and self.cur_fn != "_rubidium_init":
+                self.local_vars[node.var_name] = "i64"
+                ptr = f"%ptr_{node.var_name}"
+                self.emit(f"  {ptr} = alloca i64")
+                self._alloca_emitted.add(node.var_name)
+                self.emit(f"  store i64 {slot_val}, i64* {ptr}")
+            else:
+                self.declare_global(node.var_name, "i64")
+                self.emit(f"  store i64 {slot_val}, i64* @{node.var_name}")
         # Emit body — method calls on node.var_name will be intercepted
         saved_loop = self.loop_end_stack[:]
         self.emit_body(node.body)
@@ -1192,7 +1269,13 @@ class CodeGen:
             return buf, "i8*"
             
         if isinstance(node, Var):
-            if node.name in self.dropped_vars: raise RubidiumNameError(f"Dropped '{node.name}'")
+            if node.name in self.dropped_vars:
+                # Runtime behavior: print error message instead of crash
+                err_lbl, err_len = self.intern_str("ERROR: variable does not exist\\n")
+                fmt_ptr = self.new_tmp()
+                self.emit(f"  {fmt_ptr} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
+                self.emit(f"  call i32 (i8*, ...) @printf(i8* {fmt_ptr})")
+                return "0", "i64"
             
             # --- FIX: Implicitly access class field if it exists ---
             if self.is_class_field(node.name):
@@ -1227,8 +1310,11 @@ class CodeGen:
             return val, t
         if isinstance(node, FnCall): return self.emit_call_expr(node)
         if isinstance(node, MethodCall):
-            if node.method == "set" and isinstance(node.obj, FnCall):
+            if node.method == "set" and isinstance(node.obj, (FnCall, Var)):
                 self.emit_collection_set(node)
+                return "0", "i64"
+            if node.method == "add" and isinstance(node.obj, (FnCall, Var)):
+                self.emit_collection_add(node)
                 return "0", "i64"
             return self.emit_method_call_expr(node)
         if isinstance(node, TypeCast): return self.emit_type_cast(node)

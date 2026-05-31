@@ -263,9 +263,39 @@ void print_boxed(Box* b) {
     else if(b->type==2) printf("%s\n", b->s);
     else {
         int* magic = (int*)(b->p);
-        if(magic && *magic==1) printf("<list>\n");
-        else if(magic && *magic==2) printf("<dict>\n");
-        else printf("<object>\n");
+        if(magic && *magic==1) {
+            RList* l = (RList*)b->p;
+            printf("[");
+            for(int i=0; i<l->count; i++) {
+                if(i>0) printf(", ");
+                Box* item = l->items[i];
+                if(!item) printf("null");
+                else if(item->type==0) printf("%lld", item->i);
+                else if(item->type==1) printf("%g", item->f);
+                else if(item->type==2) printf("%s", item->s);
+                else printf("...");
+            }
+            printf("]\n");
+        } else if(magic && *magic==2) {
+            RDict* d = (RDict*)b->p;
+            printf("{");
+            for(int i=0; i<d->count; i++) {
+                if(i>0) printf(", ");
+                Box* k = d->keys[i];
+                Box* v = d->vals[i];
+                if(!k) printf("null");
+                else if(k->type==0) printf("%lld", k->i);
+                else if(k->type==1) printf("%g", k->f);
+                else if(k->type==2) printf("\"%s\"", k->s);
+                printf(": ");
+                if(!v) printf("null");
+                else if(v->type==0) printf("%lld", v->i);
+                else if(v->type==1) printf("%g", v->f);
+                else if(v->type==2) printf("%s", v->s);
+                else printf("...");
+            }
+            printf("}\n");
+        } else printf("<object>\n");
     }
     fflush(stdout);
 }

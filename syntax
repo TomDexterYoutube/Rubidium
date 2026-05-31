@@ -4,604 +4,530 @@
 # Designed for beginners. Built to scale into real systems programming.
 # -----------------------------------------
 
-# -------------------------------
-# IMPORTANT INFO
-# -------------------------------
+# =========================================
+# OVERVIEW (READ THIS FIRST PLEASE)
+# =========================================
 
-# Varbables are always deep copied never borowed or shared
-# Memory is never automatically dropped it must b manual  with the exeption of open() and loops read more in there sections 
+# Rubidium is a systems-level programming language
+# with a beginner-friendly surface syntax.
 
-# -------------------------------
-# VARIABLES & DATA TYPES
-# -------------------------------
-
-# Declare variables with optional types.
+# The most important mental model:
 #
-# Integer types:
-# i32, i64, i128, i256, f512, f1024, f2048
+# VARIABLES LIVE IN A SHARED POOL.
 #
-# Floating-point types:
-# f32, f64, f128, f256, f512, f1024, f2048
+# This means:
+# - Variables are NOT confined to function scope
+# - Variables exist once created
+# - Variables persist until explicitly dropped
+# - Functions only control WHEN variables are created
+
+# Example mental model:
 #
-# Other built-in types:
-# str   = String
-# bool  = True / False
+# Think of memory like a public whiteboard.
+# Anyone can see it.
+# Anyone can write on it (if mutable).
+# Only `.drop()` erases it completely.
 
-let x = 10                  # Type inferred as i32
-let mut y: i32 = 5          # Mutable integer
-let name: str = "Rubidium"
-let mut f: f64 = 3.14
-let mut b: bool = True
+# =========================================
+# EXECUTION ORDER (VERY IMPORTANT)
+# =========================================
 
-# Reassigning mutable variables
-y = 15
-f = 2.718
-b = False
+# 1. Top-level code runs first (top to bottom)
+# 2. Functions are defined but NOT executed yet
+# 3. main() runs automatically after top-level execution
 
-# Type casting using 'as'
-let large_num: i64 = y as i64
-let float_val: f64 = 100 as f64
+print("A - top level")
 
-# Variables are global by default.
-# Functions, classes, and imported files create isolated scopes.
-
-# -------------------------------
-# TYPE CHECKING
-# -------------------------------
-
-# Rubidium performs compile-time type checking.
-# Assigning the wrong type will raise a compiler error.
-
-# Example (will error):
-# let val: i32 = 5
-# val = "hello"
-
-# -------------------------------
-# MATH & LOGIC
-# -------------------------------
-
-# Standard operators:
-# +, -, *, /
-# Also ** for to the power of and */ for square root
-# - can be used to flip weather the val is possitive or negitve as it should
-
-# Operator precedence (BODMAS) applies
-let calc1 = 1 + 2 * 3       # equals 7
-let calc2 = (1 + 2) * 3     # equals 9
-
-# Comparison operators:
-# ==, !=, >, <, >=, <=
-
-let check: bool = calc1 > 5
-
-# Logical operators:
-# and, or, not
-
-let cond: bool = True and not False
-
-# -------------------------------
-# STRINGS & BUILT-IN METHODS
-# -------------------------------
-
-let greeting: str = "Hello, "
-let target: str = "World!"
-
-# String concatenation
-# Returns a new heap-allocated string
-
-let full_msg = greeting.combine(target)
-let combined = greeting + target
-
-# String methods
-
-let length: i64 = full_msg.len()
-let has_world: bool = full_msg.has("World")
-
-let number_str: str = "404"
-let num_val: i64 = number_str.to(i32)
-let str: str = num_val.to(str)
-let float_val: i64 = str.to(f32)
-
-# -------------------------------
-# DYNAMIC COLLECTIONS
-# (list, index, dict)
-# -------------------------------
-
-# Collections dynamically manage boxed memory internally.
-
-# Lists start at index 0
-# Before instead it started at 1 of 0 as This matches how humans naturally count sequences but lots of people didnt like it :(
-
-# 1. Lists (Arrays)
-
-let my_list: list = ["64534", 2.124, "hi"]
-
-print(my_list(3))             # prints: hi
-
-# 2. Indexes
-# Key-value collections with mixed key and value types
-
-let my_index: index = [
-    "one": "hello",
-    2: "no",
-    2.3: 123
-]
-
-print(my_index("one"))        # prints: hello
-
-# 3. Dicts
-# Structured key-value collections
-
-let my_dict: dict = {
-    "nested" = [1, "hi", 4],
-    "no" = [1, 7, 4]
+fn main() {
+    print("B - main")
 }
 
-# Accessing nested collections
+# OUTPUT:
+# A - top level
+# B - main
 
-print(my_dict("nested", 2))   # prints: hi
+# =========================================
+# VARIABLES
+# =========================================
 
-# Mutating collections using .set()
+# Variables are created when execution reaches them.
 
-my_list(2).set("why")
-my_index("one").set("changed")
-my_dict("nested", 1).set(99)
+let x = 10
+let name = "Rubidium"
+let flag = True
 
-# This sets the spesifed bit to that value
-
-# Mutating collections using .add()
-
-my_list().add("why")
-my_index().add("changed", 1)
-# Adds the key with the value 1 if the key already exits error will happen
-my_dict("nested").add(99)
-# add the value to the key spesifed you can have the key blank and do the same as index
-
-# Works as append
-
-# -------------------------------
-# PRINT & INPUT / OUTPUT
-# -------------------------------
+# These variables immediately enter the global pool.
 
 print(x)
-print("Hello, Rubidium!")
+print(name)
+print(flag)
 
-# print() outputs text and moves to a new line.
-#
-# Example output:
-#
+# OUTPUT:
 # 10
-# Hello, Rubidium!
+# Rubidium
+# True
 
-println("Hi")
-println(0)
+# -----------------------------------------
+# MUTABLE VARIABLES
+# -----------------------------------------
 
-# println() updates the current console line
-# instead of creating a new one.
-#
-# Calling println() again replaces the previous
-# text on that line.
+let mut counter = 0
 
-# Example:
-#
-# println("Hi")
-# println("Bye")
-#
-# Output:
-#
-# Bye
+counter = 1
+counter = 2
+counter = 3
 
-# You can also put varbables like this
+print(counter)
 
-print("Hello" + x)
-# OR
-print(i"Hello {x}")
+# OUTPUT:
+# 3
 
-# This also works with println
+# -----------------------------------------
+# IMMUTABLE VARIABLES
+# -----------------------------------------
 
-# Standard input
+let locked = 10
 
-let user_input: str = input("Enter your name: ")
+locked = 20   # WARNING: not mutable
 
-# -------------------------------
-# FILES & FILE HANDLES
-# -------------------------------
+# Compiler behavior:
+# - warning or error depending on compiler strict mode
+# - value is NOT changed
 
-# Rubidium supports structured file IO
-# using automatic file handles.
+# =========================================
+# VARIABLE POOL MODEL (CORE FEATURE)
+# =========================================
 
-# Files opened with `open() as`
-# automatically close at the end of the block scope the file data is closed and not there anymore but any other varbables are still there 
+# Variables exist in a shared runtime pool.
 
-open("data.txt") as file {
+fn create() {
+    let x = 99
+}
 
+create()
+
+print(x)
+
+# OUTPUT:
+# 99
+
+# Explanation:
+# - function executed
+# - variable inserted into pool
+# - variable remains after function ends
+
+# =========================================
+# DELETION SYSTEM (.drop)
+# =========================================
+
+let temp = 123
+
+print(temp)
+
+temp.drop()
+
+print(temp)
+
+# OUTPUT:
+# 123
+# ERROR: variable does not exist
+
+# -----------------------------------------
+# DROP BEHAVIOR DETAILS
+# -----------------------------------------
+
+# .drop() permanently removes variable
+# - removes value
+# - removes references
+# - removes memory
+# - cannot be recovered
+
+let list = [1,2,3]
+list.drop()
+
+# list is gone completely
+
+# =========================================
+# COPYING RULE (VERY IMPORTANT)
+# =========================================
+
+# All assignments are DEEP COPIES
+
+let a = [1,2,3]
+let b = a
+
+b(0).set(999)
+
+print(a)
+
+# OUTPUT:
+# [1,2,3]
+
+# Explanation:
+# - a and b are fully independent
+# - modifying b does NOT affect a
+
+# =========================================
+# TYPES
+# =========================================
+
+let a: i32 = 10
+let b: i64 = 100
+let c: f32 = 3.14
+let d: f64 = 2.718
+let e: str = "hello"
+let f: bool = True
+
+# -----------------------------------------
+# TYPE LIST (EXTRA DETAIL)
+# -----------------------------------------
+
+# Integers:
+# i32   - small integer
+# i64   - standard integer
+# i128  - large integer
+# i256  - very large integer
+# i512  - extremely large integer
+# i1024 - massive integer
+# i2048 - absurd integer used for simulation / math / experiments
+
+# Floats:
+# f32   - fast decimal
+# f64   - standard float
+# f128  - high precision
+# f256  - scientific precision
+# f512  - simulation grade
+# f1024 - extreme precision
+# f2048 - theoretical precision (rare use)
+
+# =========================================
+# CASTING
+# =========================================
+
+let x = 10
+
+let a = x as i64
+let b = x as f32
+let c = x as str
+
+let s = "123"
+let n = s.to(i32)
+let f = s.to(f64)
+
+# =========================================
+# MATH
+# =========================================
+
+let a = 10 + 5
+let b = 10 - 5
+let c = 10 * 5
+let d = 10 / 5
+let e = 2 ** 3
+
+# Square root operator
+let f = */16
+
+# Explanation:
+# */ means "square root"
+# so */16 = 4
+
+# -----------------------------------------
+# NEGATIVE VALUES
+# -----------------------------------------
+
+let x = 10
+let y = -x
+
+# =========================================
+# STRINGS (VERY DETAILED)
+# =========================================
+
+let a = "Hello"
+let b = "World"
+
+# concatenation
+let c = a + b
+
+# method style concatenation
+let d = a.combine(b)
+
+# length
+let len = a.len()
+
+# contains check
+let has = a.has("H")
+
+# -----------------------------------------
+# STRING EXAMPLES
+# -----------------------------------------
+
+print("A")
+print("Hello " + "World")
+print("Count: " + 10)
+print(i"Hello {10}")
+
+# =========================================
+# LISTS (MUST BE MUTABLE)
+# =========================================
+
+let mut list = [1,2,3,4,5]
+
+print(list(0))
+print(list(1))
+
+# modification examples
+list(0).set(999)
+list(1).set(888)
+
+# append examples
+list().add(6)
+list().add(7)
+
+print(list)
+
+# -----------------------------------------
+# LIST BEHAVIOR EXPLANATION
+# -----------------------------------------
+
+# Lists:
+# - stored in heap
+# - indexed from 0
+# - require mut to modify
+# - support add/set operations
+
+# =========================================
+# INDEX (MIXED KEYS)
+# =========================================
+
+let index = [
+    "name": "Rubidium",
+    1: "one",
+    2.5: "float key"
+]
+
+print(index("name"))
+print(index(1))
+print(index(2.5))
+
+index("name").set("New Name")
+
+# =========================================
+# DICTIONARY (STRUCTURED DATA)
+# =========================================
+
+let dict = {
+    "numbers" = [1,2,3],
+    "letters" = ["a", "b", "c"]
+}
+
+print(dict("numbers", 0))
+print(dict("letters", 2))
+
+dict("numbers", 1).set(999)
+
+# =========================================
+# PRINTING (EXTRA DETAIL)
+# =========================================
+
+print("Hello")
+println("Line mode A")
+println("Line mode B")
+
+print("Value: " + 10)
+print(i"Value: {10}")
+
+# =========================================
+# INPUT
+# =========================================
+
+let name = input("Enter your name: ")
+
+print("Hello " + name)
+
+# =========================================
+# FILE SYSTEM (HEAVILY EXPLAINED)
+# =========================================
+
+open("file.txt") as file {
+
+    # write overwrites file
     file.write("Hello")
 
+    # append adds to end
     file.append(" World")
 
+    # read entire file
     let data = file.read()
 
     print(data)
 }
 
-# write(data)
-#
-# Overwrites the file contents.
+# -----------------------------------------
+# FILE EXPLANATION
+# -----------------------------------------
 
-open("save.txt") as file {
+# open() creates a temporary file handle
+# automatically closed at block end
 
-    file.write("New Save Data")
+# =========================================
+# LOOPS (VERY EXPLICIT)
+# =========================================
+
+# WHILE LOOP
+let mut i = 0
+
+while i < 5 {
+    print(i)
+    i = i + 1
 }
 
-# writeln(line, data)
-#
-# Replaces or writes a specific line.
-
-open("notes.txt") as file {
-
-    file.writeln(2, "Updated second line")
-}
-
-# append(data)
-#
-# Adds data to the end of the file.
-
-open("log.txt") as file {
-
-    file.append("\nProgram Started")
-}
-
-# read()
-#
-# Reads the entire file as a string.
-
-open("story.txt") as file {
-
-    let contents = file.read()
-
-    print(contents)
-}
-
-# readln(line)
-#
-# Reads a specific line from the file.
-
-open("story.txt") as file {
-
-    let line = file.readln(3)
-
-    print(line)
-}
-
-# Files can be iterated line-by-line.
-
-open("data.txt") as file {
-
-    for line in file {
-
-        print(line)
-    }
-}
-
-# File operations can be handled
-# using try/error blocks.
-
-try {
-
-    open("missing.txt") as file {
-
-        print(file.read())
-    }
-
-} error {
-
-    print("File Error: " + error)
-}
-
-# Check if a file exists.
-
-if file.exists("data.txt") {
-
-    print("File Found")
-}
-
-# Delete a file.
-
-file.delete("old.txt")
-
-# Rename a file.
-
-file.rename("old.txt", "new.txt")
-
-# Copy a file.
-
-file.copy("save1.txt", "backup.txt")
-
-# Make a file.
-
-file.new("data.txt")
-
-# -------------------------------
-# DEEP MEMORY DROPS
-# -------------------------------
-
-# .drop() frees memory immediately.
-# The variable will no longer exist after being dropped.
-
-x.drop()
-
-# Collections and strings recursively free all
-# nested boxes, arrays, and keys.
-
-my_list.drop()
-my_dict.drop()
-
-# -------------------------------
-# CONDITIONALS
-# -------------------------------
-
-if calc1 == 7 {
-    print("True")
-} else if calc1 > 10 {
-    print("Else if")
-} else {
-    print("False")
-}
-
-# -------------------------------
-# LOOPS & ITERATION
-# -------------------------------
-
-# While loop
-# With the for i in list and other variations i will be dropped after the end of the block
-
-
-let mut count = 0
-
-while count < 5 {
-    print(count)
-    count = count + 1
-}
-
-# Numerical range loop
-
-for i in range(1, 10) {
-
-    if i == 5 {
-        break
-    }
-
+# RANGE LOOP (INCLUSIVE)
+for i in range(1, 5) {
     print(i)
 }
 
-# List iteration
+# OUTPUT:
+# 1 2 3 4 5
 
-let items: list = [10, 20, 30]
+# LIST LOOP
+let items = [10,20,30]
 
 for item in items {
     print(item)
 }
 
-# Dict iteration
-# Iteration returns the keys
-
-let table: dict = {
-    "a" = 100,
-    "b" = 200
+# DICT LOOP (KEYS)
+let map = {
+    "a" = 1,
+    "b" = 2
 }
 
-for key in table {
-
-    let val = table(key)
-
-    print(val)
+for key in map {
+    print(map(key))
 }
 
-# -------------------------------
-# FUNCTIONS & SCOPING
-# -------------------------------
-
-# Function with parameters and return type
+# =========================================
+# FUNCTIONS (VERY IMPORTANT SECTION)
+# =========================================
 
 fn add(a: i32, b: i32) -> i32 {
-
-    let local_var = a + b
-
-    return local_var
+    return a + b
 }
 
-# Calling a function
+let result = add(2,3)
 
-let math_result = add(2, 3)
+# -----------------------------------------
+# FUNCTION POOL BEHAVIOR
+# -----------------------------------------
 
-# -------------------------------
-# ERROR HANDLING
-# -------------------------------
-
-# try/error blocks
-
-try {
-
-    let fail: i32 = 10 / 0
-
-} error {
-
-    print("An error occurred" + error)
+fn make() {
+    let x = 50
 }
 
-# The error block exposes the error as a string.
+make()
 
-# -------------------------------
-# CLASSES
-# -------------------------------
+print(x)
 
-# Classes are self-contained object structures.
+# OUTPUT:
+# 50
 
-class my_class() {
+# Explanation:
+# functions inject variables into global pool
 
-    let mut obj_val: i32 = 10
+# -----------------------------------------
+# RECURSION
+# -----------------------------------------
 
-    fn my_func() {
-        print("Hello from class!")
+fn count(n: i32) {
+    if n > 0 {
+        count(n - 1)
     }
 }
 
-# Creating and using a class instance
+# =========================================
+# CLASSES
+# =========================================
 
-fn run_class() {
+class player() {
 
-    let class_one = my_class()
+    let health = 100
 
-    print(class_one.obj_val)
-
-    class_one.obj_val.set(99)
-
-    class_one.my_func()
+    fn hit() {
+        print("ouch")
+    }
 }
 
-# Inside a class there is no 'self'.
-# Class variables are directly accessible
-# from inside the class scope.
+let a = player()
+let b = player()
 
-class my_class() {
+print(a.health)
+print(b.health)
 
-    let x = 10
+a.health.set(50)
+
+print(b.health)
+
+# -----------------------------------------
+# CLASS EXPLANATION
+# -----------------------------------------
+
+# classes:
+# - isolate internal structure
+# - create separate instances
+# - do NOT share memory
+
+# =========================================
+# THREADING
+# =========================================
+
+fn task() {
+    print("task done")
 }
 
-fn main() {
+thread(task(), 1)
+thread(task(), 2)
 
-    let mut stuff = my_class()
+thread.wait(1,2)
 
-    print(stuff.x)
-}
+# WARNING:
+# no locks exist
+# shared variables can be modified simultaneously
 
-# Mutation rules:
-#
-# - If the class instance is immutable,
-#   all contained variables are immutable.
-#
-# - If the class instance is mutable,
-#   only variables declared with 'mut'
-#   can be changed.
-
-# -------------------------------
-# HARDWARE THREADING
-# -------------------------------
-
-# Rubidium supports real POSIX threading.
-
-fn task1() {
-    print("Task 1 Finished")
-}
-
-fn task2() {
-    print("Task 2 Finished")
-}
-
-fn run_threads() {
-
-    # thread(function(), thread_id)
-    # runs the function asynchronously
-
-    thread(task1(), 1)
-    thread(task2(), 2)
-
-    # Wait for specific threads to finish
-
-    thread.wait(1, 2)
-}
-
-# -------------------------------
+# =========================================
 # RANDOM
-# -------------------------------
+# =========================================
 
-# The built-in random module provides
-# random number generation and utilities.
+let r = random(0,10,i32)
 
-data = random(0, 1, f32)
+random.shuffle(list)
+random.choice(list)
 
-# random(min, max, type)
-#
-# Example:
-# random(0, 1, f32)
+# =========================================
+# TIME
+# =========================================
 
-# Randomize list order
+time.wait(5)
 
-random.shuffle(my_list)
-
-# Picks a random value or identifier
-
-random.choice(my_list)
-random.choice(my_index)
-
-random.choice(my_dict)
-random.choice(my_dict("my_idenifer"))
-
-# -------------------------------
-# WAIT / TIME
-# -------------------------------
-
-time.wait(10)
-
-# Waits for 10 seconds
-
-time.timer_start(1, f64)
-
-# Starts a named timer. The number is the timer ID (like thread IDs).
-# Multiple timers can run at once using different IDs.
-
+time.timer_start(1)
 time.timer_pause(1)
-
-# Pauses the timer with the given ID
-
 time.timer_stop(1)
 
-# Stops the timer with the given ID.
+let t = time.timer_read(1)
 
-let elapsed = time.timer_read(1)
-
-# Reads the elapsed time in Senconds then . miliseconds for the given timer ID.
-# Returns as the float type spesifed in this eg would be f64.
-
-# -------------------------------
+# =========================================
 # OS
-# -------------------------------
+# =========================================
 
 os.start(1)
-# Starts a terminal for rubidium, this is a os terminal for eg on linux with bash it would start a bash terminal for rubidium with the idenifer 1
-# This terminal is not visible it is only for Rubidium
+os.run(1, "ls")
 
-os.run(1, "ls -a")
-
-# Runs commands in the terminal
-
-let data = os.run(1, "sudo apt update")
-
-# this would run the command then return all the outputs since apt would need a y to continue you do
-
-let data = os.run(1, "sudo apt update", "y")
-
-# This would send y as soon as there is a chance for input
+let out = os.run(1, "echo hello")
 
 os(1).drop()
 
-# Dropping works the same as variables
-
-# Now the terminal is the same for rubidium as opening a terminal emulator on your computer all the env and OVERRIDE=1 and such work the same
-
-# If you hate yourself this also works for the run syntax
-
-let result = os.run({
-    cmd: "apt",
-    args: ["update"],
-    input: "y\n"
-})
-
-# -------------------------------
-# MODULES & IMPORTS
-# -------------------------------
-
-# Use 'use' to enable compiler-provided modules.
+# =========================================
+# MODULES
+# =========================================
 
 use thread
 use random
@@ -609,76 +535,16 @@ use time
 use os
 use FFI
 
-# If a module is not included with 'use',
-# it cannot be accessed and will error
+import math_tools
 
-# Use 'import' to load external .rub files from the folder the code is in
+math_tools.add()
 
-import math_tools 
-
-# -------------------------------
-# MAIN ENTRY POINT
-# -------------------------------
-
-# The compiler always looks for main()
-# as the program entry point.
+# =========================================
+# MAIN
+# =========================================
 
 fn main() {
-
-    print("Welcome to Rubidium!")
-
-    run_class()
-    run_threads()
+    print("Rubidium running")
 }
 
-# -------------------------------
-# FFI
-# -------------------------------
-
-# For C, C++, C# and my favorite flavor of pain (the least brain hurt): RUST
-
-let c_file = FFI("data/file.so")
-
-# This loads the shared library into the identifier `c_file` it always starts in the folder the code is in you could do /usr/bin or sometihng but starts in the code folder unless told otherwise
-
-# If a function declaration starts with an identifier
-# that was created using FFI(...),
-# then the compiler treats it as a foreign function binding.
-
-fn c_file printfn(var: str) -> i32
-
-# Meaning:
-# - c_file = loaded foreign library
-# - printfn = function symbol inside the library
-# - (var: str) -> i32 = type signature for ABI mapping and type checking
-#
-# This does NOT define a normal function.
-# It creates a binding to an external function.
-
-# After binding, the function can be called like a normal function.
-
-printfn("hello")
-
-# This executes the bound foreign function from the external library.
-
-# -------------------------------
-# NOTES
-# -------------------------------
-
-# - FFI libraries are loaded using FFI("path").
-# - Bound functions are resolved at compile/load time.
-# - The first identifier in the fn statement must be an FFI handle.
-# - The second identifier is the symbol name inside the library.
-# - The function signature is used for type safety and ABI layout.
-# - Statements end with a newline
-# - Semicolons are not required
-# - Variables can be mutable or immutable
-# - Functions support optional return types
-# - Math follows standard precedence rules
-# - if / else and loops use braces { }
-# - Strings use double quotes
-# - .drop() immediately frees memory
-# - Type checking happens at compile time
-# - Boolean values are True and False
-# - Logical operators are and, or, and not
-# - Error handling uses try/error blocks
+print("top level executes first")

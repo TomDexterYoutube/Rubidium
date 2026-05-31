@@ -159,7 +159,11 @@ class Parser:
         elif t[0] == "TRY":      return [self.try_stmt()]
         elif t[0] == "FN":       return [self.fn_def()]
         elif t[0] == "OPEN":     return [self.open_stmt()]
-        elif t[0] == "FILE":     return self.file_global_stmt_list()
+        elif t[0] == "FILE":     
+            result = self.file_global_stmt_list()
+            if result is not None:
+                return [result]
+            return []
         elif t[0] == "IDENT" or t[0] == "TYPE":    return [self.ident_stmt()]
         else:
             self.advance()
@@ -192,9 +196,12 @@ class Parser:
         self.match("LET")
         mut = bool(self.match("MUT"))
         # Accept both IDENT and TYPE tokens for variable names (e.g., "list" is a TYPE but can be a variable name)
+        # Also check if this is a file handle variable inside an open() block
         tok = self.peek()
         if tok and tok[0] in ("IDENT", "TYPE"):
             name = self.match(tok[0])  # match returns the value
+        elif tok and tok[0] == "FILE":
+            name = self.match("FILE")
         else:
             name = self.match("IDENT")
         vtype = None
@@ -284,16 +291,15 @@ class Parser:
         self.match("DOT")
         method = self.match("IDENT")
 
-        # If inside an open() block and this matches the handle var, parse as MethodCall
-        if file_var in self._active_file_handles:
+        # If inside an open() block and this matches the handle var, parse as handle method
+        if file_var in self._active_file_handles and method in ("write", "append", "read", "readln", "writeln"):
             self.match("LPAREN")
             args = []
             while self.peek() and self.peek()[0] != "RPAREN":
                 args.append(self.expr())
-                if self.peek() and self.peek()[0] == "COMMA":
-                    self.match("COMMA")
+                if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
             self.match("RPAREN")
-            return [MethodCall(Var(file_var), method, args)]
+            return FileHandleStmt(file_var, method, args)
 
         self.match("LPAREN")
         
