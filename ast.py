@@ -206,3 +206,52 @@ class FFIBind:
         self.symbol_name = symbol_name
         self.params = params
         self.ret_type = ret_type
+
+# File handle nodes
+class FileOpen:
+    def __init__(self, path_expr, var_name, body=None):
+        self.path_expr = path_expr
+        self.var_name = var_name
+        self.body = body or []
+
+class FileHandleMethod:
+    def __init__(self, var_name, method, args):
+        self.var_name = var_name
+        self.method = method
+        self.args = args
+
+class FileExists:
+    def __init__(self, path_expr):
+        self.path_expr = path_expr
+
+class FileDelete:
+    def __init__(self, path_expr):
+        self.path_expr = path_expr
+
+class FileRename:
+    def __init__(self, old_path, new_path):
+        self.old_path = old_path
+        self.new_path = new_path
+
+class FileCopy:
+    def __init__(self, src_path, dst_path):
+        self.src_path = src_path
+        self.dst_path = dst_path
+
+class FileNew:
+    def __init__(self, path_expr, body):
+        self.path_expr = path_expr
+        self.body = body
+
+# Collection method call nodes
+class CollectionMethodCall:
+    def __init__(self, obj, method, args):
+        self.obj = obj
+        self.method = method
+        self.args = args
+
+class FileHandleStmt:
+    def __init__(self, var_name, method, args):
+        self.var_name = var_name
+        self.method = method
+        self.args = args

@@ -36,8 +36,11 @@ TOKEN_SPEC = [
     ("INPUT",    r"\binput\b"),
     ("FILE_READ", r"\bfile_read\b"),
     ("FILE_WRITE", r"\bfile_write\b"),
+    ("OPEN",     r"\bopen\b"),
+    ("FILE",     r"\bfile\b"),
     ("RANGE",    r"\brange\b"),
     ("THREAD",   r"\bthread\b"),
+    ("OS",       r"\bos\b"),
     ("IMPORT",   r"\bimport\b"),
     ("USE",      r"\buse\b"),
     ("TRY",      r"\btry\b"),
@@ -206,6 +209,22 @@ class DictLiteral(ASTNode):
 class IndexLiteral(ASTNode):
     pairs: List[Tuple[ASTNode, ASTNode]]; line: int
 
+@dataclass
+class OsRun(ASTNode):
+    id_expr: Optional[ASTNode]
+    cmd_expr: Optional[ASTNode]
+    input_expr: Optional[ASTNode] = None
+    struct_args: Optional[Dict] = None
+    line: int = 0
+
+@dataclass
+class OsStart(ASTNode):
+    id_expr: ASTNode; line: int
+
+@dataclass
+class OsDrop(ASTNode):
+    id_expr: ASTNode; line: int
+
 # ==========================================
 # 3. RECURSIVE DESCENT PARSER
 # ==========================================
@@ -256,7 +275,8 @@ class Parser:
         if tok.kind == 'TRY': return self.parse_try_error()
         if tok.kind == 'RETURN': return self.parse_return()
         if tok.kind == 'BREAK': return self.parse_break()
-        if tok.kind in ('PRINT', 'PRINTLN', 'INPUT', 'FILE_READ', 'FILE_WRITE', 'RANGE', 'THREAD'):
+        if tok.kind == 'OPEN': return self.parse_open_block()
+        if tok.kind in ('PRINT', 'PRINTLN', 'INPUT', 'FILE_READ', 'FILE_WRITE', 'FILE', 'RANGE', 'THREAD', 'OS'):
             return self.parse_call_or_print(tok)
 
         expr = self.parse_expression()
@@ -361,6 +381,35 @@ class Parser:
         self.consume('RBRACE')
         return WhileStmt(cond, body, line)
 
+    def parse_open_block(self):
+        """Parse: open("path") as var_name { body } — file handle block"""
+        line = self.consume('OPEN').line
+        self.consume('LPAREN')
+        path_expr = self.parse_expression()
+        self.consume('RPAREN')
+        if self.current().kind == 'AS':
+            self.consume('AS')
+        # var name after 'as' — may be IDENT or FILE keyword used as variable
+        if self.current().kind in ('IDENT', 'FILE', 'TYPE'):
+            var_tok = self.consume()
+        else:
+            var_tok = Token('IDENT', '_file_handle', line, 0)
+        handle_name = var_tok.value
+        # Register handle name so FILE.method() parses correctly inside body
+        self._open_file_handles = getattr(self, '_open_file_handles', set())
+        self._open_file_handles.add(handle_name)
+        self.consume('LBRACE')
+        body = []
+        while self.current().kind not in ('RBRACE', 'EOF'):
+            stmt = self.parse_statement()
+            if stmt: body.append(stmt)
+        self.consume('RBRACE')
+        self._open_file_handles.discard(handle_name)
+        # Return a WhileStmt-like structure — debug.py only does static analysis,
+        # so we wrap as a BlockStmt equivalent by returning an If with body
+        # Use ForStmt(var_tok, path_expr, body) as a container node; warnings still fire
+        return ForStmt(var_tok, path_expr, body, line)
+
     def parse_for(self):
         line = self.consume('FOR').line
         item = self.consume('IDENT')
@@ -444,6 +493,64 @@ class Parser:
                 # thread.wait() - fall through to expression parsing
                 return ExprStmt(self.parse_method_call_from_thread(tok), tok.line)
         
+        # For os keyword - could be os.start(), os.run(), or os(id).drop()
+        if tok.kind == 'OS':
+            # Consume the keyword first
+            self.consume()
+            if self.current().kind == 'DOT':
+                # os.run() or os.start() - handle as method call
+                saved_pos = self.pos
+                self.consume('DOT')
+                attr = self.consume('IDENT')
+                if attr.value == 'run' and self.current().kind == 'LPAREN':
+                    # os.run() - check for struct form or regular args
+                    self.consume('LPAREN')
+                    if self.current().kind == 'LBRACE':
+                        # Struct form: os.run({ cmd: "...", input: "..." })
+                        struct_args = self.parse_os_run_struct()
+                        self.consume('RPAREN')
+                        return ExprStmt(OsRun(None, None, struct_args=struct_args), tok.line)
+                    else:
+                        # Regular form: os.run(id, "cmd") - let the expression parser handle it
+                        self.pos = saved_pos - 2  # Reset before DOT was consumed
+                        return ExprStmt(self.parse_os_run_regular(tok), tok.line)
+                elif attr.value == 'start':
+                    # os.start(id)
+                    self.consume('LPAREN')
+                    id_expr = self.parse_expression()
+                    self.consume('RPAREN')
+                    return ExprStmt(OsStart(id_expr, attr.line), tok.line)
+                else:
+                    self.pos = saved_pos - 2
+                    return ExprStmt(self.parse_os_run_regular(tok), tok.line)
+            elif self.current().kind == 'LPAREN':
+                # os(id) - could be os.run(id, cmd) or os(id).drop()
+                saved_pos = self.pos
+                self.consume('LPAREN')
+                id_expr = self.parse_expression()
+                self.consume('RPAREN')
+                # Check if followed by .drop()
+                if self.current().kind == 'DOT':
+                    self.consume('DOT')
+                    method = self.consume('IDENT')
+                    if method.value == 'drop' and self.current().kind == 'LPAREN':
+                        self.consume('LPAREN')
+                        self.consume('RPAREN')
+                        return ExprStmt(OsDrop(id_expr, method.line), tok.line)
+                    self.pos = saved_pos
+                return ExprStmt(FunctionCall(tok, [id_expr], tok.line), tok.line)
+            return ExprStmt(Identifier(tok), tok.line)  # Just 'os' identifier
+
+        # For file keyword — could be file.write(), file.read(), file.exists(), etc.
+        if tok.kind == 'FILE':
+            self.consume()  # consume 'file'
+            if self.current().kind == 'DOT':
+                self.consume('DOT')
+                method = self.consume('IDENT')
+                args = self._parse_method_args() if self.current().kind == 'LPAREN' else []
+                return ExprStmt(MethodCall(Identifier(tok), method, args, tok.line), tok.line)
+            return ExprStmt(Identifier(tok), tok.line)
+
         self.consume()  # consume the keyword
         self.consume('LPAREN')
         args = []
@@ -452,6 +559,41 @@ class Parser:
             if self.current().kind == 'COMMA': self.consume('COMMA')
         self.consume('RPAREN')
         return ExprStmt(FunctionCall(tok, args, tok.line), tok.line)
+
+    def _parse_method_args(self):
+        """Parse (arg, ...) returning list of args; assumes LPAREN already seen"""
+        self.consume('LPAREN')
+        args = []
+        while self.current().kind not in ('RPAREN', 'EOF'):
+            args.append(self.parse_expression())
+            if self.current().kind == 'COMMA': self.consume('COMMA')
+        self.consume('RPAREN')
+        return args
+
+    def parse_os_run_struct(self):
+        """Parse { cmd: expr, args: [...], input: expr } for os.run() struct form"""
+        self.consume('LBRACE')
+        fields = {}
+        while self.current().kind not in ('RBRACE', 'EOF'):
+            key = self.consume('IDENT')
+            # In struct form, the separator is COLON, not OP
+            self.consume('COLON')
+            val = self.parse_expression()
+            fields[key.value] = val
+            if self.current().kind == 'COMMA': self.consume('COMMA')
+        self.consume('RBRACE')
+        return fields
+
+    def parse_os_run_regular(self, os_tok):
+        """Parse os.run(id, cmd, input) regular form - returns MethodCall"""
+        # We're positioned after LPAREN, need to parse: id, cmd, input
+        args = []
+        while self.current().kind not in ('RPAREN', 'EOF'):
+            args.append(self.parse_expression())
+            if self.current().kind == 'COMMA': self.consume('COMMA')
+        self.consume('RPAREN')
+        # Return as MethodCall with os identifier and run method
+        return MethodCall(Identifier(os_tok), Token('IDENT', 'run', os_tok.line, 0), args, os_tok.line)
 
     def parse_method_call_from_thread(self, tok):
         """Handle thread.wait() syntax"""
@@ -587,13 +729,17 @@ class Parser:
             pairs = []
             while self.current().kind not in ('RBRACE', 'EOF'):
                 k = self.parse_expression()
-                self.consume('OP')  # for '=' operator
+                # Support both COLON (for struct/os.run) and OP with '=' (for dict)
+                if self.current().kind == 'COLON':
+                    self.consume('COLON')
+                else:
+                    self.consume('OP')  # for '=' operator
                 v = self.parse_expression()
                 pairs.append((k, v))
                 if self.current().kind == 'COMMA': self.consume('COMMA')
             self.consume('RBRACE')
             base_expr = DictLiteral(pairs, line)
-        elif tok.kind in ('IDENT', 'PRINT', 'PRINTLN', 'INPUT', 'FILE_READ', 'FILE_WRITE', 'RANGE', 'THREAD', 'ERROR'):
+        elif tok.kind in ('IDENT', 'PRINT', 'PRINTLN', 'INPUT', 'FILE_READ', 'FILE_WRITE', 'FILE', 'RANGE', 'THREAD', 'ERROR', 'OS'):
             if self.current().kind in ('LPAREN', 'LBRACKET'):
                 close_char = 'RPAREN' if self.current().kind == 'LPAREN' else 'RBRACKET'
                 self.consume()
@@ -665,7 +811,7 @@ class StaticAnalyzer:
         self.loop_depth = 0
         self.in_try_block = False
         
-        self.builtins = {"print", "println", "input", "file_read", "file_write", "thread", "thread.wait", "range", "random", "time", "time.wait", "time.timer_start", "time.timer_pause", "time.timer_stop", "time.timer_read"}
+        self.builtins = {"print", "println", "input", "file_read", "file_write", "thread", "thread.wait", "range", "random", "time", "time.wait", "time.timer_start", "time.timer_pause", "time.timer_stop", "time.timer_read", "os", "os.start", "os.run"}
         self.errors, self.warnings = 0, 0
         self.filepath, self.source_lines = filepath, source_lines
         self.is_main_file = is_main_file
@@ -724,7 +870,7 @@ class StaticAnalyzer:
             meta = self.get_var(expr.token.value)
             if meta: return meta.type_cat
             # Handle module identifiers
-            if expr.token.value in ("time", "random", "thread"): return expr.token.value
+            if expr.token.value in ("time", "random", "thread", "os"): return expr.token.value
             return "Unknown"
         elif isinstance(expr, FunctionCall):
             name = expr.name.value
@@ -752,6 +898,11 @@ class StaticAnalyzer:
                     return "Void"
                 if expr.method.value == "timer_read":
                     return "Float"
+            elif base_type == "os":
+                if expr.method.value in ("start",):
+                    return "Void"
+                if expr.method.value in ("run",):
+                    return "String"
             elif base_type.startswith("Class<"):
                 c_name = base_type[6:-1]
                 if c_name in self.classes and expr.method.value in self.classes[c_name].methods:
@@ -898,6 +1049,21 @@ class StaticAnalyzer:
                 self.report_error("E061", "Use of `break` outside of a loop.", node.line)
             self.unreachable = True
 
+        elif isinstance(node, OsStart):
+            self.check_expr(node.id_expr, node.line)
+
+        elif isinstance(node, OsRun):
+            if node.struct_args:
+                for k, v in node.struct_args.items():
+                    self.check_expr(v, node.line)
+            else:
+                self.check_expr(node.id_expr, node.line) if node.id_expr else None
+                self.check_expr(node.cmd_expr, node.line) if node.cmd_expr else None
+                self.check_expr(node.input_expr, node.line) if node.input_expr else None
+
+        elif isinstance(node, OsDrop):
+            self.check_expr(node.id_expr, node.line)
+
         elif isinstance(node, ExprStmt): self.check_expr(node.expr, node.line)
 
         elif isinstance(node, VarDecl):
@@ -937,8 +1103,8 @@ class StaticAnalyzer:
         if isinstance(expr, Identifier):
             meta = self.get_var(expr.token.value)
             if not meta:
-                # Check if it's a builtin module (time, random, thread)
-                if expr.token.value in ("time", "random", "thread"):
+                # Check if it's a builtin module (time, random, thread, os)
+                if expr.token.value in ("time", "random", "thread", "os"):
                     return  # Module identifier, valid
                 if expr.token.value not in self.builtins and expr.token.value not in self.global_functions and expr.token.value not in self.classes:
                     self.report_error("E002", f"Cannot find `{expr.token.value}` in scope", expr.token.line)
@@ -951,8 +1117,6 @@ class StaticAnalyzer:
             target_name = expr.name.value
             meta = self.get_var(target_name)
             if meta and meta.type_cat.startswith(("List<", "Dict<", "Index<")):
-                if len(expr.args) > 0 and isinstance(expr.args[0], Literal) and expr.args[0].value == 0:
-                    self.report_error("E051", f"Attempted to access index 0. Collections are 1-indexed.", expr.line)
                 for arg in expr.args: self.check_expr(arg, current_line)
                 meta.is_read = True
             elif target_name not in self.global_functions and target_name not in self.builtins and target_name not in self.classes:
@@ -1012,6 +1176,17 @@ class StaticAnalyzer:
                     self.report_warning("W050", "Division by zero detected statically (inside try block, will be caught at runtime).", current_line, hint="This is inside a try/error block so the error will be caught.")
                 else:
                     self.report_error("E050", "Division by zero detected statically.", current_line)
+
+        elif isinstance(expr, OsRun):
+            if expr.struct_args:
+                for k, v in expr.struct_args.items():
+                    self.check_expr(v, current_line)
+
+        elif isinstance(expr, OsStart):
+            self.check_expr(expr.id_expr, current_line)
+
+        elif isinstance(expr, OsDrop):
+            self.check_expr(expr.id_expr, current_line)
 
         elif isinstance(expr, UnaryOp): self.check_expr(expr.expr, current_line)
         

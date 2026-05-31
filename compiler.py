@@ -113,6 +113,13 @@ Box* box_i(long long i) { Box* b=malloc(sizeof(Box)); b->type=0; b->i=i; return 
 Box* box_f(double f) { Box* b=malloc(sizeof(Box)); b->type=1; b->f=f; return b; }
 Box* box_s(char* s) { Box* b=malloc(sizeof(Box)); b->type=2; b->s=strdup(s); return b; }
 Box* box_p(void* p) { Box* b=malloc(sizeof(Box)); b->type=3; b->p=p; return b; }
+Box* box_copy(Box* src) {
+    if(!src) return box_i(0);
+    if(src->type==0) return box_i(src->i);
+    if(src->type==1) return box_f(src->f);
+    if(src->type==2) return box_s(src->s);
+    return src; /* collections: return same pointer, caller must not drop */
+}
 
 long long unbox_i(Box* b) { return b ? b->i : 0; }
 double unbox_f(Box* b) { return b ? b->f : 0.0; }
@@ -129,7 +136,7 @@ void list_swap(Box* lst, int i, int j) {
     }
 }
 Box* list_get(void* col, Box* idx) {
-    RList* l=col; int i=idx->i - 1; /* 1-based indexing */
+    RList* l=col; int i=idx->i; /* 0-based indexing */
     if(i>=0 && i<l->count) return l->items[i];
     return box_i(0);
 }
@@ -174,7 +181,7 @@ void collection_set(Box* col_box, Box* key, Box* val) {
     int* magic = (int*)col;
     if (*magic == 1) {
         RList* l = col;
-        int i = key->i - 1; /* 1-based indexing */
+        int i = key->i; /* 0-based indexing */
         if(i >= 0 && i < l->count) {
             box_drop(l->items[i]);
             l->items[i] = val;
@@ -413,6 +420,130 @@ long long ffi_sym(long long handle_idx, const char* symbol) {
         return 0;
     }
     return (long long)(uintptr_t)sym;
+}
+
+// -------------------------------------------------------
+// FILE HANDLE MODULE — file I/O with automatic close
+// -------------------------------------------------------
+FILE* _file_handles[1024];
+char* _file_paths[1024];
+static int _file_handle_count = 0;
+
+// Open a file handle slot — creates file if it doesn't exist, opens r+
+long long file_open(long long slot, const char* path) {
+    if(slot < 0 || slot >= 1024) return -1;
+    if(_file_handles[slot]) { fclose(_file_handles[slot]); _file_handles[slot] = NULL; }
+    if(_file_paths[slot]) { free(_file_paths[slot]); }
+    _file_paths[slot] = strdup(path);
+    // Ensure file exists
+    FILE* touch = fopen(path, "a"); if(touch) fclose(touch);
+    _file_handles[slot] = fopen(path, "r+");
+    return slot;
+}
+
+// Close a file handle
+void file_close(long long slot) {
+    if(slot >= 0 && slot < 1024 && _file_handles[slot]) {
+        fclose(_file_handles[slot]);
+        _file_handles[slot] = NULL;
+    }
+}
+
+// file.write(data) — overwrite entire file
+void file_write_all(long long slot, const char* data) {
+    if(slot < 0 || slot >= 1024 || !_file_paths[slot]) return;
+    if(_file_handles[slot]) { fclose(_file_handles[slot]); }
+    _file_handles[slot] = fopen(_file_paths[slot], "w");
+    if(_file_handles[slot]) {
+        fputs(data, _file_handles[slot]);
+        fclose(_file_handles[slot]);
+        _file_handles[slot] = fopen(_file_paths[slot], "r+");
+    }
+}
+
+// file.append(data) — add to end of file
+void file_append_all(long long slot, const char* data) {
+    if(slot < 0 || slot >= 1024 || !_file_handles[slot]) return;
+    fseek(_file_handles[slot], 0, SEEK_END);
+    fputs(data, _file_handles[slot]);
+    fflush(_file_handles[slot]);
+}
+
+// file.read() — read entire file as string
+char* file_read_all(long long slot) {
+    if(slot < 0 || slot >= 1024 || !_file_handles[slot]) return strdup("");
+    FILE* f = _file_handles[slot];
+    fseek(f, 0, SEEK_SET);
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+    char* buf = malloc(sz + 1);
+    size_t rd = fread(buf, 1, sz, f);
+    buf[rd] = '\0';
+    return buf;
+}
+
+// file.readln(n) — read specific line (1-based)
+char* file_readln(long long slot, long long line_num) {
+    if(slot < 0 || slot >= 1024 || !_file_handles[slot]) return strdup("");
+    FILE* f = _file_handles[slot];
+    rewind(f);
+    char buf[4096]; long long cur = 1;
+    while(fgets(buf, sizeof(buf), f)) {
+        if(cur == line_num) {
+            size_t len = strlen(buf);
+            if(len > 0 && buf[len-1] == '\n') buf[len-1] = '\0';
+            return strdup(buf);
+        }
+        cur++;
+    }
+    return strdup("");
+}
+
+// file.writeln(line_num, data) — replace or write specific line
+void file_writeln(long long slot, long long line_num, const char* data) {
+    if(slot < 0 || slot >= 1024 || !_file_paths[slot]) return;
+    // Read all lines, replace target, write back
+    if(_file_handles[slot]) { fclose(_file_handles[slot]); _file_handles[slot] = NULL; }
+    FILE* f = fopen(_file_paths[slot], "r");
+    char** lines = NULL; int count = 0, cap = 8;
+    lines = malloc(cap * sizeof(char*));
+    char buf[4096];
+    while(fgets(buf, sizeof(buf), f)) {
+        if(count == cap) { cap *= 2; lines = realloc(lines, cap * sizeof(char*)); }
+        lines[count++] = strdup(buf);
+    }
+    fclose(f);
+    // Extend if needed
+    while(count < line_num) {
+        if(count == cap) { cap *= 2; lines = realloc(lines, cap * sizeof(char*)); }
+        lines[count++] = strdup("\n");
+    }
+    free(lines[line_num - 1]);
+    size_t dlen = strlen(data);
+    char* newline = malloc(dlen + 2);
+    memcpy(newline, data, dlen); newline[dlen] = '\n'; newline[dlen+1] = '\0';
+    lines[line_num - 1] = newline;
+    f = fopen(_file_paths[slot], "w");
+    for(int i = 0; i < count; i++) { fputs(lines[i], f); free(lines[i]); }
+    free(lines);
+    fclose(f);
+    FILE* touch = fopen(_file_paths[slot], "a"); if(touch) fclose(touch);
+    _file_handles[slot] = fopen(_file_paths[slot], "r+");
+}
+
+// Legacy write/append for old-style file ops
+void file_open_write(long long slot, const char* path) {
+    if(slot >= 0 && slot < 1024) {
+        if(_file_handles[slot]) fclose(_file_handles[slot]);
+        _file_handles[slot] = fopen(path, "w");
+    }
+}
+void file_open_append(long long slot, const char* path) {
+    if(slot >= 0 && slot < 1024) {
+        if(_file_handles[slot]) fclose(_file_handles[slot]);
+        _file_handles[slot] = fopen(path, "a");
+    }
 }
 """
 

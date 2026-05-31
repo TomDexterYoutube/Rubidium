@@ -24,6 +24,7 @@ TOKEN_SPEC = [
     ("ON_ERROR", r"on_error\b"),
     ("IMPORT",   r"import\b"),
     ("USE",      r"use\b"),
+    ("FILE",     r"\bfile\b"),
 
     ("AS",       r"as\b"),
     ("AND",      r"and\b"),
@@ -31,6 +32,7 @@ TOKEN_SPEC = [
     ("NOT",      r"not\b"),
 
     ("TYPE",     r"\b(?:i32|i64|i128|i256|i512|i1024|i2048|f32|f64|f128|f256|f512|f1024|f2048|str|bool|list|index|dict)\b"),
+    ("OPEN",     r"\bopen\b"),
 
     ("IDENT",    r"[a-zA-Z_][a-zA-Z0-9_]*"),
 

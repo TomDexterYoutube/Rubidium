@@ -24,6 +24,7 @@ declare i8* @box_to_cstr(%Box*)
 declare i32 @collection_len(%Box*)
 declare %Box* @collection_get_at(%Box*, i32)
 declare void @box_drop(%Box*)
+declare %Box* @box_copy(%Box*)
 declare i64 @time(i64*)
 declare i32 @rand()
 declare void @srand(i32)
@@ -36,7 +37,15 @@ declare void @time_timer_pause(i64)
 declare void @time_timer_stop(i64)
 declare double @time_timer_read(i64)
 declare void @_thread_smart_wait(i64)
+declare i64 @file_open(i64, i8*)
+declare void @file_close(i64)
+declare void @file_write_all(i64, i8*)
+declare void @file_append_all(i64, i8*)
+declare i8* @file_read_all(i64)
+declare i8* @file_readln(i64, i64)
+declare void @file_writeln(i64, i64, i8*)
 '''
+
 
 class RubidiumTypeError(Exception): pass
 class RubidiumNameError(Exception): pass
@@ -61,6 +70,8 @@ class CodeGen:
         self._alloca_emitted = set()  # local var names that already have an alloca in current fn
         self._try_error_label = None  # set while inside a try body for div-by-zero guards
         self._pending_trampolines = []  # trampoline fn_lines to emit after current function
+        self._file_slot_counter = 0     # unique slot number for each open() block
+        self._file_handle_vars = {}     # var_name -> slot_int while inside an open() block
 
     def is_class_field(self, name):
         if not self.cur_class: return False
@@ -311,9 +322,15 @@ class CodeGen:
             if obj_name == "random":
                 if node.method == "choice": return "%Box*"
                 return "i64"  # shuffle returns void/0
+            # File handle methods (inside open() block)
+            if obj_name in self._file_handle_vars:
+                if node.method in ("read", "readln"): return "i8*"
+                return "i64"
             
             raise RubidiumNameError(f"Cannot infer type for method call '{node.method}' on object '{obj_name}'")
 
+        if isinstance(node, OsRun):
+            return "i8*"
         if isinstance(node, FnCall):
             # Normalization check
             name = node.name.replace(".", "_") if isinstance(node.name, str) and "." in node.name else node.name
@@ -375,6 +392,12 @@ class CodeGen:
         elif isinstance(node, Try):
             for s in node.try_body: self._collect_global(s)
             for s in node.error_body: self._collect_global(s)
+        elif isinstance(node, FileOpen):
+            if node.var_name:
+                self._file_handle_vars[node.var_name] = -1  # sentinel during collect pass
+            for s in node.body: self._collect_global(s)
+            if node.var_name:
+                self._file_handle_vars.pop(node.var_name, None)
 
     def emit_fn(self, node):
         self.tmp_count, self.label_count, self.cur_fn, self.cur_class = 0, 0, node.name, None
@@ -559,6 +582,11 @@ class CodeGen:
                 tid_v = self.coerce(tid_v, tid_t, "i64")
                 self.emit(f"  call void @_thread_smart_wait(i64 {tid_v})")
         elif isinstance(node, FileWrite): self.emit_file_write(node)
+        elif isinstance(node, FileOpen): self.emit_file_open(node)
+        elif isinstance(node, FileExists): self.emit_file_exists(node)
+        elif isinstance(node, FileDelete): self.emit_file_delete(node)
+        elif isinstance(node, FileRename): self.emit_file_rename(node)
+        elif isinstance(node, FileCopy): self.emit_file_copy(node)
         elif isinstance(node, OsStart):
             id_v, id_t = self.emit_expr(node.id_expr)
             id_v = self.coerce(id_v, id_t, "i64")
@@ -670,31 +698,31 @@ class CodeGen:
         self.emit(f"  store {ir_t} {val}, {ir_t}* {fptr}")
 
     def emit_print(self, value):
-        val, val_t = self.emit_expr(value)
-        if val_t == "%Box*":
-            self.emit(f"  call void @print_boxed(%Box* {val})")  # print_boxed already calls fflush
-        elif val_t in ("i64","i1"):
-            fmt, flen = self.intern_str("%lld\n")
-            ptr = self.new_tmp()
-            self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
-            cv = self.coerce(val, val_t, "i64")
-            self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, i64 {cv})')
-            self.emit(f'  call i32 @fflush(i8* null)')
-        elif val_t in ("float","double"):
-            fmt, flen = self.intern_str("%g\n")
-            ptr = self.new_tmp()
-            self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
-            dv = self.coerce(val, val_t, "double")
-            self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, double {dv})')
-            self.emit(f'  call i32 @fflush(i8* null)')
-        elif val_t == "i8*":
-            self.emit(f'  call i32 @puts(i8* {val})')
-            self.emit(f'  call i32 @fflush(i8* null)')
+         val, val_t = self.emit_expr(value)
+         if val_t == "%Box*":
+             self.emit(f"  call void @print_boxed(%Box* {val})")  # print_boxed already calls fflush
+         elif val_t in ("i32", "i64", "i1"):
+             cv = self.coerce(val, val_t, "i64")
+             fmt, flen = self.intern_str("%lld\n")
+             ptr = self.new_tmp()
+             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
+             self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, i64 {cv})')
+             self.emit(f'  call i32 @fflush(i8* null)')
+         elif val_t in ("float","double"):
+             fmt, flen = self.intern_str("%g\n")
+             ptr = self.new_tmp()
+             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
+             dv = self.coerce(val, val_t, "double")
+             self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, double {dv})')
+             self.emit(f'  call i32 @fflush(i8* null)')
+         elif val_t == "i8*":
+             self.emit(f'  call i32 @puts(i8* {val})')
+             self.emit(f'  call i32 @fflush(i8* null)')
 
     def emit_println(self, value):
         # println prints without newline; subsequent calls overwrite same line via \r
         val, val_t = self.emit_expr(value)
-        if val_t in ("i64","i1"):
+        if val_t in ("i32", "i64", "i1"):
             fmt, flen = self.intern_str("\r%lld")
             ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
@@ -788,12 +816,19 @@ class CodeGen:
             self.emit(f"  br i1 {cond}, label %{body_l}, label %{end_l}\n{body_l}:")
             
             item_val = self.new_tmp()
+            item_copy = self.new_tmp()
             self.emit(f"  {item_val} = call %Box* @collection_get_at(%Box* {iter_b}, i32 {cur_idx})")
-            self.emit(f"  store %Box* {item_val}, %Box** {var_ptr}")
+            self.emit(f"  {item_copy} = call %Box* @box_copy(%Box* {item_val})")
+            self.emit(f"  store %Box* {item_copy}, %Box** {var_ptr}")
             
             self.loop_end_stack.append(end_l)
             self.emit_body(node.body)
             self.loop_end_stack.pop()
+            
+            # Drop the loop variable after the loop ends
+            drop_val = self.new_tmp()
+            self.emit(f"  {drop_val} = load %Box*, %Box** {var_ptr}")
+            self.emit(f"  call void @box_drop(%Box* {drop_val})")
             
             inc_idx = self.new_tmp()
             self.emit(f"  {inc_idx} = add i32 {cur_idx}, 1")
@@ -862,6 +897,80 @@ class CodeGen:
         self.emit(f"  call i64 @fwrite(i8* {cont_val}, i64 1, i64 {clen}, i8* {fp})")
         self.emit(f"  call i32 @fclose(i8* {fp})")
 
+    def emit_file_open(self, node):
+        """open("path") as var { body } - file handle with automatic close"""
+        path_val, path_t = self.emit_expr(node.path_expr)
+        path_s = self.coerce(path_val, path_t, "i8*")
+        # Assign a unique slot for this open() block
+        slot = self._file_slot_counter
+        self._file_slot_counter += 1
+        self.emit(f"  call i64 @file_open(i64 {slot}, i8* {path_s})")
+        # Register this var_name as a file handle pointing to this slot
+        self._file_handle_vars[node.var_name] = slot
+        # Emit body — method calls on node.var_name will be intercepted
+        saved_loop = self.loop_end_stack[:]
+        self.emit_body(node.body)
+        self.loop_end_stack = saved_loop
+        # Unregister the handle and auto-close
+        del self._file_handle_vars[node.var_name]
+        self.emit(f"  call void @file_close(i64 {slot})")
+
+    def emit_file_handle_method(self, var_name, method, args):
+        """Emit a method call on a file handle variable (inside open() block)"""
+        slot = self._file_handle_vars[var_name]
+        if method == "write":
+            data_v, data_t = self.emit_expr(args[0])
+            data_s = self.coerce(data_v, data_t, "i8*")
+            self.emit(f"  call void @file_write_all(i64 {slot}, i8* {data_s})")
+            return "0", "i64"
+        elif method == "append":
+            data_v, data_t = self.emit_expr(args[0])
+            data_s = self.coerce(data_v, data_t, "i8*")
+            self.emit(f"  call void @file_append_all(i64 {slot}, i8* {data_s})")
+            return "0", "i64"
+        elif method == "read":
+            result = self.new_tmp()
+            self.emit(f"  {result} = call i8* @file_read_all(i64 {slot})")
+            return result, "i8*"
+        elif method == "readln":
+            line_v, line_t = self.emit_expr(args[0])
+            line_i = self.coerce(line_v, line_t, "i64")
+            result = self.new_tmp()
+            self.emit(f"  {result} = call i8* @file_readln(i64 {slot}, i64 {line_i})")
+            return result, "i8*"
+        elif method == "writeln":
+            line_v, line_t = self.emit_expr(args[0])
+            line_i = self.coerce(line_v, line_t, "i64")
+            data_v, data_t = self.emit_expr(args[1])
+            data_s = self.coerce(data_v, data_t, "i8*")
+            self.emit(f"  call void @file_writeln(i64 {slot}, i64 {line_i}, i8* {data_s})")
+            return "0", "i64"
+        else:
+            raise RubidiumNameError(f"Unknown file handle method '.{method}()'")
+
+
+
+    def emit_file_exists(self, node):
+        path_val, path_t = self.emit_expr(node.path_expr)
+        tmp = self.new_tmp()
+        self.emit(f"  {tmp} = call i32 @file_exists(i8* {path_val})")
+        self.emit(f"  {tmp} = icmp ne i32 {tmp}, 0")
+        return tmp, "i1"
+
+    def emit_file_delete(self, node):
+        path_val, path_t = self.emit_expr(node.path_expr)
+        self.emit(f"  call i32 @file_delete(i8* {path_val})")
+
+    def emit_file_rename(self, node):
+        old_val, old_t = self.emit_expr(node.old_path)
+        new_val, new_t = self.emit_expr(node.new_path)
+        self.emit(f"  call i32 @file_rename_file(i8* {old_val}, i8* {new_val})")
+
+    def emit_file_copy(self, node):
+        src_val, src_t = self.emit_expr(node.src_path)
+        dst_val, dst_t = self.emit_expr(node.dst_path)
+        self.emit(f"  call i32 @file_copy_file(i8* {src_val}, i8* {dst_val})")
+
     def _os_run_core(self, node):
         """Shared logic: emit os_run() call, return (result_tmp, "i8*")"""
         null_lbl, null_len = self.intern_str("")
@@ -869,6 +978,8 @@ class CodeGen:
         self.emit(f"  {null_ptr} = getelementptr [{null_len} x i8], [{null_len} x i8]* {null_lbl}, i64 0, i64 0")
         if node.struct_args is not None:
             # os.run({ cmd: "...", args: [...], input: "..." })
+            # Auto-start terminal 0 if not already started
+            self.emit(f"  call void @os_start(i64 0)")
             # Build the command string: cmd + " " + joined args
             fields = node.struct_args
             cmd_v, cmd_t = self.emit_expr(fields["cmd"])
@@ -902,8 +1013,7 @@ class CodeGen:
             if "input" in fields:
                 inp_v, inp_t = self.emit_expr(fields["input"])
                 input_s = self.coerce(inp_v, inp_t, "i8*")
-            # id is not needed for struct form — use terminal 0 by default or detect from context
-            # The syntax shows no id for struct form; use a special value sentinel -1 which os_run handles
+            # id is not needed for struct form — use terminal 0 by default
             res = self.new_tmp()
             self.emit(f"  {res} = call i8* @os_run(i64 0, i8* {cmd_s}, i8* {input_s})")
             return res, "i8*"
@@ -1287,6 +1397,59 @@ class CodeGen:
     def emit_method_call_expr(self, node):
         # 1. Resolve the object name
         obj_name = node.obj.name if hasattr(node.obj, 'name') else str(node.obj)
+
+        # 0. File handle method calls — intercept before any other logic
+        if obj_name in self._file_handle_vars:
+            return self.emit_file_handle_method(obj_name, node.method, node.args)
+
+        # 2. Handle .to() type conversion for any type (numeric, string, float)
+        if node.method == "to" and isinstance(node.obj, Var) and node.args:
+            val, val_t = self.emit_expr(node.obj)
+            arg = node.args[0]
+            if hasattr(arg, 'name') and arg.name in ("i32", "i64", "i128", "i256", "i512", "i1024", "i2048", "f32", "f64", "f128", "f256", "f512", "f1024", "f2048", "str", "bool"):
+                target_type = arg.name
+            elif hasattr(arg, 'value'):
+                target_type = arg.value
+            else:
+                target_type = "i64"
+            target_ir = self.rubi_type_to_ir(target_type)
+            # Special handling for numeric->string
+            if target_ir == "i8*":
+                return self.coerce_to_string(val, val_t), "i8*"
+            # If the object is a string (i8*) and we are converting to a non-string type, parse the string
+            if val_t == "i8*" and target_ir != "i8*":
+                if target_ir in self._INT_IR_SET:
+                    tmp = self.new_tmp()
+                    self.emit(f"  {tmp} = call i64 @atol(i8* {val})")
+                    # Now, if target_ir is not i64, we need to truncate or sign-extend
+                    if target_ir == "i32":
+                        tmp2 = self.new_tmp()
+                        self.emit(f"  {tmp2} = trunc i64 {tmp} to i32")
+                        return tmp2, target_ir
+                    elif target_ir == "i1":
+                        tmp2 = self.new_tmp()
+                        self.emit(f"  {tmp2} = trunc i64 {tmp} to i1")
+                        return tmp2, target_ir
+                    elif target_ir == "i64":
+                        return tmp, target_ir
+                    else: # wider than i64
+                        tmp2 = self.new_tmp()
+                        self.emit(f"  {tmp2} = sext i64 {tmp} to {target_ir}")
+                        return tmp2, target_ir
+                elif target_ir in self._FLOAT_IR_SET:
+                    tmp = self.new_tmp()
+                    self.emit(f"  {tmp} = call double @strtod(i8* {val}, i8* null)")
+                    if target_ir == "float":
+                        tmp2 = self.new_tmp()
+                        self.emit(f"  {tmp2} = fptrunc double {tmp} to float")
+                        return tmp2, target_ir
+                    elif target_ir == "double":
+                        return tmp, target_ir
+                    else: # fp128
+                        tmp2 = self.new_tmp()
+                        self.emit(f"  {tmp2} = fpext double {tmp} to fp128")
+                        return tmp2, target_ir
+            return self.coerce(val, val_t, target_ir), target_ir
         
         # 2. Handle Collection 'set' method separately
         # This bypasses the class method logic entirely
@@ -1373,11 +1536,24 @@ class CodeGen:
                 col_b = self.coerce_to_box(col_v, col_t)
                 len_v = self.new_tmp()
                 self.emit(f"  {len_v} = call i32 @collection_len(%Box* {col_b})")
+                # Guard: if len == 0 return box_i(0) to avoid division by zero
+                safe_l, zero_l, merge_l = self.new_label("choice_safe"), self.new_label("choice_zero"), self.new_label("choice_merge")
+                cmp_v = self.new_tmp()
+                self.emit(f"  {cmp_v} = icmp sgt i32 {len_v}, 0")
+                self.emit(f"  br i1 {cmp_v}, label %{safe_l}, label %{zero_l}\n{safe_l}:")
                 r_raw, r_idx = self.new_tmp(), self.new_tmp()
                 self.emit(f"  {r_raw} = call i32 @rand()")
                 self.emit(f"  {r_idx} = srem i32 {r_raw}, {len_v}")
+                result_safe = self.new_tmp()
+                self.emit(f"  {result_safe} = call %Box* @collection_get_at(%Box* {col_b}, i32 {r_idx})")
+                result_copy = self.new_tmp()
+                self.emit(f"  {result_copy} = call %Box* @box_copy(%Box* {result_safe})")
+                self.emit(f"  br label %{merge_l}\n{zero_l}:")
+                zero_box = self.new_tmp()
+                self.emit(f"  {zero_box} = call %Box* @box_i(i64 0)")
+                self.emit(f"  br label %{merge_l}\n{merge_l}:")
                 result = self.new_tmp()
-                self.emit(f"  {result} = call %Box* @collection_get_at(%Box* {col_b}, i32 {r_idx})")
+                self.emit(f"  {result} = phi %Box* [ {result_copy}, %{safe_l} ], [ {zero_box}, %{zero_l} ]")
                 return result, "%Box*"
 
         # 3. Handle Class Method Calls
@@ -1415,6 +1591,26 @@ class CodeGen:
 
          # 4. Fallback: String method OR module function call (e.g. math.add)
         obj_val, obj_t = self.emit_expr(node.obj)
+        
+        # Handle .to() for numeric types (i64, i32, f64, f32, etc.)
+        if node.method == "to" and obj_t in ("i32", "i64", "i1", "float", "double"):
+            if len(args) == 1:
+                # Check if arg is a Var with type-looking name (str, i32, etc.)
+                arg = args[0]
+                if hasattr(arg, 'name') and arg.name in ("i32", "i64", "i128", "i256", "i512", "i1024", "i2048", "f32", "f64", "f128", "f256", "f512", "f1024", "f2048", "str", "bool"):
+                    target_type = arg.name
+                elif hasattr(arg, 'value'):
+                    target_type = arg.value
+                else:
+                    target_type = "i64"
+            else:
+                target_type = "i64"
+            target_ir = self.rubi_type_to_ir(target_type)
+            # Special handling for numeric->string
+            if target_ir == "i8*":
+                return self.coerce_to_string(obj_val, obj_t), "i8*"
+            return self.coerce(obj_val, obj_t, target_ir), target_ir
+        
         if obj_t == "i8*":
             # Emit as string method; raises a clear RubidiumNameError on unknown methods
             # instead of silently falling through to a confusing "Undefined function" error.
@@ -1449,9 +1645,20 @@ class CodeGen:
             self.emit(f"  {tmp} = icmp ne i8* {strstr_r}, null")
             return tmp, "i1"
         if method == "to" or method == "to_int":
+            if len(args) == 1:
+                target_type = args[0].name if hasattr(args[0], 'name') else (args[0].value if hasattr(args[0], 'value') else "i64")
+            else:
+                target_type = "i64"
+            target_ir = self.rubi_type_to_ir(target_type)
             tmp = self.new_tmp()
-            self.emit(f"  {tmp} = call i64 @atol(i8* {obj_val})")
-            return tmp, "i64"
+            if target_ir in ("i1", "i32", "i64"):
+                self.emit(f"  {tmp} = call i64 @atol(i8* {obj_val})")
+                tmp = self.coerce(tmp, "i64", target_ir)
+            elif target_ir in ("float", "double", "fp128"):
+                self.emit(f"  {tmp} = call double @strtod(i8* {obj_val}, i8* null)")
+            elif target_ir == "i8*":
+                return obj_val, "i8*"
+            return tmp, target_ir
         if method == "slice" and len(args) == 2:
             start_v, start_t = self.emit_expr(args[0]); end_v, end_t = self.emit_expr(args[1])
             start_v = self.coerce(start_v, start_t, "i64"); end_v = self.coerce(end_v, end_t, "i64")
@@ -1635,6 +1842,10 @@ class CodeGen:
             if instr:
                 self.emit(f"  {tmp} = {instr} double {l}, {r}")
                 return tmp, "double"
+            # Handle power operator (**) for float types
+            if node.op == "**":
+                self.emit(f"  {tmp} = call double @pow(double {l}, double {r})")
+                return tmp, "double"
         return "0", "i64"
 
     def emit_compare(self, node):
@@ -1683,7 +1894,7 @@ class CodeGen:
             # Box* → use runtime helper that inspects box type and formats correctly
             self.emit(f"  {tmp} = call i8* @box_to_cstr(%Box* {val})")
             return tmp
-        if t in ("i1", "i64"):
+        if t in ("i1", "i32", "i64"):
             fmt_lbl, flen = self.intern_str("%lld")
             fmt_ptr = self.new_tmp()
             self.emit(f"  {buf} = call i8* @malloc(i64 32)")

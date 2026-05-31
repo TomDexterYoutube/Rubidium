@@ -5,6 +5,13 @@
 # -----------------------------------------
 
 # -------------------------------
+# IMPORTANT INFO
+# -------------------------------
+
+# Varbables are always deep copied never borowed or shared
+# Memory is never automatically dropped it must b manual  with the exeption of open() and loops read more in there sections 
+
+# -------------------------------
 # VARIABLES & DATA TYPES
 # -------------------------------
 
@@ -56,6 +63,7 @@ let float_val: f64 = 100 as f64
 # Standard operators:
 # +, -, *, /
 # Also ** for to the power of and */ for square root
+# - can be used to flip weather the val is possitive or negitve as it should
 
 # Operator precedence (BODMAS) applies
 let calc1 = 1 + 2 * 3       # equals 7
@@ -91,6 +99,8 @@ let has_world: bool = full_msg.has("World")
 
 let number_str: str = "404"
 let num_val: i64 = number_str.to(i32)
+let str: str = num_val.to(str)
+let float_val: i64 = str.to(f32)
 
 # -------------------------------
 # DYNAMIC COLLECTIONS
@@ -99,8 +109,8 @@ let num_val: i64 = number_str.to(i32)
 
 # Collections dynamically manage boxed memory internally.
 
-# Lists start at index 1 instead of 0.
-# This matches how humans naturally count sequences.
+# Lists start at index 0
+# Before instead it started at 1 of 0 as This matches how humans naturally count sequences but lots of people didnt like it :(
 
 # 1. Lists (Arrays)
 
@@ -136,6 +146,18 @@ print(my_dict("nested", 2))   # prints: hi
 my_list(2).set("why")
 my_index("one").set("changed")
 my_dict("nested", 1).set(99)
+
+# This sets the spesifed bit to that value
+
+# Mutating collections using .add()
+
+my_list().add("why")
+my_index().add("changed", 1)
+# Adds the key with the value 1 if the key already exits error will happen
+my_dict("nested").add(99)
+# add the value to the key spesifed you can have the key blank and do the same as index
+
+# Works as append
 
 # -------------------------------
 # PRINT & INPUT / OUTPUT
@@ -181,15 +203,123 @@ print(i"Hello {x}")
 
 let user_input: str = input("Enter your name: ")
 
-# File operations
+# -------------------------------
+# FILES & FILE HANDLES
+# -------------------------------
 
-file_write("data.txt", "Saving this to disk!")
+# Rubidium supports structured file IO
+# using automatic file handles.
 
-let file_contents str = file_read("data.txt")
+# Files opened with `open() as`
+# automatically close at the end of the block scope the file data is closed and not there anymore but any other varbables are still there 
 
-print(file_contents)
+open("data.txt") as file {
 
-# "\n" creates a new line
+    file.write("Hello")
+
+    file.append(" World")
+
+    let data = file.read()
+
+    print(data)
+}
+
+# write(data)
+#
+# Overwrites the file contents.
+
+open("save.txt") as file {
+
+    file.write("New Save Data")
+}
+
+# writeln(line, data)
+#
+# Replaces or writes a specific line.
+
+open("notes.txt") as file {
+
+    file.writeln(2, "Updated second line")
+}
+
+# append(data)
+#
+# Adds data to the end of the file.
+
+open("log.txt") as file {
+
+    file.append("\nProgram Started")
+}
+
+# read()
+#
+# Reads the entire file as a string.
+
+open("story.txt") as file {
+
+    let contents = file.read()
+
+    print(contents)
+}
+
+# readln(line)
+#
+# Reads a specific line from the file.
+
+open("story.txt") as file {
+
+    let line = file.readln(3)
+
+    print(line)
+}
+
+# Files can be iterated line-by-line.
+
+open("data.txt") as file {
+
+    for line in file {
+
+        print(line)
+    }
+}
+
+# File operations can be handled
+# using try/error blocks.
+
+try {
+
+    open("missing.txt") as file {
+
+        print(file.read())
+    }
+
+} error {
+
+    print("File Error: " + error)
+}
+
+# Check if a file exists.
+
+if file.exists("data.txt") {
+
+    print("File Found")
+}
+
+# Delete a file.
+
+file.delete("old.txt")
+
+# Rename a file.
+
+file.rename("old.txt", "new.txt")
+
+# Copy a file.
+
+file.copy("save1.txt", "backup.txt")
+
+# Make a file.
+
+file.new("data.txt")
 
 # -------------------------------
 # DEEP MEMORY DROPS
@@ -223,6 +353,8 @@ if calc1 == 7 {
 # -------------------------------
 
 # While loop
+# With the for i in list and other variations i will be dropped after the end of the block
+
 
 let mut count = 0
 
@@ -478,11 +610,11 @@ use os
 use FFI
 
 # If a module is not included with 'use',
-# it cannot be accessed.
+# it cannot be accessed and will error
 
-# Use 'import' to load external .rub files
+# Use 'import' to load external .rub files from the folder the code is in
 
-import math_tools
+import math_tools 
 
 # -------------------------------
 # MAIN ENTRY POINT
@@ -507,7 +639,7 @@ fn main() {
 
 let c_file = FFI("data/file.so")
 
-# This loads the shared library into the identifier `c_file`.
+# This loads the shared library into the identifier `c_file` it always starts in the folder the code is in you could do /usr/bin or sometihng but starts in the code folder unless told otherwise
 
 # If a function declaration starts with an identifier
 # that was created using FFI(...),

@@ -5,6 +5,7 @@ class Parser:
         self.tokens = tokens
         self.pos = 0
         self.line_no = 1
+        self._active_file_handles = set()  # var names bound via open() as varname
 
     def peek(self):
         return self.tokens[self.pos] if self.pos < len(self.tokens) else None
@@ -157,10 +158,35 @@ class Parser:
         elif t[0] == "RETURN":   return [self.return_stmt()]
         elif t[0] == "TRY":      return [self.try_stmt()]
         elif t[0] == "FN":       return [self.fn_def()]
+        elif t[0] == "OPEN":     return [self.open_stmt()]
+        elif t[0] == "FILE":     return self.file_global_stmt_list()
         elif t[0] == "IDENT" or t[0] == "TYPE":    return [self.ident_stmt()]
         else:
             self.advance()
             return []
+
+    def open_stmt(self):
+        """Parse: open("path") as var_name { statements }"""
+        self.match("OPEN")
+        self.match("LPAREN")
+        path = self.expr()
+        self.match("RPAREN")
+        self.match("AS")
+        # "file" is tokenized as FILE keyword, but valid as a var name here
+        var_name = self.match("IDENT") or self.match("FILE") or self.match("TYPE")
+        self.match("LBRACE")
+        # Register var_name so that FILE.method() inside body is parsed as handle method
+        if var_name:
+            self._active_file_handles.add(var_name)
+        body = []
+        while self.peek() and self.peek()[0] != "RBRACE":
+            item = self.stmt_list_item()
+            if item is not None:
+                body += item if isinstance(item, list) else [item]
+        self.match("RBRACE")
+        if var_name:
+            self._active_file_handles.discard(var_name)
+        return FileOpen(path, var_name, body)
 
     def var_decl(self):
         self.match("LET")
@@ -248,6 +274,60 @@ class Parser:
             self.advance()  # consume `error`
         self.match("LBRACE"); err_body = self.block(); self.match("RBRACE")
         return Try(try_body, err_body)
+
+    def file_global_stmt_list(self):
+        """Parse: file.write(...), file.append(...), file.read(...), file.exists(...), file.delete(...), file.rename(...), file.copy(...), file.new(...)"""
+        # Peek at the FILE token value to check if it's an active file handle var
+        file_tok = self.peek()
+        file_var = file_tok[1] if file_tok else "file"
+        self.match("FILE")
+        self.match("DOT")
+        method = self.match("IDENT")
+
+        # If inside an open() block and this matches the handle var, parse as MethodCall
+        if file_var in self._active_file_handles:
+            self.match("LPAREN")
+            args = []
+            while self.peek() and self.peek()[0] != "RPAREN":
+                args.append(self.expr())
+                if self.peek() and self.peek()[0] == "COMMA":
+                    self.match("COMMA")
+            self.match("RPAREN")
+            return [MethodCall(Var(file_var), method, args)]
+
+        self.match("LPAREN")
+        
+        if method == "exists":
+            path = self.expr()
+            self.match("RPAREN")
+            return FileExists(path)
+        elif method == "delete":
+            path = self.expr()
+            self.match("RPAREN")
+            return FileDelete(path)
+        elif method == "rename":
+            old_path = self.expr()
+            self.match("COMMA")
+            new_path = self.expr()
+            self.match("RPAREN")
+            return FileRename(old_path, new_path)
+        elif method == "copy":
+            src_path = self.expr()
+            self.match("COMMA")
+            dst_path = self.expr()
+            self.match("RPAREN")
+            return FileCopy(src_path, dst_path)
+        elif method == "new":
+            path = self.expr()
+            self.match("RPAREN")
+            self.match("LBRACE")
+            body = []
+            while self.peek() and self.peek()[0] != "RBRACE":
+                body += self.stmt_list_item()
+            self.match("RBRACE")
+            return FileNew(path, body)
+        else:
+            return None  # Will be handled as file handle method
 
     def ident_stmt(self):
         # Accept both IDENT and TYPE tokens for variable names (e.g., "list" is a TYPE but can be a variable name)
@@ -472,6 +552,26 @@ class Parser:
             self.advance(); return UnaryOp("not", self.factor())
         if tok[0] == "LPAREN":
             self.advance(); e = self.expr(); self.match("RPAREN"); return e
+
+        # FILE token used as file handle variable inside open() block
+        if tok[0] == "FILE" and tok[1] in self._active_file_handles:
+            self.advance()
+            var_name = tok[1]
+            res = Var(var_name)
+            while self.peek() and self.peek()[0] == "DOT":
+                self.match("DOT")
+                attr = self.match("IDENT")
+                if self.peek() and self.peek()[0] == "LPAREN":
+                    self.match("LPAREN")
+                    args = []
+                    while self.peek() and self.peek()[0] != "RPAREN":
+                        args.append(self.expr())
+                        if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
+                    self.match("RPAREN")
+                    res = MethodCall(res, attr, args)
+                else:
+                    res = FieldAccess(res, attr)
+            return res
         # TYPE tokens used as arguments (e.g. "404".to(i32) — i32 appears as TYPE token)
         # Also handle TYPE tokens used as variable names (e.g., "list" is a type but can be a variable)
         if tok[0] == "TYPE":
