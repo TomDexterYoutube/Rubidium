@@ -326,11 +326,13 @@ class Parser:
         elif method == "new":
             path = self.expr()
             self.match("RPAREN")
-            self.match("LBRACE")
+            # Optional body block (syntax spec shows no block body for file.new())
             body = []
-            while self.peek() and self.peek()[0] != "RBRACE":
-                body += self.stmt_list_item()
-            self.match("RBRACE")
+            if self.peek() and self.peek()[0] == "LBRACE":
+                self.match("LBRACE")
+                while self.peek() and self.peek()[0] != "RBRACE":
+                    body += self.stmt_list_item()
+                self.match("RBRACE")
             return FileNew(path, body)
         else:
             return None  # Will be handled as file handle method
@@ -347,7 +349,7 @@ class Parser:
             self.match("OP")
             return Assign(name, self.expr())
 
-        # Handle thread.wait(1, 2) -> ThreadWait
+        # Handle thread.wait(1, 2) -> ThreadWait / thread.running(1) -> ThreadRunning
         if name == "thread" and self.peek() and self.peek()[0] == "DOT":
             self.match("DOT")
             attr = self.match("IDENT")
@@ -359,6 +361,11 @@ class Parser:
                     if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                 self.match("RPAREN")
                 return ThreadWait(ids)
+            if attr == "running":
+                self.match("LPAREN")
+                tid = self.expr()
+                self.match("RPAREN")
+                return ThreadRunning(tid)
 
         # Handle os.start(n), os.run(...), os(n).drop()
         if name == "os":
@@ -527,7 +534,7 @@ class Parser:
             return Number(int(tok[1]))
         if tok[0] == "BOOL":
             self.advance()
-            if tok[1] == "None": return None_()
+            if tok[1] in ("None", "Null"): return None_()
             return Bool(tok[1] == "True")
         if tok[0] == "STRING":
             self.advance()
@@ -578,6 +585,11 @@ class Parser:
                 else:
                     res = FieldAccess(res, attr)
             return res
+        # FILE token used as file utility in expression context (e.g. let x = file.exists("f"))
+        if tok[0] == "FILE":
+            node = self.file_global_stmt_list()
+            if node is not None:
+                return node
         # TYPE tokens used as arguments (e.g. "404".to(i32) — i32 appears as TYPE token)
         # Also handle TYPE tokens used as variable names (e.g., "list" is a type but can be a variable)
         if tok[0] == "TYPE":
@@ -646,7 +658,7 @@ class Parser:
                     self.match("RPAREN")
                     return OsRun(id_expr, cmd_expr, input_expr=input_expr)
                 self.pos = saved
-            # Handle thread.wait(...) in expression context
+            # Handle thread.wait(...) / thread.running(...) in expression context
             if name == "thread" and self.peek() and self.peek()[0] == "DOT":
                 saved_pos = self.pos
                 self.match("DOT")
@@ -659,6 +671,11 @@ class Parser:
                         if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                     self.match("RPAREN")
                     return ThreadWait(ids)
+                if attr == "running":
+                    self.match("LPAREN")
+                    tid = self.expr()
+                    self.match("RPAREN")
+                    return ThreadRunning(tid)
                 self.pos = saved_pos
             res = Var(name)
             while self.peek():

@@ -10,6 +10,7 @@ from ast import Import, Use, VarDecl, FnDef, ClassDef
 from codegen import CodeGen, RubidiumTypeError, RubidiumNameError
 
 RUNTIME_C = r"""
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,9 +72,11 @@ static void* _waiter_thread_fn(void* arg) {
 void _thread_smart_wait(long long tid) {
     if(tid < 0 || tid >= 1024) return;
     pthread_t handle = (pthread_t)_thread_handles[tid];
+    if(!handle) return;
     if(pthread_equal(pthread_self(), _main_thread_id)) {
         // Called from main — block until target thread is done
         pthread_join(handle, NULL);
+        _thread_handles[tid] = 0;  // Mark as no longer running
     } else {
         // Called from a child thread — hand the join off to a detached waiter
         // so main is never blocked by this wait
@@ -84,6 +87,20 @@ void _thread_smart_wait(long long tid) {
         pthread_detach(waiter);
         // Return immediately — caller thread continues
     }
+}
+
+// _thread_is_running: returns 1 (true) if the thread is still running, 0 if done.
+// Uses pthread_tryjoin_np: returns EBUSY if thread is still running, 0 if it has exited.
+int _thread_is_running(long long tid) {
+    if(tid < 0 || tid >= 1024) return 0;
+    pthread_t handle = (pthread_t)_thread_handles[tid];
+    if(!handle) return 0;
+    int rc = pthread_tryjoin_np(handle, NULL);
+    // EBUSY (16) means the thread is still alive
+    if(rc == 16) return 1;
+    // 0 means the thread finished (join succeeded); we zero out the handle to avoid re-joining
+    if(rc == 0) _thread_handles[tid] = 0;
+    return 0;
 }
 
 void box_drop(Box* b) {
@@ -574,6 +591,29 @@ void file_open_append(long long slot, const char* path) {
         if(_file_handles[slot]) fclose(_file_handles[slot]);
         _file_handles[slot] = fopen(path, "a");
     }
+}
+
+// file.exists / file.delete / file.rename / file.copy
+int file_exists(const char* path) {
+    FILE* f = fopen(path, "r");
+    if(f) { fclose(f); return 1; }
+    return 0;
+}
+int file_delete(const char* path) {
+    return remove(path);
+}
+int file_rename_file(const char* old_path, const char* new_path) {
+    return rename(old_path, new_path);
+}
+int file_copy_file(const char* src, const char* dst) {
+    FILE* in  = fopen(src, "rb");
+    if(!in) return -1;
+    FILE* out = fopen(dst, "wb");
+    if(!out) { fclose(in); return -1; }
+    char buf[4096]; size_t n;
+    while((n = fread(buf, 1, sizeof(buf), in)) > 0) fwrite(buf, 1, n, out);
+    fclose(in); fclose(out);
+    return 0;
 }
 """
 

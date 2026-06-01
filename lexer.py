@@ -4,7 +4,7 @@ TOKEN_SPEC = [
     ("NUMBER",   r"\d+\.\d+|\d+"),
     ("ISTRING",  r'i"[^"]*"'),
     ("STRING",   r'"[^"]*"'),
-    ("BOOL",     r"True|False|None"),
+    ("BOOL",     r"True|False|Null|None"),
 
     ("LET",      r"let\b"),
     ("MUT",      r"mut\b"),

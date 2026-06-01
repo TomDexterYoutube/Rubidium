@@ -3,6 +3,8 @@ from ast import *
 extern_decls = '''
 declare i32 @pthread_create(i64*, i64*, i8* (i8*)*, i8*)
 declare i32 @pthread_join(i64, i8**)
+declare i32 @pthread_tryjoin_np(i64, i8**)
+declare i1 @_thread_is_running(i64)
 %Box = type opaque
 declare %Box* @box_i(i64)
 declare %Box* @box_f(double)
@@ -44,6 +46,10 @@ declare void @file_append_all(i64, i8*)
 declare i8* @file_read_all(i64)
 declare i8* @file_readln(i64, i64)
 declare void @file_writeln(i64, i64, i8*)
+declare i32 @file_exists(i8*)
+declare i32 @file_delete(i8*)
+declare i32 @file_rename_file(i8*, i8*)
+declare i32 @file_copy_file(i8*, i8*)
 '''
 
 
@@ -590,6 +596,8 @@ class CodeGen:
                 tid_v, tid_t = self.emit_expr(texpr)
                 tid_v = self.coerce(tid_v, tid_t, "i64")
                 self.emit(f"  call void @_thread_smart_wait(i64 {tid_v})")
+        elif isinstance(node, ThreadRunning):
+            self.emit_thread_running_stmt(node)
         elif isinstance(node, FileWrite): self.emit_file_write(node)
         elif isinstance(node, FileHandleStmt):
             self.emit_file_handle_method(node.var_name, node.method, node.args)
@@ -598,6 +606,7 @@ class CodeGen:
         elif isinstance(node, FileDelete): self.emit_file_delete(node)
         elif isinstance(node, FileRename): self.emit_file_rename(node)
         elif isinstance(node, FileCopy): self.emit_file_copy(node)
+        elif isinstance(node, FileNew): self.emit_file_new(node)
         elif isinstance(node, OsStart):
             id_v, id_t = self.emit_expr(node.id_expr)
             id_v = self.coerce(id_v, id_t, "i64")
@@ -848,6 +857,10 @@ class CodeGen:
 
     def emit_for(self, node):
         if node.iterable:
+            # Check if the iterable is a file handle var
+            if isinstance(node.iterable, Var) and node.iterable.name in self._file_handle_vars:
+                self._emit_for_file(node)
+                return
             iter_v, iter_t = self.emit_expr(node.iterable)
             iter_b = self.coerce_to_box(iter_v, iter_t)
             
@@ -928,6 +941,88 @@ class CodeGen:
             inc, cur2 = self.new_tmp(), self.new_tmp()
             self.emit(f"  {cur2} = load i64, i64* {var_ptr}\n  {inc} = add i64 {cur2}, 1\n  store i64 {inc}, i64* {var_ptr}")
             self.emit(f"  br label %{cond_l}\n{end_l}:")
+
+    def _emit_for_file(self, node):
+        """for line in file_handle { body } — iterate file lines one-by-one."""
+        slot = self._file_handle_vars[node.iterable.name]
+        # Loop variable stores the current line as i8*
+        if self.cur_fn is not None and self.cur_fn != "_rubidium_init":
+            var_ptr = f"%ptr_{node.var}"
+            if node.var not in self._alloca_emitted:
+                self.local_vars[node.var] = "%Box*"
+                self.emit(f"  {var_ptr} = alloca %Box*")
+                self._alloca_emitted.add(node.var)
+        else:
+            self.declare_global(node.var, "%Box*")
+            var_ptr = f"@{node.var}"
+
+        # Line counter (1-based)
+        line_ptr = self.new_tmp()
+        self.emit(f"  {line_ptr} = alloca i64")
+        self.emit(f"  store i64 1, i64* {line_ptr}")
+
+        cond_l = self.new_label("ffilecond")
+        body_l = self.new_label("ffilebody")
+        end_l  = self.new_label("ffileend")
+        self.emit(f"  br label %{cond_l}\n{cond_l}:")
+
+        cur_line = self.new_tmp()
+        line_s   = self.new_tmp()
+        cond     = self.new_tmp()
+        self.emit(f"  {cur_line} = load i64, i64* {line_ptr}")
+        self.emit(f"  {line_s} = call i8* @file_readln(i64 {slot}, i64 {cur_line})")
+        # Empty string → end of file
+        empty_lbl, elen = self.intern_str("")
+        empty_ptr = self.new_tmp()
+        self.emit(f"  {empty_ptr} = getelementptr [{elen} x i8], [{elen} x i8]* {empty_lbl}, i64 0, i64 0")
+        cmp_res = self.new_tmp()
+        self.emit(f"  {cmp_res} = call i32 @strcmp(i8* {line_s}, i8* {empty_ptr})")
+        self.emit(f"  {cond} = icmp eq i32 {cmp_res}, 0")
+        self.emit(f"  br i1 {cond}, label %{end_l}, label %{body_l}\n{body_l}:")
+
+        # Box the line string and store as loop variable
+        boxed = self.new_tmp()
+        self.emit(f"  {boxed} = call %Box* @box_s(i8* {line_s})")
+        self.emit(f"  store %Box* {boxed}, %Box** {var_ptr}")
+
+        self.loop_end_stack.append(end_l)
+        self.emit_body(node.body)
+        self.loop_end_stack.pop()
+
+        # Increment line counter and loop
+        inc_v = self.new_tmp()
+        cur2  = self.new_tmp()
+        self.emit(f"  {cur2} = load i64, i64* {line_ptr}")
+        self.emit(f"  {inc_v} = add i64 {cur2}, 1")
+        self.emit(f"  store i64 {inc_v}, i64* {line_ptr}")
+        self.emit(f"  br label %{cond_l}\n{end_l}:")
+
+    def emit_thread_running(self, node):
+        """thread.running(id) -> bool: True if thread is still running, False if done."""
+        # Lookup thread handle in _thread_handles array
+        tid_v, tid_t = self.emit_expr(node.thread_id)
+        tid_v = self.coerce(tid_v, tid_t, "i64")
+        result = self.new_tmp()
+        # pthread_tryjoin_np returns 0 (EBUSY) if thread is still running, ESRCH/0 if done
+        # We call it with null retval; if it returns EBUSY (16) → still running
+        # For simplicity use our runtime helper to check via non-destructive probe
+        self.emit(f"  {result} = call i1 @_thread_is_running(i64 {tid_v})")
+        return result, "i1"
+
+    def emit_thread_running_stmt(self, node):
+        self.emit_thread_running(node)
+
+    def emit_file_new(self, node):
+        """file.new("path") — create a new empty file (truncates if exists)."""
+        path_val, path_t = self.emit_expr(node.path_expr)
+        path_s = self.coerce(path_val, path_t, "i8*")
+        mode_lbl, mlen = self.intern_str("w")
+        mode_ptr = self.new_tmp()
+        self.emit(f"  {mode_ptr} = getelementptr [{mlen} x i8], [{mlen} x i8]* {mode_lbl}, i64 0, i64 0")
+        fp = self.new_tmp()
+        self.emit(f"  {fp} = call i8* @fopen(i8* {path_s}, i8* {mode_ptr})")
+        closed = self.new_tmp()
+        self.emit(f"  {closed} = call i32 @fclose(i8* {fp})")
 
     def emit_try(self, node):
         # NOTE: Rubidium's try/on_error does NOT use LLVM invoke/landingpad.
@@ -1029,10 +1124,11 @@ class CodeGen:
 
     def emit_file_exists(self, node):
         path_val, path_t = self.emit_expr(node.path_expr)
-        tmp = self.new_tmp()
-        self.emit(f"  {tmp} = call i32 @file_exists(i8* {path_val})")
-        self.emit(f"  {tmp} = icmp ne i32 {tmp}, 0")
-        return tmp, "i1"
+        raw = self.new_tmp()
+        cmp = self.new_tmp()
+        self.emit(f"  {raw} = call i32 @file_exists(i8* {path_val})")
+        self.emit(f"  {cmp} = icmp ne i32 {raw}, 0")
+        return cmp, "i1"
 
     def emit_file_delete(self, node):
         path_val, path_t = self.emit_expr(node.path_expr)
@@ -1268,6 +1364,10 @@ class CodeGen:
             self.emit(f"  call i32 @fclose(i8* {fp})")
             return buf, "i8*"
             
+        if isinstance(node, ThreadRunning):
+            return self.emit_thread_running(node)
+        if isinstance(node, FileExists):
+            return self.emit_file_exists(node)
         if isinstance(node, Var):
             if node.name in self.dropped_vars:
                 # Runtime behavior: print error message instead of crash
@@ -1795,23 +1895,18 @@ class CodeGen:
         # Box* casts: delegate to coerce() which handles unbox_f/unbox_i/unbox_s
         if from_t == "%Box*":
             return self.coerce(val, from_t, to_t), to_t
-        if from_t in ("i1","i64") and to_t in ("float","double"):
-            self.emit(f"  {tmp} = sitofp {from_t} {val} to {to_t}"); return tmp, to_t
-        if from_t in ("float","double") and to_t in ("i1","i64"):
-            self.emit(f"  {tmp} = fptosi {from_t} {val} to {to_t}"); return tmp, to_t
-        if from_t == "float" and to_t == "double":
-            self.emit(f"  {tmp} = fpext float {val} to double"); return tmp, to_t
-        if from_t == "double" and to_t == "float":
-            self.emit(f"  {tmp} = fptrunc double {val} to float"); return tmp, to_t
-        int_sizes = {"i1":1,"i64":64}
-        if from_t in int_sizes and to_t in int_sizes:
-            # i1 and i64 need proper conversion
-            if from_t == "i64" and to_t == "i1":
-                self.emit(f"  {tmp} = trunc i64 {val} to i1"); return tmp, to_t
-            if from_t == "i1" and to_t == "i64":
-                self.emit(f"  {tmp} = zext i1 {val} to i64"); return tmp, to_t
-            return val
-        if from_t in ("i1","i64") and to_t == "i8*":
+        # Integer ↔ Integer — delegate to coerce() which handles all widths
+        if from_t in self._INT_IR_SET and to_t in self._INT_IR_SET:
+            return self.coerce(val, from_t, to_t), to_t
+        # Integer ↔ Float
+        if from_t in self._INT_IR_SET and to_t in self._FLOAT_IR_SET:
+            return self.coerce(val, from_t, to_t), to_t
+        if from_t in self._FLOAT_IR_SET and to_t in self._INT_IR_SET:
+            return self.coerce(val, from_t, to_t), to_t
+        # Float ↔ Float
+        if from_t in self._FLOAT_IR_SET and to_t in self._FLOAT_IR_SET:
+            return self.coerce(val, from_t, to_t), to_t
+        if from_t in self._INT_IR_SET and to_t == "i8*":
             buf, fmt_ptr = self.new_tmp(), self.new_tmp()
             fmt_lbl, flen = self.intern_str("%lld")
             self.emit(f"  {buf} = call i8* @malloc(i64 32)")

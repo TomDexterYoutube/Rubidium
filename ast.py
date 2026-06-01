@@ -148,6 +148,10 @@ class ThreadWait:
     def __init__(self, thread_ids):
         self.thread_ids = thread_ids
 
+class ThreadRunning:
+    def __init__(self, thread_id):
+        self.thread_id = thread_id
+
 class Import:
     def __init__(self, module_name):
         self.module_name = module_name
