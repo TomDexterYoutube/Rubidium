@@ -1,88 +1,126 @@
-# Rubidium
+# Rubidium Programming Language
 
-> A beginner-friendly programming language built for real systems programming.
-> Python-style readability. Rust-inspired safety. Direct native binaries.
-> Because apparently humans looked at C++, cried a little, and decided to invent another language. This one is actually pretty interesting though.
+**Simple enough for beginners. Powerful enough for systems programming.**
+
+Rubidium is a statically typed, compiled programming language designed around simplicity, predictability, and direct control of memory. It removes complex ownership systems and hidden behavior while still providing features required for real-world software development.
+
+Programs are written in `.rub` files and compile into native executables.
 
 ---
 
-## What is Rubidium?
+## Features
 
-Rubidium is a compiled programming language designed to feel simple for beginners while still scaling into low-level and high-performance software development.
-
-It combines:
-
-* Clean, readable syntax
-* Static typing
+* Beginner-friendly syntax
 * Compile-time type checking
-* Manual memory control
-* POSIX threading
-* Native binary compilation
-* Structured collections
-* Beginner-friendly design choices
-
-Rubidium aims to remove a lot of the unnecessary pain found in traditional systems languages without turning everything into a slow abstraction soup.
-
----
-
-# Features
-
-* **Compiled directly to native binaries**
-* **Static type system**
-* **Compile-time error checking**
-* **Mutable and immutable variables**
-* **Manual memory dropping with `.drop()`**
-* **POSIX hardware threading**
-* **Dynamic collections**
-* **Python-like readability**
-* **Rust-inspired safety concepts**
-* **No semicolons required**
-* **Built-in random, threading, and time modules**
-* **Simple class system**
-* **Built-in file I/O**
-* **Structured error handling**
-* **FFI if you feel Rubidium wasn't enough 
+* Explicit memory management
+* Deep-copy assignment semantics
+* Global shared memory model
+* Built-in threading support
+* File system access
+* Foreign Function Interface (FFI)
+* Cross-platform OS interaction
+* High-precision integer and floating-point types
+* Automatic program entry through `main()`
 
 ---
 
 # Hello World
 
 ```rub
+print("This runs before main()")
+
+fn main() {
+    print("Hello, Rubidium!")
+}
+```
+
+Output:
+
+```text
+This runs before main()
+Hello, Rubidium!
+```
+
+---
+
+# Execution Model
+
+Rubidium executes in two phases:
+
+### Phase 1 — Top Level
+
+All code outside functions runs immediately from top to bottom.
+
+* Global variables are created
+* Top-level function calls execute
+* Functions and classes are defined
+
+### Phase 2 — Main
+
+After top-level execution completes, Rubidium automatically runs:
+
+```rub
 fn main() {
 
-    print("Hello, Rubidium!")
 }
 ```
 
 ---
 
+# Memory Philosophy
+
+Rubidium uses a shared global memory pool.
+
+```rub
+let score = 100
+```
+
+Once a variable exists, it can be accessed anywhere unless created inside an isolated scope.
+
+### Manual Memory Management
+
+Memory is never freed automatically.
+
+```rub
+let data = [1,2,3]
+
+data.drop()
+```
+
+Exceptions:
+
+* Loop variables
+* File handles created by `open()`
+
+These are automatically released at the end of their block.
+
+---
+
 # Variables
 
-Rubidium supports optional static typing with type inference.
+Immutable:
 
 ```rub
-let x = 10
-let mut y: i32 = 5
-
-let name: str = "Rubidium"
-let pi: f64 = 3.14159
-let active: bool = True
+let name = "Rubidium"
 ```
 
-Mutable variables use `mut`.
+Mutable:
 
 ```rub
-y = 15
+let mut counter = 0
+
+counter = 10
 ```
+
+Attempting to modify an immutable variable causes a compile-time error.
 
 ---
 
 # Data Types
 
-## Integer Types
+## Integers
 
 ```text
-
 i32
 i64
 i128
@@ -92,7 +130,7 @@ i1024
 i2048
 ```
 
-## Floating Point Types
+## Floating Point
 
 ```text
 f32
@@ -109,190 +147,164 @@ f2048
 ```text
 str
 bool
-list
-index
-dict
+Null
+```
+
+Example:
+
+```rub
+let age: i32 = 25
+let pi: f64 = 3.14
+let active: bool = True
+let username: str = "Alice"
 ```
 
 ---
 
-# Type Safety
+# Null Values
 
-Rubidium performs compile-time type checking.
+Every type accepts `Null`.
 
 ```rub
-let x: i32 = 10
-x = "hello"   # Compiler error
+let age: i32 = Null
+let name: str = Null
 ```
 
-Because discovering type errors before runtime is generally preferable to discovering them at 3AM while staring at logs and reconsidering your career path.
+This means the variable exists but currently contains no value.
 
 ---
 
-# Math & Logic
+# Type Casting
 
 ```rub
-let result = (1 + 2) * 3
+let a: i32 = 5
 
-let valid = result > 5
-
-let state = True and not False
+let b: i64 = a as i64
+let c: f64 = a as f64
 ```
 
-Supported operators:
+---
+
+# Deep Copy Semantics
+
+Every assignment creates a completely independent copy.
+
+```rub
+let a = [1,2,3]
+let b = a
+
+b(0).set(999)
+
+print(a)
+print(b)
+```
+
+Output:
 
 ```text
-+  -  *  / ** */
-== != > < >= <=
-and or not
+[1,2,3]
+[999,2,3]
 ```
+
+There is no borrowing, referencing, or ownership system.
 
 ---
 
 # Strings
 
 ```rub
-let greeting = "Hello, "
-let target = "World!"
+let first = "Hello"
+let second = "World"
 
-let full = greeting.combine(target)
-
-print(full)
+let combined = first + second
 ```
 
-## String Methods
+Interpolation:
 
 ```rub
-full.len()
-full.has("World")
-```
+let name = "Rubidium"
 
-## String Conversion
-
-```rub
-let number = "404"
-
-let value: i32 = number.to(i32)
-```
-
-## String Interpolation
-
-```rub
 print(i"Hello {name}")
 ```
 
-Tiny feature. Massive quality-of-life improvement. Humanity spent decades manually concatenating strings like cave people.
+Useful methods:
+
+```rub
+text.len()
+text.has("abc")
+```
+
+Conversions:
+
+```rub
+let num = "123".to(i32)
+let text = 42.to(str)
+```
 
 ---
 
 # Collections
 
-## Lists
+Rubidium provides three built-in collection types.
 
-Lists use **1-based indexing**.
+## List
+
+Ordered collection.
 
 ```rub
-let items: list = [10, 20, 30]
+let mut items: list = [1,2,3]
 
-print(items(1))
+items().add(4)
+
+items(0).set(100)
 ```
 
-## Indexes
+---
 
-Mixed key/value structures.
+## Index
+
+Single-value key/value map.
 
 ```rub
-let values: index = [
-    "name": "Rubidium",
-    1: "hello"
+let mut users: index = [
+    "name": "Alice",
+    1: "Admin"
 ]
+
+users().add("email", "alice@example.com")
 ```
 
-## Dicts
+---
 
-Structured nested collections.
+## Dict
+
+Multi-value key collection.
 
 ```rub
-let table: dict = {
-    "numbers" = [1, 2, 3]
+let mut scores: dict = {
+    "math" = [90,95,100]
 }
+
+scores("math").add(85)
 ```
-
-## Mutation
-
-```rub
-items(1).set(99)
-```
-
----
-
-# Input & Output
-
-## Printing
-
-```rub
-print("Hello")
-```
-
-## Updating Console Lines
-
-```rub
-println("Loading...")
-println("Done")
-```
-
-`println()` replaces the current console line instead of creating a new one.
-
-Useful for:
-
-* Loading bars
-* Progress displays
-* Status updates
-
----
-
-# File I/O
-
-## Write Files
-
-```rub
-file_write("save.txt", "Hello")
-```
-
-## Read Files
-
-```rub
-let contents = file_read("save.txt")
-```
-
-Because every language eventually becomes "move text around and panic about paths."
-
----
-
-# Memory Management
-
-Rubidium supports explicit memory dropping.
-
-```rub
-my_list.drop()
-```
-
-Dropping recursively frees nested allocations immediately.
-
-This gives developers more direct memory control without requiring full manual allocation management everywhere.
 
 ---
 
 # Conditionals
 
 ```rub
-if x > 5 {
+if score > 90 {
 
-    print("Large")
+    print("Excellent")
+
+} else if score > 50 {
+
+    print("Pass")
 
 } else {
 
-    print("Small")
+    print("Fail")
+
 }
 ```
 
@@ -300,30 +312,33 @@ if x > 5 {
 
 # Loops
 
-## While Loops
+## While Loop
 
 ```rub
 while count < 10 {
 
     count = count + 1
+
 }
 ```
 
-## Range Loops
+## Range Loop
 
 ```rub
-for i in range(1, 10) {
+for i in range(0, 10) {
 
     print(i)
+
 }
 ```
 
-## Collection Iteration
+## Collection Loop
 
 ```rub
 for item in items {
 
     print(item)
+
 }
 ```
 
@@ -331,17 +346,30 @@ for item in items {
 
 # Functions
 
+Basic function:
+
+```rub
+fn greet() {
+
+    print("Hello")
+
+}
+```
+
+Function with return value:
+
 ```rub
 fn add(a: i32, b: i32) -> i32 {
 
     return a + b
+
 }
 ```
 
-## Calling Functions
+Usage:
 
 ```rub
-let result = add(5, 10)
+let result = add(5, 3)
 ```
 
 ---
@@ -351,17 +379,16 @@ let result = add(5, 10)
 ```rub
 try {
 
-    let x = 10 / 0
+    let result = 10 / 0
 
 } error {
 
-    print("Error: " + error)
+    print(error)
+
 }
 ```
 
-Errors inside the `error` block are exposed as strings.
-
-Simple. Predictable. No seventeen-layer exception hierarchy named after Greek tragedies.
+The `error` variable contains the runtime error message.
 
 ---
 
@@ -372,59 +399,79 @@ class player() {
 
     let mut health: i32 = 100
 
-    fn damage() {
+    fn damage(amount: i32) {
 
-        health = health - 10
+        health = health - amount
+
     }
 }
 ```
 
-## Creating Instances
+Create an instance:
 
 ```rub
 let mut p = player()
 
-p.health.set(50)
+p.health = 50
+
+p.damage(10)
 ```
 
-### Class Rules
+---
 
-* No `self`
-* Class scope directly accesses variables
-* Mutable class instances can only mutate `mut` fields
+# File Handling
+
+```rub
+open("data.txt") as file {
+
+    file.write("Hello")
+
+    let content = file.read()
+
+}
+```
+
+Iterating over a file:
+
+```rub
+open("data.txt") as file {
+
+    for line in file {
+
+        print(line)
+
+    }
+
+}
+```
 
 ---
 
 # Threading
 
-Rubidium supports real POSIX threading.
-
 ```rub
 use thread
 
-fn task() {
-
-    print("Running")
-}
-
-thread(task(), 1)
+thread(task_one(), 1)
 
 thread.wait(1)
 ```
 
+Check if a thread is still running:
+
+```rub
+thread.running(1)
+```
+
 ---
 
-# Random Module
+# Random
 
 ```rub
 use random
 
 let value = random(0, 100, i32)
-```
 
-## Utilities
-
-```rub
 random.shuffle(my_list)
 
 random.choice(my_list)
@@ -432,115 +479,168 @@ random.choice(my_list)
 
 ---
 
-# Time Module
+# Time
 
 ```rub
 use time
 
-time.sleep(5)
+time.wait(5)
+```
+
+Named timers:
+
+```rub
+time.timer_start(1)
+
+let elapsed = time.timer_read(1)
 ```
 
 ---
 
-# Imports
+# Operating System Access
 
-## Built-in Modules
+```rub
+use os
+
+os.start(1)
+
+let output = os.run(1, "echo hello")
+
+os(1).drop()
+```
+
+---
+
+# Foreign Function Interface (FFI)
+
+Load a shared library:
+
+```rub
+use FFI
+
+let lib = FFI("libs/mylib.so")
+```
+
+Bind a native function:
+
+```rub
+fn lib add_numbers(a: i32, b: i32) -> i32
+```
+
+Call it normally:
+
+```rub
+let result = add_numbers(5, 10)
+```
+
+Compatible with:
+
+* C
+* C++
+* Rust
+* C#
+
+---
+
+# Modules
+
+Built-in modules:
 
 ```rub
 use thread
 use random
 use time
+use os
+use FFI
 ```
 
-## External Files
+External modules:
 
 ```rub
 import math_tools
 ```
 
+Imports load `.rub` files from the current project.
+
 ---
 
-# Program Entry Point
+# Project Structure
 
-Rubidium programs start at `main()`.
-
-```rub
-fn main() {
-
-    print("Program started")
-}
+```text
+project/
+│
+├── main.rub
+├── math_tools.rub
+│
+└── libs/
+    └── mylib.so
 ```
 
 ---
 
-# Syntax Philosophy
+# Design Goals
 
-Rubidium tries to follow a few core ideas:
+Rubidium was created with several core principles:
 
-* Readable without being weak
-* Explicit without being noisy
-* Powerful without looking like encrypted tax forms
-* Beginner-friendly without hiding how computers work
-
-It is designed to grow with the programmer instead of forcing them to abandon the language once projects become serious.
+1. Easy to learn
+2. Predictable behavior
+3. Explicit memory control
+4. Strong compile-time safety
+5. No hidden ownership systems
+6. Simple syntax that scales to large applications
+7. Native performance
 
 ---
 
-# Example Program
+# Quick Syntax Reference
 
 ```rub
-use random
-use thread
+# Comment
 
-fn worker() {
+let value = 10
 
-    let value = random(1, 100, i32)
+let mut count = 0
 
-    print(i"Generated: {value}")
+if value > 5 {
+
 }
 
-fn main() {
+while True {
 
-    thread(worker(), 1)
-
-    thread.wait(1)
-
-    print("Done")
 }
+
+for i in range(0,10) {
+
+}
+
+fn add(a: i32, b: i32) -> i32 {
+
+    return a + b
+
+}
+
+class player() {
+
+}
+
+print("Hello")
+
+let name = input("Name: ")
+
+value.drop()
 ```
-
----
-
-# Current Goals
-
-* Standard library expansion
-* Better tooling and diagnostics
-* Package manager
-* Try and make less buggy and more usable 
-
----
-
-# Why Rubidium?
-
-Because modern programming somehow became a war between:
-
-* unreadable low-level languages,
-* painfully slow abstraction-heavy languages,
-* and JavaScript pretending to be an operating system.
-
-Rubidium tries to sit in the middle:
-
-* fast,
-* readable,
-* safe,
-* and actually enjoyable to write.
-
-A dangerous idea in software engineering, apparently.
 
 ---
 
 # License
 
-MIT License
+Choose a license that matches your project's goals:
 
-Use it, modify it, break it, rebuild it into something cursed. Humanity seems committed to doing that with every technology anyway.
+* MIT
+* Apache 2.0
+* GPLv3
+* Custom License
+
+---
+
+**Rubidium — a language that starts simple and stays powerful.**
