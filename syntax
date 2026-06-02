@@ -743,6 +743,10 @@ let mut my_dict: dict = { "scores" = [10, 20, 30] }
 random.choice(my_dict)
 random.choice(my_dict("scores"))
 
+random.seed("seed")
+
+# to set the starting seed
+
 # =========================================
 # TIME
 # =========================================
