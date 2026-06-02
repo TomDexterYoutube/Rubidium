@@ -75,12 +75,25 @@ a = 20   # ERROR: a is not mutable
 #   str   — text string
 #   bool  — True or False
 #   Null  — valid for all types, means "exists but empty"
+#   Any   — can hold a value of any type
 
 let a: i32  = 100
 let b: f64  = 3.14
 let c: str  = "hello"
 let d: bool = True
 let e: i32  = Null
+let f: Any  = "I can be anything!"
+
+# Any can be used when you don't know the type in advance, for functions and return types and such
+# Strings are also indexable for existing
+
+let str: str = "Hello, World!"
+
+for i in str.len() {
+    print(str.char(i))
+}
+
+# It starts a 1 so for this it would print all the characters in str one by one on a new line
 
 # =========================================
 # NULL
@@ -193,7 +206,7 @@ let d = a.combine(b)
 
 # String methods:
 
-let length: i64 = a.len()         # character count
+let length: i64 = a.len()         # character count if the str was "hello" it would return 5 
 let found: bool = a.has("ell")    # True
 
 # Type conversion from string:
@@ -412,9 +425,15 @@ while count < 5 {
     count = count + 1
 }
 
-# Range loop:
+# -----------------------------------------
+# RANGE LOOP
+# -----------------------------------------
+
 # range(start, end) — end is exclusive.
-# The loop variable is automatically dropped after the block.
+#
+# The loop variable is local to the loop only.
+# It can be named anything and is automatically
+# dropped when the loop ends.
 
 for i in range(1, 10) {
 
@@ -425,26 +444,121 @@ for i in range(1, 10) {
     print(i)
 }
 
-# List iteration:
-# The loop variable is automatically dropped after the block.
+# The loop variable name is not special.
 
-let mut items: list = [10, 20, 30]
+for value in range(1, 10) {
+    print(value)
+}
+
+for banana in range(1, 10) {
+    print(banana)
+}
+
+# -----------------------------------------
+# COLLECTION ITERATION
+# -----------------------------------------
+
+# Lists, indexes, dicts, and files can be
+# used directly in for loops.
+
+# Loop variables are always local to the loop
+# and are automatically dropped after execution.
+
+let items: list = [10, 20, 30]
 
 for item in items {
     print(item)
 }
 
-# Dict iteration — yields keys, not values:
-
-let mut table: dict = {
-    "a" = [100, 200],
-    "b" = [300, 400]
+for number in items {
+    print(number)
 }
+
+# -----------------------------------------
+# INDEX ITERATION
+# -----------------------------------------
+
+# Iterating an index yields keys.
+
+let table: index = [
+    "name": "Rubidium",
+    "lang": "Programming"
+]
 
 for key in table {
     print(key)
-    print(table(key, 0))
+    print(table(key))
 }
+
+# -----------------------------------------
+# DICT ITERATION
+# -----------------------------------------
+
+# Iterating a dict yields keys.
+
+let scores: dict = {
+    "players" = ["Alice", "Bob"],
+    "points" = [10, 20]
+}
+
+for key in scores {
+    print(key)
+    print(scores(key, 0))
+}
+
+# -----------------------------------------
+# FILE ITERATION
+# -----------------------------------------
+
+# Iterating a file yields lines.
+# The file handle remains valid only inside
+# the open block scope.
+
+open("data.txt") as file {
+
+    for line in file {
+        print(line)
+    }
+}
+
+# -----------------------------------------
+# BREAK & CONTINUE
+# -----------------------------------------
+
+# break exits the loop immediately.
+
+for i in range(1, 10) {
+
+    if i == 5 {
+        break
+    }
+
+    print(i)
+}
+
+# continue skips the current iteration.
+
+for i in range(1, 10) {
+
+    if i == 5 {
+        continue
+    }
+
+    print(i)
+}
+
+# -----------------------------------------
+# ITERATION NOTES
+# -----------------------------------------
+
+# - Loop variable names can be anything
+# - Loop variables are local to the loop scope
+# - Loop variables are automatically dropped after the loop
+# - Lists yield values
+# - Indexes yield keys
+# - Dicts yield keys
+# - Files yield lines
+# - User-defined classes cannot define custom iteration behavior
 
 # =========================================
 # FUNCTIONS
@@ -712,7 +826,7 @@ fn c_lib my_c_func(msg: str) -> i32
 
 # Call the bound function like a normal function:
 
-my_c_func("hello from Rubidium")
+c_lib.my_c_func("hello from Rubidium")
 
 # Binding rules:
 # - The first identifier must be an FFI handle.
@@ -734,10 +848,11 @@ use time
 use os
 use FFI
 
-# 'import' loads an external .rub file from the same folder
-# as your code.
+# 'import' loads an external .rub file from the same folder into your code with the name of the file as the namespace
 
 import math_tools
+
+math_tools.sin(0.5)
 
 # =========================================
 # MAIN ENTRY POINT
@@ -781,3 +896,4 @@ fn main() {
 #   list  — ordered sequence, zero-indexed, one type of value per slot
 #   index — flat key->value map, mixed key and value types allowed
 #   dict  — key->collection map, each key holds multiple values
+#   for all of these you can use .has() for keys and values
