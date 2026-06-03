@@ -343,7 +343,7 @@ let user: str = input("Enter your name: ")
 open("data.txt") as file {
 
     file.write("Hello")        # overwrite entire file
-    file.append(" World")      # add to end of file
+    file.add(" World")      # add to end of file
 
     let data = file.read()     # read entire file
     print(data)
