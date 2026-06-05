@@ -39,7 +39,7 @@ fn main() {
 #   which are freed automatically at the end of their block.
 #
 # Think of memory as a shared whiteboard —
-# everyone can see and mody it.
+# everyone can see and modify it.
 
 # =========================================
 # VARIABLES
@@ -51,7 +51,7 @@ let x = 10
 let name = "Rubidium"
 let flag = True
 
-# Use 'mut'  you need to reassign the variable later.
+# Use 'mut' if you need to reassign the variable later.
 
 let mut counter = 0
 counter = 5
@@ -92,9 +92,6 @@ let str: str = "Hello, World!"
 for i in str.len() {
     print(str.char(i))
 }
-
-# It starts a 1 so for this it would print all the characters in str one by one on a new line
-
 # =========================================
 # NULL
 # =========================================
@@ -196,41 +193,143 @@ let result: bool = True and not False   # True
 # STRINGS
 # =========================================
 
-let a: str = "Hello"
-let b: str = "World"
+# Strings store text.
 
-# Concatenation — returns a new string.
+let text = "Hello World"
 
-let c = a + b
-let d = a.combine(b)
+print(text)
 
-# String methods:
+# Output:
+# Hello World
 
-let length: i64 = a.len()         # character count  the str was "hello" it would return 5 
-let found: bool = a.has("ell")    # True
 
-# Type conversion from string:
+# Strings use double quotes.
 
-let num_str: str = "123"
-let i: i32 = num_str.to(i32)
-let f: f64 = num_str.to(f64)
+let name = "Max"
+let message = "Welcome to Rubidium"
 
-# Type conversion to string:
 
-let n: i32 = 42
-let s: str = n.to(str)
+# Empty string
 
-# String interpolation using i"":
+let empty = ""
 
-let name = "Rubidium"
-print(i"Hello {name}")   # Hello Rubidium
+
+# Strings can contain numbers and symbols.
+
+let text = "abc123!@#"
+
+
+# -------------------------------
+# STRING METHODS
+# -------------------------------
+
+# Get a character at an index.
+
+text.char(index)
+
+let text = "Hello"
+
+print(text.char(0))
+
+# Output:
+# H
+
+
+print(text.char(4))
+
+# Output:
+# o
+
+
+# Replace a character at an index.
+
+text.set(index, value)
+
+let text = "Hello"
+
+text.set(0, "J")
+
+print(text)
+
+# Output:
+# Jello
+
+
+# value must be a single character string.
+
+text.set(4, "!")
+
+print(text)
+
+# Output:
+# Hell!
+
+
+# Insert text before an index.
+
+text.insert(index, value)
+
+let text = "Hello"
+
+text.insert(5, "!")
+
+print(text)
+
+# Output:
+# Hello!
+
+
+let text = "World"
+
+text.insert(0, "Hello ")
+
+print(text)
+
+# Output:
+# Hello World
+
+
+# Replace every matching character or string.
+
+text.replace(old, new)
+
+let text = "banana"
+
+text.replace("a", "_")
+
+print(text)
+
+# Output:
+# b_n_n_
+
+
+let text = "Hello World"
+
+text.replace("World", "Rubidium")
+
+print(text)
+
+# Output:
+# Hello Rubidium
+
+
+# Convert a string into a list of characters.
+
+text.slice()
+
+let text = "Hello"
+
+print(text.slice())
+
+# Output:
+# ["H", "e", "l", "l", "o"]
 
 # =========================================
 # COLLECTIONS
 # =========================================
 
 # All three collection types (list, index, dict)
-# require 'mut'  you want to mody them.
+# require 'mut' if you want to modify them.
 
 # -----------------------------------------
 # LIST
@@ -275,7 +374,7 @@ print(my_index("name"))   # Rubidium
 my_index("name").set("updated")
 
 # Add a new key-value pair using .add():
-#  the key already exists, this will error.
+# If the key already exists, this will error.
 
 my_index().add("new_key", 99)
 
@@ -291,7 +390,7 @@ let mut my_dict: dict = {
     "names"  = ["alice", "bob"]
 }
 
-# Access a specic value inside a key:
+# Access a specific value inside a key:
 # dict(key, index)
 
 print(my_dict("scores", 1))   # 20
@@ -348,10 +447,10 @@ open("data.txt") as file {
     let data = file.read()     # read entire file
     print(data)
 
-    let line = file.readln(3)  # read a specic line
+    let line = file.readln(3)  # read a specific line
     print(line)
 
-    file.writeln(2, "Updated") # overwrite a specic line
+    file.writeln(2, "Updated") # overwrite a specific line
 }
 
 # Iterate over a file line by line:
@@ -404,17 +503,13 @@ items.drop()
 
 let x = 7
 
- x == 7 {
+if x == 7 {
     print("lucky seven")
 } else if x > 10 {
     print("big number")
 } else {
     print("something else")
 }
-
-# you can do one liners like this it it is only one line of code in the {}
-
-if health - value < 0 { health = 0 } else { health = health - value }
 
 # =========================================
 # LOOPS
@@ -477,6 +572,8 @@ for item in items {
 for number in items {
     print(number)
 }
+
+# for lists you can do .combine and it does [item1 + item2 + item3] internaly then outputs the result 
 
 # -----------------------------------------
 # INDEX ITERATION
@@ -551,25 +648,12 @@ for i in range(1, 10) {
     print(i)
 }
 
-# -----------------------------------------
-# ITERATION NOTES
-# -----------------------------------------
-
-# - Loop variable names can be anything
-# - Loop variables are local to the loop scope
-# - Loop variables are automatically dropped after the loop
-# - Lists yield values
-# - Indexes yield keys
-# - Dicts yield keys
-# - Files yield lines
-# - User-defined classes cannot define custom iteration behavior
-
 # =========================================
 # FUNCTIONS
 # =========================================
 
-# Functions create an isolated scope.
-# Variables declared inside a function are not in the global pool.
+# Functions do not create a isolated scope they share the global pool except with imports
+# like main(value: any) that says in the function and its droped when function is finished
 
 # Basic function:
 
@@ -718,6 +802,22 @@ fn run() {
 
     let still_going: bool = thread.running(1)
 }
+
+# threading creates a scope with spetial rules 
+
+fn task_one(x) {
+    let local y = 10
+    print("done")
+}
+
+let z = 10
+
+fn main() {
+    thread(task_one(1), 1)
+    thread(task_one(1), 2)
+}
+
+# with this y is local so each thread would share z but have there own x and y
 
 # =========================================
 # RANDOM
@@ -874,34 +974,149 @@ fn main() {
 }
 
 # =========================================
-# QUICK REFERENCE
+# NOTES
 # =========================================
 
-# Syntax basics:
-#   - Statements end with a newline. Semicolons are not required.
+# Syntax:
+#   - Statements end with a newline
+#   - Semicolons are not required
 #   - Blocks use braces { }
 #   - Comments use #
 #   - Strings use double quotes
+#   - String interpolation uses: i"text {variable}"
 #   - Boolean values are True and False
 #   - Logical operators are: and, or, not
 #   - Type casting uses: as
-#   - String interpolation uses: i"text {variable}"
 #   - Square root uses: */value
 
 # Memory:
-#   - All assignments are deep copies
-#   - Variables are global by default
-#   - Functions, classes, and imports create isolated scopes
+#   - All assignments create a full deep copy
+#   - Values are never borrowed or shared
+#   - Variables live in the global pool by default
 #   - Memory must be freed manually with .drop()
-#   - Exceptions: open() blocks and loop variables are freed automatically
+#   - Accessing dropped memory causes a runtime error
+#   - Loop variables are automatically dropped when the loop ends
+#   - File handles are automatically dropped when an open() block ends
+#   - Null is a valid value for all types (exists but empty)
+#   - null == null is true
+
+# Scope:
+#   - Variables created at the top level are visible everywhere
+#   - Functions can access global variables
+#   - Function parameters exist only for the lifetime of the function
+#   - Classes create their own scope
+#   - Imported files create their own namespace
 
 # Types:
-#   - Type checking is done at compile time
-#   - Null is valid for all types
-#   - Collections always require mut to be modified
+#   - Type checking happens at compile time
+#   - Null is valid for every type
+#   - Any can store any value type
+#   - Assigning an incompatible type causes a compile error
+#   - Unknown or missing symbols raise compile errors (error if fn/class not found)
+#   - Reassignment rules depend on mut (non-mut = compile error)
+#   - Not all errors are runtime; many are compile-time by design
 
-# Collections summary:
-#   list  — ordered sequence, zero-indexed, one type of value per slot
-#   index — flat key->value map, mixed key and value types allowed
-#   dict  — key->collection map, each key holds multiple values
-#   for all of these you can use .has() for keys and values
+# Null:
+#   - Null represents an existing value with no data
+#   - Null can be compared using == and !=
+#   - Null is considered smaller than all non-null values
+#   - Example: Null < 0 is True
+#   - Null comparisons are valid and well-defined across types
+
+# Collections:
+#   - Collections require mut to be modified
+#   - list  = ordered sequence of values
+#   - index = key -> value map
+#   - dict  = key -> collection map
+#   - .len() returns the number of items
+#   - .has() checks for keys or values
+#   - Accessing a missing key or index causes a runtime error
+#   - Iteration behavior:
+#       * list  -> values
+#       * index -> keys
+#       * dict  -> keys
+#       * file  -> lines
+#   - Collections use deep copy on assignment
+
+# Collection Equality:
+#   - Collection equality compares contents
+#   - Two collections with identical contents are equal
+#   - Equality is checked recursively
+#   - null values inside collections are valid and comparable
+
+# Strings:
+#   - Strings are zero indexed
+#   - .len() returns number of characters
+#   - .char(index) returns character at index
+#   - .set(index, value) replaces a character
+#   - .set() requires a single-character string
+#   - .insert(index, value) inserts text before index
+#   - .replace(old, new) replaces all matches
+#   - .slice() returns list of characters
+#   - String modification requires mut
+#   - Strings are iterable in loops
+
+# Loops:
+#   - Loop variable names can be anything
+#   - Loop variables are local to the loop
+#   - Loop variables are automatically dropped after the loop
+#   - Lists yield values
+#   - Indexes yield keys
+#   - Dicts yield keys
+#   - Files yield lines
+#   - User-defined classes cannot define custom iteration behavior
+#   - Loop variables are not persistent outside loop scope
+
+# Range:
+#   - range(start, end) excludes the end value
+#   - If start < end, counts upward
+#   - If start > end, counts downward
+
+# Indexes:
+#   - Iteration preserves insertion order
+#   - Keys can be any type (not just strings)
+
+# Classes:
+#   - Class instances follow normal deep-copy rules
+#   - Assigning one instance to another creates a full copy
+#   - Class fields marked mut may be modified
+#   - Non-mut fields cannot be modified
+#   - No "self" keyword; fields are accessed directly
+#   - Methods operate on instance state implicitly
+#   - Attempting to modify locked fields causes compile error
+
+# Threads:
+#   - Threads share access to global variables
+#   - Multiple threads may modify the same variable
+#   - No race-condition protection is provided
+#   - Invalid memory access causes runtime error
+#   - Thread IDs are required for control and synchronization
+
+# Imports:
+#   - use enables built-in modules
+#   - import loads external .rub files
+#   - Imported files are accessed through their namespace
+#   - Built-in modules and imported namespaces are separate systems
+#   - Missing imports or symbols result in compile errors
+
+# Files & Memory Notes:
+#   - open() blocks auto-close file handles
+#   - File variables persist after block ends
+#   - File operations support try/error handling
+#   - File iteration yields lines only inside open scope
+
+# Errors (new clarified behavior):
+#   - Some errors are compile-time (missing fn/class, bad types)
+#   - Some are runtime (invalid memory access, invalid indexing)
+#   - mut violations cause compile errors
+#   - Accessing null behaves as valid but empty state
+
+# Local Variables:
+#   - Declared using 'local'
+#   - Syntax: let mut local x: type = value
+#   - Exist only inside the current block or function
+#   - Automatically dropped at scope exit
+#   - Cannot be accessed outside their scope
+#   - May shadow global variables
+#   - Do not enter the global pool
+#   - Follow normal mutability rules
