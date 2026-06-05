@@ -39,7 +39,7 @@ fn main() {
 #   which are freed automatically at the end of their block.
 #
 # Think of memory as a shared whiteboard —
-# everyone can see and modify it.
+# everyone can see and mody it.
 
 # =========================================
 # VARIABLES
@@ -51,7 +51,7 @@ let x = 10
 let name = "Rubidium"
 let flag = True
 
-# Use 'mut' if you need to reassign the variable later.
+# Use 'mut'  you need to reassign the variable later.
 
 let mut counter = 0
 counter = 5
@@ -206,7 +206,7 @@ let d = a.combine(b)
 
 # String methods:
 
-let length: i64 = a.len()         # character count if the str was "hello" it would return 5 
+let length: i64 = a.len()         # character count  the str was "hello" it would return 5 
 let found: bool = a.has("ell")    # True
 
 # Type conversion from string:
@@ -230,7 +230,7 @@ print(i"Hello {name}")   # Hello Rubidium
 # =========================================
 
 # All three collection types (list, index, dict)
-# require 'mut' if you want to modify them.
+# require 'mut'  you want to mody them.
 
 # -----------------------------------------
 # LIST
@@ -275,7 +275,7 @@ print(my_index("name"))   # Rubidium
 my_index("name").set("updated")
 
 # Add a new key-value pair using .add():
-# If the key already exists, this will error.
+#  the key already exists, this will error.
 
 my_index().add("new_key", 99)
 
@@ -291,7 +291,7 @@ let mut my_dict: dict = {
     "names"  = ["alice", "bob"]
 }
 
-# Access a specific value inside a key:
+# Access a specic value inside a key:
 # dict(key, index)
 
 print(my_dict("scores", 1))   # 20
@@ -348,10 +348,10 @@ open("data.txt") as file {
     let data = file.read()     # read entire file
     print(data)
 
-    let line = file.readln(3)  # read a specific line
+    let line = file.readln(3)  # read a specic line
     print(line)
 
-    file.writeln(2, "Updated") # overwrite a specific line
+    file.writeln(2, "Updated") # overwrite a specic line
 }
 
 # Iterate over a file line by line:
@@ -404,13 +404,17 @@ items.drop()
 
 let x = 7
 
-if x == 7 {
+ x == 7 {
     print("lucky seven")
 } else if x > 10 {
     print("big number")
 } else {
     print("something else")
 }
+
+# you can do one liners like this it it is only one line of code in the {}
+
+if health - value < 0 { health = 0 } else { health = health - value }
 
 # =========================================
 # LOOPS
