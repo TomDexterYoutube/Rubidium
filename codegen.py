@@ -1660,6 +1660,21 @@ class CodeGen:
         raw_fp = f"%ffi_raw_{self.new_tmp()[1:]}"
         pending.append(f"  {raw_fp} = call i64 @ffi_sym(i64 {handle_var_v}, i8* {sym_ptr_t})")
 
+        # Null check — if symbol not resolved, skip the call and return zero/null
+        ok_lbl  = f"ffi_ok_{self.new_tmp()[1:]}"
+        bad_lbl = f"ffi_bad_{self.new_tmp()[1:]}"
+        is_null = f"%ffi_null_{self.new_tmp()[1:]}"
+        pending.append(f"  {is_null} = icmp eq i64 {raw_fp}, 0")
+        pending.append(f"  br i1 {is_null}, label %{bad_lbl}, label %{ok_lbl}")
+        pending.append(f"{bad_lbl}:")
+        if ret_ir in ("float", "double"):
+            pending.append(f"  ret {ret_ir} 0.0")
+        elif ret_ir in ("i8*", "%Box*") or ret_ir.endswith("*"):
+            pending.append(f"  ret {ret_ir} null")
+        else:
+            pending.append(f"  ret {ret_ir} 0")
+        pending.append(f"{ok_lbl}:")
+
         # Bitcast i64 → fn ptr type
         fp_cast = f"%ffi_fp_{self.new_tmp()[1:]}"
         pending.append(f"  {fp_cast} = inttoptr i64 {raw_fp} to {fn_ptr_t}")
@@ -2395,6 +2410,22 @@ class CodeGen:
                 ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else "i64"
                 self.emit(f"  {tmp} = call {ret_ir} @{node.method}({', '.join(args_ir)})")
                 return tmp, ret_ir
+
+        # 4.5 Handle namespace.var.method() - e.g., wrap.glfw.glfwInit()
+        # Resolves FieldAccess(Var(ns), attr).method() by trying ns_attr_method, ns_method, method
+        if isinstance(node.obj, FieldAccess) and isinstance(node.obj.obj, Var):
+            ns_name  = node.obj.obj.name
+            attr_name = node.obj.field
+            for target in (f"{ns_name}_{attr_name}_{node.method}", f"{ns_name}_{node.method}", node.method):
+                if target in self.functions:
+                    args_ir = []
+                    for a in node.args:
+                        v, t = self.emit_expr(a); args_ir.append(f"{t} {v}")
+                    tmp = self.new_tmp()
+                    fn_ret = self.functions[target].ret_type
+                    ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else "i64"
+                    self.emit(f"  {tmp} = call {ret_ir} @{target}({', '.join(args_ir)})")
+                    return tmp, ret_ir
 
         obj_val, obj_t = self.emit_expr(node.obj)
         

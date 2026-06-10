@@ -6,7 +6,7 @@ import glob
 
 from lexer import tokenize
 from parser import Parser
-from rub_ast import Import, Use, VarDecl, FnDef, ClassDef
+from rub_ast import Import, Use, VarDecl, FnDef, ClassDef, Assign, Drop, FFIBind
 from codegen import CodeGen, RubidiumTypeError, RubidiumNameError
 
 RUNTIME_C = r"""
@@ -706,7 +706,7 @@ Box* str_slice(const char* str) {
 
 def _prefix_fn_calls(node, prefix, local_fns=None):
     """Recursively prefix FnCall names with module prefix, but only for functions defined in this module."""
-    from .ast import FnCall, MethodCall, Return, Print, Println, If, While, For, VarDecl, Assign, FieldAssign, Try, FnDef, ClassDef, FileOpen, FileExists, FileDelete, FileRename, FileCopy, FileNew, OsStart, OsRun, OsDrop, FFIBind, Use, Import, Break, Continue, Drop, ThreadCall, ThreadWait, ThreadRunning, BinOp, UnaryOp, Compare, TypeCast, Input, Number, Bool, None_, Str, InterpolatedStr, Var, ListExpr, DictExpr, FieldAccess, ClassInstantiate, FFILoad, FileHandleStmt
+    from rub_ast import FnCall, MethodCall, Return, Print, Println, If, While, For, VarDecl, Assign, FieldAssign, Try, FnDef, ClassDef, FileOpen, FileExists, FileDelete, FileRename, FileCopy, FileNew, OsStart, OsRun, OsDrop, FFIBind, Use, Import, Break, Continue, Drop, ThreadCall, ThreadWait, ThreadRunning, BinOp, UnaryOp, Compare, TypeCast, Input, Number, Bool, None_, Str, InterpolatedStr, Var, ListExpr, DictExpr, FieldAccess, ClassInstantiate, FFILoad, FileHandleStmt
     
     if local_fns is None:
         local_fns = set()
@@ -860,6 +860,8 @@ def parse_file(filepath, parsed_files, combined_ast, is_main=False):
                 node.name = f"{mod_name}_{node.name}"
             elif isinstance(node, Drop) and not node.name.startswith(mod_name + "_"):
                 node.name = f"{mod_name}_{node.name}"
+            elif isinstance(node, FFIBind) and not node.handle_name.startswith(mod_name + "_"):
+                node.handle_name = f"{mod_name}_{node.handle_name}"
     
     # Collect local function names BEFORE prefixing (for _prefix_fn_calls)
     local_fns_original = set()
