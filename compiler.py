@@ -6,7 +6,7 @@ import glob
 
 from lexer import tokenize
 from parser import Parser
-from ast import Import, Use, VarDecl, FnDef, ClassDef
+from rub_ast import Import, Use, VarDecl, FnDef, ClassDef
 from codegen import CodeGen, RubidiumTypeError, RubidiumNameError
 
 RUNTIME_C = r"""
@@ -143,16 +143,26 @@ double unbox_f(Box* b) { return b ? b->f : 0.0; }
 char* unbox_s(Box* b) { return (b && b->type==2) ? b->s : ""; }
 void* unbox_p(Box* b) { return (b && b->type==3) ? b->p : NULL; }
 
+double _rubidium_pow(double base, double exp) { return pow(base, exp); }
+
 typedef struct { int magic; Box** items; int count; int cap; } RList;
 Box* make_list() { RList* l=malloc(sizeof(RList)); l->magic=1; l->count=0; l->cap=8; l->items=malloc(8*sizeof(Box*)); return box_p(l); }
-void list_append(Box* lst, Box* b) { RList* l=lst->p; if(l->count==l->cap){l->cap*=2; l->items=realloc(l->items,l->cap*sizeof(Box*));} l->items[l->count++]=b; }
+void list_append(Box* lst, Box* b) { 
+    if(!lst || lst->type != 3) return;
+    RList* l=lst->p; 
+    if(!l || l->magic != 1) return; /* not a list */
+    if(l->count==l->cap){l->cap*=2; l->items=realloc(l->items,l->cap*sizeof(Box*));} 
+    l->items[l->count++]=b; 
+}
 void list_swap(Box* lst, int i, int j) {
+    if(!lst) return;
     RList* l=lst->p;
     if(i>=0 && i<l->count && j>=0 && j<l->count) {
         Box* tmp=l->items[i]; l->items[i]=l->items[j]; l->items[j]=tmp;
     }
 }
 Box* list_get(void* col, Box* idx) {
+    if(!col) return box_i(0);
     RList* l=col; int i=idx->i; /* 0-based indexing */
     if(i>=0 && i<l->count) return l->items[i];
     return box_i(0);
@@ -168,7 +178,9 @@ int box_eq(Box* a, Box* b) {
     return a->p==b->p;
 }
 void dict_set(Box* dct, Box* k, Box* v) {
+    if(!dct || dct->type != 3) return;
     RDict* d=dct->p;
+    if(!d || d->magic != 2) return; /* not a dict */
     for(int i=0;i<d->count;i++) if(box_eq(d->keys[i],k)) { 
         box_drop(d->vals[i]);
         d->vals[i]=v; 
@@ -178,6 +190,7 @@ void dict_set(Box* dct, Box* k, Box* v) {
     d->keys[d->count]=k; d->vals[d->count]=v; d->count++;
 }
 Box* dict_get(void* col, Box* k) {
+    if(!col) return box_i(0);
     RDict* d=col;
     for(int i=0;i<d->count;i++) if(box_eq(d->keys[i],k)) return d->vals[i];
     return box_i(0);
@@ -186,6 +199,7 @@ Box* dict_get(void* col, Box* k) {
 Box* collection_get(Box* col_box, Box* key) {
     if (!col_box || col_box->type != 3) return box_i(0);
     void* col = col_box->p;
+    if(!col) return box_i(0);
     int* magic = (int*)col;
     if (*magic == 1) return list_get(col, key);
     if (*magic == 2) return dict_get(col, key);
@@ -195,6 +209,7 @@ Box* collection_get(Box* col_box, Box* key) {
 void collection_set(Box* col_box, Box* key, Box* val) {
     if (!col_box || col_box->type != 3) return;
     void* col = col_box->p;
+    if(!col) return;
     int* magic = (int*)col;
     if (*magic == 1) {
         RList* l = col;
@@ -213,15 +228,41 @@ void collection_set(Box* col_box, Box* key, Box* val) {
 int collection_len(Box* col_box) {
     if (!col_box || col_box->type != 3) return 0;
     void* col = col_box->p;
+    if(!col) return 0;
     int* magic = (int*)col;
     if (*magic == 1) return ((RList*)col)->count;
     if (*magic == 2) return ((RDict*)col)->count;
     return 0;
 }
 
+unsigned int _rub_str_hash(const char* s) {
+    unsigned long hash = 5381;
+    int c;
+    while ((c = *s++)) hash = ((hash << 5) + hash) + c;
+    return (unsigned int)hash;
+}
+
+int collection_has(Box* col, Box* needle) {
+    if (!col || col->type != 3) return 0;
+    void* ptr = col->p;
+    if(!ptr) return 0;
+    int* magic = (int*)ptr;
+    if (*magic == 1) {
+        RList* l = ptr;
+        for(int i = 0; i < l->count; i++)
+            if(box_eq(l->items[i], needle)) return 1;
+    } else if (*magic == 2) {
+        RDict* d = ptr;
+        for(int i = 0; i < d->count; i++)
+            if(box_eq(d->keys[i], needle)) return 1;
+    }
+    return 0;
+}
+
 Box* collection_get_at(Box* col_box, int idx) {
     if (!col_box || col_box->type != 3) return box_i(0);
     void* col = col_box->p;
+    if(!col) return box_i(0);
     int* magic = (int*)col;
     if (*magic == 1) {
         RList* l = col;
@@ -476,15 +517,18 @@ FILE* _file_handles[1024];
 char* _file_paths[1024];
 static int _file_handle_count = 0;
 
-// Open a file handle slot — creates file if it doesn't exist, opens r+
-long long file_open(long long slot, const char* path) {
+// Open a file handle slot — mode: 0 = r+ (read/write, no truncate), 1 = w (create/truncate)
+long long file_open(long long slot, const char* path, int mode) {
     if(slot < 0 || slot >= 1024) return -1;
     if(_file_handles[slot]) { fclose(_file_handles[slot]); _file_handles[slot] = NULL; }
     if(_file_paths[slot]) { free(_file_paths[slot]); }
     _file_paths[slot] = strdup(path);
-    // Ensure file exists
-    FILE* touch = fopen(path, "a"); if(touch) fclose(touch);
-    _file_handles[slot] = fopen(path, "r+");
+    if(mode == 1) {
+        _file_handles[slot] = fopen(path, "w");
+    } else {
+        FILE* touch = fopen(path, "a"); if(touch) fclose(touch);
+        _file_handles[slot] = fopen(path, "r+");
+    }
     return slot;
 }
 
@@ -499,13 +543,29 @@ void file_close(long long slot) {
 // file.write(data) — overwrite entire file
 void file_write_all(long long slot, const char* data) {
     if(slot < 0 || slot >= 1024 || !_file_paths[slot]) return;
-    if(_file_handles[slot]) { fclose(_file_handles[slot]); }
-    _file_handles[slot] = fopen(_file_paths[slot], "w");
-    if(_file_handles[slot]) {
-        fputs(data, _file_handles[slot]);
-        fclose(_file_handles[slot]);
-        _file_handles[slot] = fopen(_file_paths[slot], "r+");
-    }
+    if(_file_handles[slot]) { fclose(_file_handles[slot]); _file_handles[slot] = NULL; }
+    FILE* f = fopen(_file_paths[slot], "w");
+    if(f) { fputs(data, f); fclose(f); }
+    FILE* touch = fopen(_file_paths[slot], "a"); if(touch) fclose(touch);
+    _file_handles[slot] = fopen(_file_paths[slot], "r+");
+}
+
+// file.read() — read entire file contents
+char* file_read_all(long long slot) {
+    if(slot < 0 || slot >= 1024 || !_file_paths[slot]) return strdup("");
+    if(_file_handles[slot]) { fclose(_file_handles[slot]); _file_handles[slot] = NULL; }
+    FILE* f = fopen(_file_paths[slot], "r");
+    if(!f) return strdup("");
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char* buf = malloc(sz + 1);
+    size_t rd = fread(buf, 1, sz, f);
+    buf[rd] = '\0';
+    fclose(f);
+    FILE* touch = fopen(_file_paths[slot], "a"); if(touch) fclose(touch);
+    _file_handles[slot] = fopen(_file_paths[slot], "r+");
+    return buf;
 }
 
 // file.append(data) — add to end of file
@@ -514,20 +574,6 @@ void file_append_all(long long slot, const char* data) {
     fseek(_file_handles[slot], 0, SEEK_END);
     fputs(data, _file_handles[slot]);
     fflush(_file_handles[slot]);
-}
-
-// file.read() — read entire file as string
-char* file_read_all(long long slot) {
-    if(slot < 0 || slot >= 1024 || !_file_handles[slot]) return strdup("");
-    FILE* f = _file_handles[slot];
-    fseek(f, 0, SEEK_SET);
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    rewind(f);
-    char* buf = malloc(sz + 1);
-    size_t rd = fread(buf, 1, sz, f);
-    buf[rd] = '\0';
-    return buf;
 }
 
 // file.readln(n) — read specific line (1-based)
@@ -615,7 +661,176 @@ int file_copy_file(const char* src, const char* dst) {
     fclose(in); fclose(out);
     return 0;
 }
+
+// str.replace(old, new) - replace all occurrences of old with new
+char* str_replace(const char* str, const char* old, const char* new_str) {
+    if(!str || !old) return strdup(str ? str : "");
+    size_t old_len = strlen(old);
+    size_t new_len = strlen(new_str);
+    size_t count = 0;
+    const char* p = str;
+    while((p = strstr(p, old)) != NULL) {
+        count++;
+        p += old_len;
+    }
+    size_t str_len = strlen(str);
+    size_t result_len = str_len + count * (new_len - old_len);
+    char* result = malloc(result_len + 1);
+    if(!result) return strdup("");
+    char* out = result;
+    p = str;
+    while(*p) {
+        if(strncmp(p, old, old_len) == 0) {
+            memcpy(out, new_str, new_len);
+            out += new_len;
+            p += old_len;
+        } else {
+            *out++ = *p++;
+        }
+    }
+    *out = '\0';
+    return result;
+}
+
+// str.slice() - return list of characters
+Box* str_slice(const char* str) {
+    Box* lst = make_list();
+    if(!str) return lst;
+    for(size_t i = 0; str[i]; i++) {
+        char buf[2] = {str[i], '\0'};
+        list_append(lst, box_s(buf));
+    }
+    return lst;
+}
 """
+
+def _prefix_fn_calls(node, prefix, local_fns=None):
+    """Recursively prefix FnCall names with module prefix, but only for functions defined in this module."""
+    from .ast import FnCall, MethodCall, Return, Print, Println, If, While, For, VarDecl, Assign, FieldAssign, Try, FnDef, ClassDef, FileOpen, FileExists, FileDelete, FileRename, FileCopy, FileNew, OsStart, OsRun, OsDrop, FFIBind, Use, Import, Break, Continue, Drop, ThreadCall, ThreadWait, ThreadRunning, BinOp, UnaryOp, Compare, TypeCast, Input, Number, Bool, None_, Str, InterpolatedStr, Var, ListExpr, DictExpr, FieldAccess, ClassInstantiate, FFILoad, FileHandleStmt
+    
+    if local_fns is None:
+        local_fns = set()
+    
+    if isinstance(node, FnCall):
+        if isinstance(node.name, str) and "." not in node.name:
+            # Only prefix if it's a function defined in this module
+            if node.name in local_fns:
+                node.name = f"{prefix}_{node.name}"
+    elif isinstance(node, MethodCall):
+        _prefix_fn_calls(node.obj, prefix, local_fns)
+        for arg in node.args:
+            _prefix_fn_calls(arg, prefix, local_fns)
+    elif isinstance(node, BinOp):
+        _prefix_fn_calls(node.left, prefix, local_fns)
+        _prefix_fn_calls(node.right, prefix, local_fns)
+    elif isinstance(node, UnaryOp):
+        _prefix_fn_calls(node.value, prefix, local_fns)
+    elif isinstance(node, Compare):
+        _prefix_fn_calls(node.left, prefix, local_fns)
+        _prefix_fn_calls(node.right, prefix, local_fns)
+    elif isinstance(node, TypeCast):
+        _prefix_fn_calls(node.expr, prefix, local_fns)
+    elif isinstance(node, Return):
+        _prefix_fn_calls(node.value, prefix, local_fns)
+    elif isinstance(node, Print):
+        _prefix_fn_calls(node.value, prefix, local_fns)
+    elif isinstance(node, Println):
+        _prefix_fn_calls(node.value, prefix, local_fns)
+    elif isinstance(node, If):
+        _prefix_fn_calls(node.cond, prefix, local_fns)
+        for s in node.then_body:
+            _prefix_fn_calls(s, prefix, local_fns)
+        for s in (node.else_body or []):
+            _prefix_fn_calls(s, prefix, local_fns)
+    elif isinstance(node, While):
+        _prefix_fn_calls(node.cond, prefix, local_fns)
+        for s in node.body:
+            _prefix_fn_calls(s, prefix, local_fns)
+    elif isinstance(node, For):
+        for s in node.body:
+            _prefix_fn_calls(s, prefix, local_fns)
+    elif isinstance(node, VarDecl):
+        _prefix_fn_calls(node.value, prefix, local_fns)
+    elif isinstance(node, Assign):
+        if isinstance(node.name, str) and "." not in node.name:
+            if node.name in local_fns:
+                node.name = f"{prefix}_{node.name}"
+        _prefix_fn_calls(node.value, prefix, local_fns)
+    elif isinstance(node, FieldAssign):
+        _prefix_fn_calls(node.obj, prefix, local_fns)
+        _prefix_fn_calls(node.value, prefix, local_fns)
+    elif isinstance(node, Try):
+        for s in node.try_body:
+            _prefix_fn_calls(s, prefix, local_fns)
+        for s in node.error_body:
+            _prefix_fn_calls(s, prefix, local_fns)
+    elif isinstance(node, FnDef):
+        for s in node.body:
+            _prefix_fn_calls(s, prefix, local_fns)
+    elif isinstance(node, ClassDef):
+        for f in node.fields:
+            _prefix_fn_calls(f.value, prefix, local_fns)
+        for m in node.methods:
+            for s in m.body:
+                _prefix_fn_calls(s, prefix, local_fns)
+    elif isinstance(node, FileOpen):
+        _prefix_fn_calls(node.path_expr, prefix, local_fns)
+        for s in node.body:
+            _prefix_fn_calls(s, prefix, local_fns)
+    elif isinstance(node, FileExists):
+        _prefix_fn_calls(node.path_expr, prefix, local_fns)
+    elif isinstance(node, FileDelete):
+        _prefix_fn_calls(node.path_expr, prefix, local_fns)
+    elif isinstance(node, FileRename):
+        _prefix_fn_calls(node.old_path, prefix, local_fns)
+        _prefix_fn_calls(node.new_path, prefix, local_fns)
+    elif isinstance(node, FileCopy):
+        _prefix_fn_calls(node.src_path, prefix, local_fns)
+        _prefix_fn_calls(node.dst_path, prefix, local_fns)
+    elif isinstance(node, FileNew):
+        _prefix_fn_calls(node.path_expr, prefix, local_fns)
+        for s in node.body:
+            _prefix_fn_calls(s, prefix, local_fns)
+    elif isinstance(node, OsStart):
+        _prefix_fn_calls(node.id_expr, prefix, local_fns)
+    elif isinstance(node, OsRun):
+        _prefix_fn_calls(node.id_expr, prefix, local_fns)
+        _prefix_fn_calls(node.cmd_expr, prefix, local_fns)
+        if node.input_expr:
+            _prefix_fn_calls(node.input_expr, prefix, local_fns)
+        if node.struct_args:
+            for k, v in node.struct_args.items():
+                _prefix_fn_calls(v, prefix, local_fns)
+    elif isinstance(node, OsDrop):
+        _prefix_fn_calls(node.id_expr, prefix, local_fns)
+    elif isinstance(node, FFIBind):
+        pass  # FFI bindings don't need prefixing
+    elif isinstance(node, ThreadCall):
+        _prefix_fn_calls(node.func_call, prefix, local_fns)
+        _prefix_fn_calls(node.thread_id, prefix, local_fns)
+    elif isinstance(node, ThreadWait):
+        for tid in node.thread_ids:
+            _prefix_fn_calls(tid, prefix, local_fns)
+    elif isinstance(node, ThreadRunning):
+        _prefix_fn_calls(node.thread_id, prefix, local_fns)
+    elif isinstance(node, FFILoad):
+        _prefix_fn_calls(node.path_expr, prefix, local_fns)
+    elif isinstance(node, FileHandleStmt):
+        for arg in node.args:
+            _prefix_fn_calls(arg, prefix, local_fns)
+    elif isinstance(node, Input):
+        if node.prompt:
+            _prefix_fn_calls(node.prompt, prefix, local_fns)
+    elif isinstance(node, ListExpr):
+        for e in node.elements:
+            _prefix_fn_calls(e, prefix, local_fns)
+    elif isinstance(node, DictExpr):
+        for k, v in node.pairs:
+            _prefix_fn_calls(k, prefix, local_fns)
+            _prefix_fn_calls(v, prefix, local_fns)
+    elif isinstance(node, InterpolatedStr):
+        for part in node.parts:
+            _prefix_fn_calls(part, prefix, local_fns)
 
 def parse_file(filepath, parsed_files, combined_ast, is_main=False):
     abs_path = os.path.abspath(filepath)
@@ -636,11 +851,36 @@ def parse_file(filepath, parsed_files, combined_ast, is_main=False):
     tokens = tokenize(code)
     ast = Parser(tokens).parse()
     
+    # First pass: prefix all names (only for imported files, not main)
     for node in ast:
-        # Prepend module name to avoid naming collisions (only for imported files, not main)
-        if not is_main and isinstance(node, (VarDecl, FnDef, ClassDef)):
-            node.name = f"{mod_name}_{node.name}"
-            
+        if not is_main:
+            if isinstance(node, (VarDecl, FnDef, ClassDef)):
+                node.name = f"{mod_name}_{node.name}"
+            elif isinstance(node, Assign) and not node.name.startswith(mod_name + "_"):
+                node.name = f"{mod_name}_{node.name}"
+            elif isinstance(node, Drop) and not node.name.startswith(mod_name + "_"):
+                node.name = f"{mod_name}_{node.name}"
+    
+    # Collect local function names BEFORE prefixing (for _prefix_fn_calls)
+    local_fns_original = set()
+    for node in ast:
+        if isinstance(node, FnDef):
+            local_fns_original.add(node.name)  # This is the ORIGINAL name before prefixing
+    
+    # Collect local function names AFTER prefixing (for CodeGen)
+    local_fns_prefixed = set()
+    for node in ast:
+        if isinstance(node, FnDef):
+            local_fns_prefixed.add(node.name)  # This is the PREFIXED name
+    
+    # Second pass: prefix function calls inside bodies (only for imported files)
+    if not is_main:
+        for node in ast:
+            if isinstance(node, FnDef):
+                for stmt in node.body:
+                    _prefix_fn_calls(stmt, mod_name, local_fns_original)
+    
+    for node in ast:
         if isinstance(node, Import):
             mod_file = node.module_name.replace(".", os.sep) + ".rub"
             base_dir = os.path.dirname(filepath)
@@ -648,9 +888,9 @@ def parse_file(filepath, parsed_files, combined_ast, is_main=False):
             parse_file(mod_path, parsed_files, combined_ast)
         elif isinstance(node, Use):
             continue
-            
+    
     combined_ast.extend(ast)
-
+    
 def compile_files(source_files, output=None):
     try:
         parsed_files = set()
@@ -675,12 +915,13 @@ def compile_files(source_files, output=None):
 
         try:
             result = subprocess.run(
-                ["clang", ir_path, c_path, "-o", output_bin, "-O2", "-pthread", "-ldl"],
+                ["clang", ir_path, c_path, "-o", output_bin, "-O2", "-pthread", "-ldl", "-lm"],
                 capture_output=True, text=True
             )
         finally:
-            os.unlink(ir_path)
-            os.unlink(c_path)
+            pass
+            # os.unlink(ir_path)
+            # os.unlink(c_path)
 
         if result.returncode != 0:
             print("✖ Compilation failed:")

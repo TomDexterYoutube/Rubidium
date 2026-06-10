@@ -1,4 +1,4 @@
-from ast import *
+from rub_ast import *
 
 class Parser:
     def __init__(self, tokens):
@@ -38,11 +38,11 @@ class Parser:
         """Unified method for parsing variable access, dots, and calls."""
         res = Var(name)
         while self.peek():
-            t = self.peek()
-            if t[0] == "DOT":
-                self.advance()
-                attr = self.match("IDENT")
+            if self.peek()[0] == "DOT":
+                self.advance()  # consume DOT
+                attr = self.match("IDENT")  # consume the IDENT after the dot
                 if self.peek() and self.peek()[0] == "LPAREN":
+                    # Method call: DOT IDENT LPAREN args RPAREN
                     self.match("LPAREN")
                     args = []
                     while self.peek() and self.peek()[0] != "RPAREN":
@@ -51,21 +51,24 @@ class Parser:
                     self.match("RPAREN")
                     res = MethodCall(res, attr, args)
                 else:
+                    # Field access: DOT IDENT
                     res = FieldAccess(res, attr)
-            elif t[0] == "LPAREN":
+            elif self.peek()[0] == "LPAREN":
+                # Call: LPAREN args RPAREN
                 self.match("LPAREN")
                 args = []
                 while self.peek() and self.peek()[0] != "RPAREN":
                     args.append(self.expr())
                     if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                 self.match("RPAREN")
-                
-                # Intercept specialized built-ins
+                # Intercept specialized built-ins for direct calls
                 if isinstance(res, Var):
-                    if res.name == "thread" and len(args) == 2: res = ThreadCall(args[0], args[1])
-                    elif res.name == "input": res = Input(args[0] if args else None)
-                    elif res.name == "file_read" and len(args) == 1: res = FileRead(args[0])
-                    else: res = FnCall(res.name, args)
+                    if res.name == "thread" and len(args) == 2:
+                        res = ThreadCall(args[0], args[1])
+                    elif res.name == "input":
+                        res = Input(args[0] if args else None)
+                    else:
+                        res = FnCall(res.name, args)
                 else:
                     res = FnCall(res, args)
             else:
@@ -148,23 +151,27 @@ class Parser:
     def stmt_list_item(self):
         t = self.peek()
         if t is None: return []
-        if   t[0] == "LET":      return [self.var_decl()]
-        elif t[0] == "PRINT":    return [self.print_stmt()]
-        elif t[0] == "PRINTLN":  return [self.println_stmt()]
-        elif t[0] == "IF":       return [self.if_stmt()]
-        elif t[0] == "WHILE":    return [self.while_stmt()]
-        elif t[0] == "FOR":      return [self.for_stmt()]
-        elif t[0] == "BREAK":    self.match("BREAK"); return [Break()]
-        elif t[0] == "RETURN":   return [self.return_stmt()]
-        elif t[0] == "TRY":      return [self.try_stmt()]
-        elif t[0] == "FN":       return [self.fn_def()]
-        elif t[0] == "OPEN":     return [self.open_stmt()]
-        elif t[0] == "FILE":     
+        if t[0] == "RBRACE": return []
+        if   t[0] == "IMPORT":  return [self.import_stmt()]
+        elif t[0] == "USE":     return [self.use_stmt()]
+        elif t[0] == "LET":     return [self.var_decl()]
+        elif t[0] == "PRINT":   return [self.print_stmt()]
+        elif t[0] == "PRINTLN": return [self.println_stmt()]
+        elif t[0] == "IF":      return [self.if_stmt()]
+        elif t[0] == "WHILE":   return [self.while_stmt()]
+        elif t[0] == "FOR":     return [self.for_stmt()]
+        elif t[0] == "BREAK":   self.match("BREAK"); return [Break()]
+        elif t[0] == "CONTINUE":self.match("CONTINUE"); return [Continue()]
+        elif t[0] == "RETURN":  return [self.return_stmt()]
+        elif t[0] == "TRY":     return [self.try_stmt()]
+        elif t[0] == "FN":      return [self.fn_def()]
+        elif t[0] == "OPEN":    return [self.open_stmt()]
+        elif t[0] == "FILE":    
             result = self.file_global_stmt_list()
             if result is not None:
                 return [result]
             return []
-        elif t[0] == "IDENT" or t[0] == "TYPE":    return [self.ident_stmt()]
+        elif t[0] == "IDENT" or t[0] == "TYPE":   return [self.ident_stmt()]
         else:
             self.advance()
             return []
@@ -195,6 +202,7 @@ class Parser:
     def var_decl(self):
         self.match("LET")
         mut = bool(self.match("MUT"))
+        is_local = bool(self.match("LOCAL"))
         # Accept both IDENT and TYPE tokens for variable names (e.g., "list" is a TYPE but can be a variable name)
         # Also check if this is a file handle variable inside an open() block
         tok = self.peek()
@@ -212,7 +220,7 @@ class Parser:
             vtype = self.match("TYPE")
         self.match("OP")
         value = self.expr()
-        return VarDecl(name, mut, vtype, value)
+        return VarDecl(name, mut, is_local, vtype, value)
 
     def print_stmt(self):
         self.match("PRINT")
@@ -292,7 +300,8 @@ class Parser:
         method = self.match("IDENT")
 
         # If inside an open() block and this matches the handle var, parse as handle method
-        if file_var in self._active_file_handles and method in ("write", "append", "read", "readln", "writeln"):
+        # Also parse as handle method if file_var is "file" (default handle for file.new)
+        if (file_var in self._active_file_handles or file_var == "file") and method in ("write", "append", "add", "read", "readln", "writeln"):
             self.match("LPAREN")
             args = []
             while self.peek() and self.peek()[0] != "RPAREN":
@@ -326,13 +335,14 @@ class Parser:
         elif method == "new":
             path = self.expr()
             self.match("RPAREN")
-            # Optional body block (syntax spec shows no block body for file.new())
             body = []
             if self.peek() and self.peek()[0] == "LBRACE":
                 self.match("LBRACE")
+                self._active_file_handles.add("file")
                 while self.peek() and self.peek()[0] != "RBRACE":
                     body += self.stmt_list_item()
                 self.match("RBRACE")
+                self._active_file_handles.discard("file")
             return FileNew(path, body)
         else:
             return None  # Will be handled as file handle method
@@ -703,7 +713,6 @@ class Parser:
                     if isinstance(res, Var):
                         if res.name == "thread" and len(args) == 2: res = ThreadCall(args[0], args[1])
                         elif res.name == "input": res = Input(args[0] if args else None)
-                        elif res.name == "file_read" and len(args) == 1: res = FileRead(args[0])
                         else: res = FnCall(res.name, args)
                     else:
                         res = FnCall(res, args)
@@ -716,28 +725,29 @@ class Parser:
 
     def _parse_istring_parts(self, raw):
         """Parse an i"..." string body into an InterpolatedStr node.
-        Splits on {identifier} patterns. Each piece is either a Str literal
-        or a Var node (simple variable reference)."""
+        Splits on {varname} or {varname.method()} patterns."""
         import re
         parts = []
-        # Split on {varname} tokens - support simple identifiers only
-        pattern = re.compile(r'\{([a-zA-Z_][a-zA-Z0-9_]*)\}')
+        # Match simple identifiers or method calls (e.g., {name} or {shapes.len()})
+        pattern = re.compile(r'\{([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*\(\))?)\}')
         last = 0
         for m in pattern.finditer(raw):
-            # text before this placeholder
             before = raw[last:m.start()]
             if before:
                 parts.append(Str(before))
-            parts.append(Var(m.group(1)))
+            expr = m.group(1)
+            if '.' in expr:
+                obj_name, method_name = expr.split('.', 1)
+                method_name = method_name.rstrip('()')
+                parts.append(MethodCall(Var(obj_name), method_name, []))
+            else:
+                parts.append(Var(expr))
             last = m.end()
-        # trailing text
         after = raw[last:]
         if after:
             parts.append(Str(after))
-        # If nothing was parsed (no interpolations), just return a plain Str
         if not parts:
             return Str(raw)
-        # If only one part and it's a Str, return it directly
         if len(parts) == 1 and isinstance(parts[0], Str):
             return parts[0]
         return InterpolatedStr(parts)
