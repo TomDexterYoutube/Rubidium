@@ -256,14 +256,14 @@ print(b)   # [999, 2, 3]
 #   *   multiplication
 #   /   division
 #   **  power
-#   */  square root (prefix)
+#   */  root
 
 let a = 10 + 5       # 15
 let b = 10 - 5       # 5
 let c = 10 * 5       # 50
 let d = 10 / 5       # 2
 let e = 2 ** 3       # 8
-let f = */16         # 4
+let f = 2 */ 16      # 4
 
 # Standard BODMAS precedence applies.
 
@@ -341,12 +341,10 @@ print(text.char(0))
 # Output:
 # H
 
-
 print(text.char(4))
 
 # Output:
 # o
-
 
 # Replace a character at an index.
 
@@ -1306,6 +1304,7 @@ fn main() {
 #       * dict  -> keys
 #       * file  -> lines
 #   - Collections use deep copy on assignment
+#   - you can force types like let x: list: i32 = [0, 10, 32]
 
 # Collection Equality:
 #   - Collection equality compares contents
