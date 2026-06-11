@@ -624,6 +624,18 @@ class CodeGen:
                     self.emit(f"  store i64 {val}, i64* {slot}")
             elif self.cur_fn is not None and self.cur_fn != "_rubidium_init":
                 # Inside a regular function (not class method) — keep variables local
+                if is_class:
+                    struct_t = self.class_ir_type(cn)
+                    self.instances[node.name] = cn
+                    self.local_vars_stack[-1][node.name] = f"{struct_t}*"
+                    if node.mutable: self.mutable_vars.add(node.name)
+                    ptr_str = f"%ptr_{node.name}"
+                    if node.name not in self._alloca_emitted:
+                        self.emit(f"  {ptr_str} = alloca {struct_t}*")
+                        self._alloca_emitted.add(node.name)
+                    init_args = node.value.args if isinstance(node.value, (FnCall, ClassInstantiate)) else []
+                    self.emit_class_init(ptr_str, cn, init_args)
+                    return False
                 ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
                 self.local_vars_stack[-1][node.name] = ir_t
                 if node.mutable: self.mutable_vars.add(node.name)
@@ -1997,6 +2009,21 @@ class CodeGen:
                 self.emit(f"  {res} = call %Box* @collection_get(%Box* {col_b}, %Box* {idx_b})")
                 col_b = res
             return col_b, "%Box*"
+
+        # 4.5 Class field access via call syntax: e.g., inv() inside class → loads field "inv"
+        if self.is_class_field(node.name):
+            field_val, field_t = self.emit_field_access(Var("__self"), node.name)
+            # If args provided, treat as collection access on the field
+            if node.args:
+                col_b = self.coerce_to_box(field_val, field_t)
+                for arg in node.args:
+                    idx_v, idx_t = self.emit_expr(arg)
+                    idx_b = self.coerce_to_box(idx_v, idx_t)
+                    res = self.new_tmp()
+                    self.emit(f"  {res} = call %Box* @collection_get(%Box* {col_b}, %Box* {idx_b})")
+                    col_b = res
+                return col_b, "%Box*"
+            return field_val, field_t
 
         # 5. PRIORITY 5: Class instantiation (ClassName())
         if node.name in self.class_defs:

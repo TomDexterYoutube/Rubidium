@@ -255,7 +255,13 @@ class Parser:
 
     def for_stmt(self):
         self.match("FOR")
-        var = self.match("IDENT")
+        # Allow TYPE keywords (index, dict, str, etc.) as loop variable names
+        if self.peek() and self.peek()[0] == "IDENT":
+            var = self.match("IDENT")
+        elif self.peek() and self.peek()[0] == "TYPE":
+            var = self.match("TYPE")
+        else:
+            var = self.match("IDENT")  # will return None and bubble up as parse error
         self.match("IN")
         if self.peek() and self.peek()[0] == "RANGE":
             self.match("RANGE")
@@ -725,11 +731,11 @@ class Parser:
 
     def _parse_istring_parts(self, raw):
         """Parse an i"..." string body into an InterpolatedStr node.
-        Splits on {varname} or {varname.method()} patterns."""
+        Supports {var}, {obj.field}, {obj.method()}, and chained access."""
         import re
         parts = []
-        # Match simple identifiers or method calls (e.g., {name} or {shapes.len()})
-        pattern = re.compile(r'\{([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*\(\))?)\}')
+        # Match: {var}, {obj.field}, {obj.method()}, {a.b.c}, {a.b.c()}
+        pattern = re.compile(r'\{([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*(?:\(\))?)*)\}')
         last = 0
         for m in pattern.finditer(raw):
             before = raw[last:m.start()]
@@ -737,9 +743,14 @@ class Parser:
                 parts.append(Str(before))
             expr = m.group(1)
             if '.' in expr:
-                obj_name, method_name = expr.split('.', 1)
-                method_name = method_name.rstrip('()')
-                parts.append(MethodCall(Var(obj_name), method_name, []))
+                segments = expr.split('.')
+                node = Var(segments[0])
+                for seg in segments[1:]:
+                    if seg.endswith('()'):
+                        node = MethodCall(node, seg[:-2], [])
+                    else:
+                        node = FieldAccess(node, seg)
+                parts.append(node)
             else:
                 parts.append(Var(expr))
             last = m.end()

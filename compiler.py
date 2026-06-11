@@ -226,7 +226,9 @@ void collection_set(Box* col_box, Box* key, Box* val) {
 }
 
 int collection_len(Box* col_box) {
-    if (!col_box || col_box->type != 3) return 0;
+    if (!col_box) return 0;
+    if (col_box->type == 2) return col_box->s ? (int)strlen(col_box->s) : 0;
+    if (col_box->type != 3) return 0;
     void* col = col_box->p;
     if(!col) return 0;
     int* magic = (int*)col;
@@ -260,7 +262,13 @@ int collection_has(Box* col, Box* needle) {
 }
 
 Box* collection_get_at(Box* col_box, int idx) {
-    if (!col_box || col_box->type != 3) return box_i(0);
+    if (!col_box) return box_i(0);
+    if (col_box->type == 2) {
+        if (!col_box->s || idx < 0 || idx >= (int)strlen(col_box->s)) return box_s("");
+        char ch[2] = {col_box->s[idx], '\0'};
+        return box_s(ch);
+    }
+    if (col_box->type != 3) return box_i(0);
     void* col = col_box->p;
     if(!col) return box_i(0);
     int* magic = (int*)col;
@@ -366,7 +374,44 @@ char* box_to_cstr(Box* b) {
     if(b->type==0)      { snprintf(buf, 64, "%lld", b->i); }
     else if(b->type==1) { snprintf(buf, 64, "%g",   b->f); }
     else if(b->type==2) { free(buf); return strdup(b->s ? b->s : ""); }
-    else                { free(buf); buf = malloc(7); strcpy(buf,"<obj>"); }
+    else if(b->type==3 && b->p) {
+        int* magic = (int*)b->p;
+        if(magic && *magic==1) {
+            // List → "[item, item, ...]"
+            RList* l = (RList*)b->p;
+            size_t cap = 256; char* out = malloc(cap); size_t pos = 0;
+            out[pos++] = '[';
+            for(int i=0; i<l->count; i++) {
+                if(i>0) { out[pos++]= ','; out[pos++]=' '; }
+                char* s = box_to_cstr(l->items[i]);
+                size_t slen = strlen(s);
+                while(pos+slen+4 >= cap) { cap*=2; out=realloc(out,cap); }
+                memcpy(out+pos, s, slen); pos+=slen; free(s);
+            }
+            out[pos++] = ']'; out[pos] = '\0';
+            free(buf); return out;
+        } else if(magic && *magic==2) {
+            // Dict → "{key: val, ...}"
+            RDict* d = (RDict*)b->p;
+            size_t cap = 256; char* out = malloc(cap); size_t pos = 0;
+            out[pos++] = '{';
+            for(int i=0; i<d->count; i++) {
+                if(i>0) { out[pos++]=','; out[pos++]=' '; }
+                char* ks = box_to_cstr(d->keys[i]);
+                char* vs = box_to_cstr(d->vals[i]);
+                size_t kl=strlen(ks), vl=strlen(vs);
+                while(pos+kl+vl+4 >= cap) { cap*=2; out=realloc(out,cap); }
+                memcpy(out+pos,ks,kl); pos+=kl;
+                out[pos++]=':'; out[pos++]=' ';
+                memcpy(out+pos,vs,vl); pos+=vl;
+                free(ks); free(vs);
+            }
+            out[pos++] = '}'; out[pos] = '\0';
+            free(buf); return out;
+        }
+        free(buf); buf = malloc(7); strcpy(buf,"<obj>");
+    }
+    else { free(buf); buf = malloc(7); strcpy(buf,"<obj>"); }
     return buf;
 }
 
