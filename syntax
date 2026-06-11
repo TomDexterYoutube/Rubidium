@@ -42,6 +42,118 @@ fn main() {
 # everyone can see and modify it.
 
 # =========================================
+# LANGUAGE PHILOSOPHY
+# =========================================
+
+# Rubidium is designed around simplicity,
+
+# predictability, and explicit behavior.
+
+#
+
+# Many modern languages use garbage collection,
+
+# ownership systems, reference counting,
+
+# borrow checking, or other hidden mechanisms.
+
+#
+
+# Rubidium instead favors rules that are
+
+# visible and easy to reason about.
+
+# -----------------------------------------
+# GLOBAL BY DEFAULT
+# -----------------------------------------
+
+# Variables created normally are placed into
+
+# the global memory pool.
+
+let score = 100
+
+# Global variables can be accessed anywhere.
+
+# Local variables must be declared explicitly.
+
+let local temp = 100
+
+# Local variables never enter the global pool
+
+# and are automatically dropped when their
+
+# scope ends.
+
+# -----------------------------------------
+# ASSIGNMENT ALWAYS COPIES
+# -----------------------------------------
+
+# Assigning one value to another creates a
+
+# complete deep copy.
+
+let a = [1, 2, 3]
+let b = a
+
+# a and b are completely independent.
+
+# Rubidium does not use references,
+
+# borrowing, or shared ownership.
+
+# -----------------------------------------
+# MANUAL MEMORY MANAGEMENT
+# -----------------------------------------
+
+# Memory is never freed automatically except
+
+# for special scoped values.
+
+# Normal variables remain alive until .drop()
+
+# is called.
+
+let data = [1, 2, 3]
+data.drop()
+
+# -----------------------------------------
+# PREDICTABILITY OVER OPTIMIZATION
+# -----------------------------------------
+
+# Rubidium favors behavior that is easy to
+
+# understand over behavior that is heavily
+
+# optimized.
+
+# The language intentionally prioritizes
+
+# clarity and consistency over maximum
+
+# performance.
+
+# -----------------------------------------
+# NULL BEHAVIOR
+# -----------------------------------------
+
+# Null is a valid value for every type.
+
+let value: i32 = Null
+
+# Null is considered smaller than every
+
+# non-null value.
+
+# Conceptually, Null behaves like negative
+
+# infinity.
+
+Null < 0         # True
+Null < -999999   # True
+Null == Null     # True
+
+# =========================================
 # VARIABLES
 # =========================================
 
@@ -77,6 +189,11 @@ a = 20   # ERROR: a is not mutable
 #   Null  — valid for all types, means "exists but empty"
 #   Any   — can hold a value of any type
 
+# Collections:
+#   list
+#   index
+#   dict
+
 let a: i32  = 100
 let b: f64  = 3.14
 let c: str  = "hello"
@@ -85,23 +202,13 @@ let e: i32  = Null
 let f: Any  = "I can be anything!"
 
 # Any can be used when you don't know the type in advance, for functions and return types and such
-# Strings are also indexable for existing
+# Strings are also indexable
 
 let str: str = "Hello, World!"
 
 for i in str.len() {
     print(str.char(i))
 }
-# =========================================
-# NULL
-# =========================================
-
-# Null is a valid value for every type.
-# It means the variable exists but holds no data yet.
-
-let x: i32  = Null
-let name: str  = Null
-let flag: bool = Null
 
 # =========================================
 # TYPE CASTING
@@ -245,7 +352,7 @@ print(text.char(4))
 
 text.set(index, value)
 
-let text = "Hello"
+let mut text = "Hello"
 
 text.set(0, "J")
 
@@ -269,7 +376,7 @@ print(text)
 
 text.insert(index, value)
 
-let text = "Hello"
+let mut text = "Hello"
 
 text.insert(5, "!")
 
@@ -293,7 +400,7 @@ print(text)
 
 text.replace(old, new)
 
-let text = "banana"
+let mut text = "banana"
 
 text.replace("a", "_")
 
@@ -324,6 +431,13 @@ print(text.slice())
 # Output:
 # ["H", "e", "l", "l", "o"]
 
+let text = "Hello"
+
+print(text.len())
+
+# Output:
+# 5
+
 # =========================================
 # COLLECTIONS
 # =========================================
@@ -350,6 +464,19 @@ my_list(0).set("changed")
 # Append a new item using .add():
 
 my_list().add("new_item")
+
+# -----------------------------------------
+# LIST UTILITIES
+# -----------------------------------------
+
+# .combine() joins all values together.
+
+let words = ["Hello", " ", "World"]
+
+print(words.combine())
+
+# Output:
+# Hello World
 
 # -----------------------------------------
 # INDEX
@@ -573,8 +700,6 @@ for number in items {
     print(number)
 }
 
-# for lists you can do .combine and it does [item1 + item2 + item3] internaly then outputs the result 
-
 # -----------------------------------------
 # INDEX ITERATION
 # -----------------------------------------
@@ -652,9 +777,12 @@ for i in range(1, 10) {
 # FUNCTIONS
 # =========================================
 
-# Functions do not create a isolated scope they share the global pool except with imports
-# like main(value: any) that says in the function and its droped when function is finished
+# Functions share the global memory pool.
 
+# Function parameters are local to the function
+# and are automatically dropped when the function returns.
+
+# Imported files are isolated through namespaces.
 # Basic function:
 
 fn greet() {
@@ -769,6 +897,33 @@ class locked() {
 let mut obj = locked()
 obj.value = 99   # ERROR: value is not declared mut
 
+# -----------------------------------------
+# CLASS MEMORY MODEL
+# -----------------------------------------
+
+# Class instances do not store their fields
+# in the global memory pool.
+
+# Each instance owns its own data.
+
+let mut a = player()
+let mut b = player()
+
+a.health = 50
+
+print(b.health) # 100
+
+# Assigning one instance to another creates
+# a complete deep copy.
+
+let mut a = player()
+let mut b = a
+
+b.health = 10
+
+print(a.health) # 100
+print(b.health) # 10
+
 # =========================================
 # THREADING
 # =========================================
@@ -803,7 +958,7 @@ fn run() {
     let still_going: bool = thread.running(1)
 }
 
-# threading creates a scope with spetial rules 
+# Threading creates a scope with special rules.
 
 fn task_one(x) {
     let local y = 10
@@ -817,7 +972,121 @@ fn main() {
     thread(task_one(1), 2)
 }
 
-# with this y is local so each thread would share z but have there own x and y
+# y is local, so each thread shares z but
+# has its own x and y.
+
+# -----------------------------------------
+# THREAD SCOPE RULES
+# -----------------------------------------
+
+# Threads share the global memory pool.
+
+# Any global variable can be read or modified
+
+# by any thread.
+
+let counter = 0
+
+# All threads can access counter.
+
+# -----------------------------------------
+# THREAD-LOCAL DATA
+# -----------------------------------------
+
+# Function parameters and local variables
+
+# belong only to the thread currently
+
+# executing them.
+
+fn worker(id) {
+    let local temp = 10
+
+    print(id)
+    print(temp)
+}
+
+# Every thread receives its own copy of:
+
+#
+
+# - Function parameters
+
+# - Local variables
+
+# - Loop variables
+
+# These values are never shared between
+
+# threads.
+
+# -----------------------------------------
+# SHARED DATA
+# -----------------------------------------
+
+# Global variables are shared.
+
+let total = 0
+
+fn add() {
+    total = total + 1
+}
+
+# If multiple threads modify the same global
+
+# variable at the same time, the result is
+
+# undefined.
+
+# Rubidium provides no automatic race
+
+# condition protection.
+
+# -----------------------------------------
+# AUTOMATIC CLEANUP
+# -----------------------------------------
+
+# When a thread finishes:
+
+#
+
+# - Function parameters are dropped
+
+# - Local variables are dropped
+
+# - Loop variables are dropped
+
+#
+
+# Global variables remain alive.
+
+# -----------------------------------------
+# THREAD MEMORY MODEL
+# -----------------------------------------
+
+# Variable Type       Shared?
+
+#
+
+# Global Variable     Yes
+
+# Function Parameter  No
+
+# Local Variable      No
+
+# Loop Variable       No
+
+# File Handle         No
+
+# Simple rule:
+
+#
+
+# If it is in the global pool, it is shared.
+
+# Otherwise it belongs only to the currently
+
+# executing thread.
 
 # =========================================
 # RANDOM
