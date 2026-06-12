@@ -276,6 +276,8 @@ class CodeGen:
             "declare %Box* @str_slice(i8*)",
             "declare i64 @strtol(i8*, i8**, i32)", "declare i64 @atol(i8*)",
             "declare i8* @strndup(i8*, i64)", "declare i32 @fclose(i8*)",
+            "declare i8* @list_combine(%Box*)",
+            "declare %Box* @box_deep_copy(%Box*)",
             "declare i8* @fopen(i8*, i8*)", "declare i64 @fread(i8*, i64, i64, i8*)",
             "declare i64 @fwrite(i8*, i64, i64, i8*)", "declare i64 @fseek(i8*, i64, i32)",
             "declare i64 @ftell(i8*)", "declare void @rewind(i8*)",
@@ -334,6 +336,15 @@ class CodeGen:
                 patched.append("  call i64 @_rubidium_init()")
                 injected = True
         self.fn_lines = patched
+
+    def _deep_copy_if_var(self, val, val_t, source_node):
+        """Deep copy a %Box* value when the source is an existing variable (not a fresh allocation).
+        Called on VarDecl/Assign to implement the spec's 'every assignment creates a full deep copy' rule."""
+        if val_t == "%Box*" and isinstance(source_node, Var):
+            copied = self.new_tmp()
+            self.emit(f"  {copied} = call %Box* @box_deep_copy(%Box* {val})")
+            return copied
+        return val
 
     def _infer_type(self, node):
         if isinstance(node, Number): return "double" if isinstance(node.value, float) else "i64"
@@ -572,6 +583,7 @@ class CodeGen:
             
             is_class = False
             cn = ""
+            is_class_copy_src = None  # set when source is an existing instance var
             if isinstance(node.value, (ClassInstantiate, FnCall)):
                 raw_cn = node.value.class_name if isinstance(node.value, ClassInstantiate) else (node.value.name if isinstance(node.value.name, str) else "")
                 if raw_cn in self.class_defs:
@@ -580,6 +592,11 @@ class CodeGen:
                 elif f"main_{raw_cn}" in self.class_defs:
                     cn = f"main_{raw_cn}"
                     is_class = True
+            elif isinstance(node.value, Var) and node.value.name in self.instances:
+                # let p2 = p1 where p1 is a class instance — deep copy semantics
+                cn = self.instances[node.value.name]
+                is_class = True
+                is_class_copy_src = node.value.name  # source var to copy from
 
             # Local variables are function-scoped (not global)
             if node.is_local:
@@ -592,6 +609,7 @@ class CodeGen:
                     self._alloca_emitted.add(node.name)
                 val, val_t = self.emit_expr(node.value)
                 val = self.coerce(val, val_t, ir_t)
+                val = self._deep_copy_if_var(val, val_t, node.value)
                 self.emit(f"  store {ir_t} {val}, {ir_t}* {ptr_str}")
                 return False
             if self.cur_fn is not None and self.cur_fn != "_rubidium_init" and self.cur_class is not None:
@@ -603,8 +621,11 @@ class CodeGen:
                     if node.mutable: self.mutable_vars.add(node.name)
                     ptr_str = f"%ptr_{node.name}"
                     self.emit(f"  {ptr_str} = alloca {struct_t}*")
-                    init_args = node.value.args if isinstance(node.value, FnCall) else []
-                    self.emit_class_init(ptr_str, cn, init_args)
+                    if is_class_copy_src:
+                        self.emit_class_copy(ptr_str, cn, is_class_copy_src)
+                    else:
+                        init_args = node.value.args if isinstance(node.value, FnCall) else []
+                        self.emit_class_init(ptr_str, cn, init_args)
                     return False
 
                 ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
@@ -616,6 +637,7 @@ class CodeGen:
                     self._alloca_emitted.add(node.name)
                 val, val_t = self.emit_expr(node.value)
                 val = self.coerce(val, val_t, ir_t)
+                val = self._deep_copy_if_var(val, val_t, node.value)
                 self.emit(f"  store {ir_t} {val}, {ir_t}* {ptr_str}")
                 if isinstance(node.value, FFILoad):
                     slot = f"@_ffi_slot_{node.name}"
@@ -633,8 +655,11 @@ class CodeGen:
                     if node.name not in self._alloca_emitted:
                         self.emit(f"  {ptr_str} = alloca {struct_t}*")
                         self._alloca_emitted.add(node.name)
-                    init_args = node.value.args if isinstance(node.value, (FnCall, ClassInstantiate)) else []
-                    self.emit_class_init(ptr_str, cn, init_args)
+                    if is_class_copy_src:
+                        self.emit_class_copy(ptr_str, cn, is_class_copy_src)
+                    else:
+                        init_args = node.value.args if isinstance(node.value, (FnCall, ClassInstantiate)) else []
+                        self.emit_class_init(ptr_str, cn, init_args)
                     return False
                 ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
                 self.local_vars_stack[-1][node.name] = ir_t
@@ -645,6 +670,7 @@ class CodeGen:
                     self._alloca_emitted.add(node.name)
                 val, val_t = self.emit_expr(node.value)
                 val = self.coerce(val, val_t, ir_t)
+                val = self._deep_copy_if_var(val, val_t, node.value)
                 self.emit(f"  store {ir_t} {val}, {ir_t}* {ptr_str}")
                 if isinstance(node.value, FFILoad):
                     slot = f"@_ffi_slot_{node.name}"
@@ -659,13 +685,17 @@ class CodeGen:
                     if node.mutable: self.mutable_vars.add(node.name)
                     init_args = node.value.args if isinstance(node.value, FnCall) else []
                     ir_name = f"_var_{node.name}" if node.name in ("pow", "sin", "cos", "tan", "sqrt", "log", "log10", "exp", "fabs", "floor", "ceil", "round") else node.name
-                    self.emit_class_init(f"@{ir_name}", cn, init_args)
+                    if is_class_copy_src:
+                        self.emit_class_copy(f"@{ir_name}", cn, is_class_copy_src)
+                    else:
+                        self.emit_class_init(f"@{ir_name}", cn, init_args)
                     return False
                 ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
                 if node.mutable: self.mutable_vars.add(node.name)
                 self.declare_global(node.name, ir_t)
                 val, val_t = self.emit_expr(node.value)
                 val = self.coerce(val, val_t, ir_t)
+                val = self._deep_copy_if_var(val, val_t, node.value)
                 ir_name = f"_var_{node.name}" if node.name in ("pow", "sin", "cos", "tan", "sqrt", "log", "log10", "exp", "fabs", "floor", "ceil", "round") else node.name
                 self.emit(f"  store {ir_t} {val}, {ir_t}* @{ir_name}")
                 if isinstance(node.value, FFILoad):
@@ -689,6 +719,7 @@ class CodeGen:
                 ptr_str, ir_t = self.get_var_ptr(node.name)
                 val, val_t = self.emit_expr(node.value)
                 val = self.coerce(val, val_t, ir_t)
+                val = self._deep_copy_if_var(val, val_t, node.value)
                 self.emit(f"  store {ir_t} {val}, {ir_t}* {ptr_str}")
                 
         elif isinstance(node, FieldAssign): self.emit_field_assign(node)
@@ -711,6 +742,16 @@ class CodeGen:
             if node.method == "add" and isinstance(node.obj, (FnCall, MethodCall)):
                 self.emit_collection_add(node)
                 return False
+            # String mutation: s.set(idx, char) / s.insert(idx, str) / s.replace(old, new)
+            # These return a new string that must be stored back to the variable.
+            if node.method in ("set", "insert", "replace") and isinstance(node.obj, Var):
+                obj_t = self._infer_type(node.obj)
+                if obj_t == "i8*":
+                    obj_val, _ = self.emit_expr(node.obj)
+                    result, _ = self.emit_string_method(obj_val, node.method, node.args)
+                    ptr_str, _ = self.get_var_ptr(node.obj.name)
+                    self.emit(f"  store i8* {result}, i8** {ptr_str}")
+                    return False
             self.emit_method_call_expr(node)
         elif isinstance(node, Drop):
             self.dropped_vars.add(node.name)
@@ -1045,6 +1086,31 @@ class CodeGen:
                     args_ir.append(f"{t} {v}")
             self.emit(f"  call i64 @{mangled}({', '.join(args_ir)})")
 
+    def emit_class_copy(self, ptr_str, class_name, src_var_name):
+        """Deep copy a class instance into ptr_str. Allocates a new struct and copies all fields."""
+        cls = self.class_defs[class_name]
+        struct_t = self.class_ir_type(class_name)
+        src_ptr_ptr, _ = self.get_var_ptr(src_var_name)
+        src_ptr = self.new_tmp()
+        self.emit(f"  {src_ptr} = load {struct_t}*, {struct_t}** {src_ptr_ptr}")
+        size_ptr, size_int, raw_ptr, dst_ptr = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
+        self.emit(f"  {size_ptr} = getelementptr {struct_t}, {struct_t}* null, i64 1")
+        self.emit(f"  {size_int} = ptrtoint {struct_t}* {size_ptr} to i64")
+        self.emit(f"  {raw_ptr} = call i8* @malloc(i64 {size_int})")
+        self.emit(f"  {dst_ptr} = bitcast i8* {raw_ptr} to {struct_t}*")
+        self.emit(f"  store {struct_t}* {dst_ptr}, {struct_t}** {ptr_str}")
+        for i, field in enumerate(cls.fields):
+            ir_t = self.rubi_type_to_ir(field.vtype) if field.vtype else self._infer_type(field.value)
+            src_fptr, dst_fptr, fval = self.new_tmp(), self.new_tmp(), self.new_tmp()
+            self.emit(f"  {src_fptr} = getelementptr {struct_t}, {struct_t}* {src_ptr}, i32 0, i32 {i}")
+            self.emit(f"  {fval} = load {ir_t}, {ir_t}* {src_fptr}")
+            if ir_t == "%Box*":
+                copied = self.new_tmp()
+                self.emit(f"  {copied} = call %Box* @box_deep_copy(%Box* {fval})")
+                fval = copied
+            self.emit(f"  {dst_fptr} = getelementptr {struct_t}, {struct_t}* {dst_ptr}, i32 0, i32 {i}")
+            self.emit(f"  store {ir_t} {fval}, {ir_t}* {dst_fptr}")
+
     def emit_field_assign(self, node):
         obj_name = node.obj.name if hasattr(node.obj, 'name') else node.obj
         if obj_name not in self.instances: return
@@ -1185,11 +1251,11 @@ class CodeGen:
                 else:
                     self.declare_global(node.var, "i64")
                     var_ptr = f"@{node.var}"
-                self.emit(f"  store i64 1, i64* {var_ptr}")
+                self.emit(f"  store i64 0, i64* {var_ptr}")
                 cond_l, body_l, cont_l, end_l = self.new_label("fcond"), self.new_label("fbody"), self.new_label("fcont"), self.new_label("fend")
                 self.emit(f"  br label %{cond_l}\n{cond_l}:")
                 cur, cond = self.new_tmp(), self.new_tmp()
-                self.emit(f"  {cur} = load i64, i64* {var_ptr}\n  {cond} = icmp sle i64 {cur}, {iter_v_64}")
+                self.emit(f"  {cur} = load i64, i64* {var_ptr}\n  {cond} = icmp slt i64 {cur}, {iter_v_64}")
                 self.emit(f"  br i1 {cond}, label %{body_l}, label %{end_l}\n{body_l}:")
                 self.loop_end_stack.append(end_l)
                 self.loop_cond_stack.append(cont_l)
@@ -1259,7 +1325,7 @@ class CodeGen:
         else:
             sv, st = self.emit_expr(node.start); ev, et = self.emit_expr(node.end)
             sv = self.coerce(sv, st, "i64"); ev = self.coerce(ev, et, "i64")
-            
+
             if self.cur_fn is not None and self.cur_fn != "_rubidium_init":
                 var_ptr = f"%ptr_{node.var}"
                 if node.var not in self._alloca_emitted:
@@ -1271,22 +1337,28 @@ class CodeGen:
             else:
                 self.declare_global(node.var, "i64")
                 var_ptr = f"@{node.var}"
-                
+
+            # Determine direction at codegen time: is_up = (start < end)
+            is_up = self.new_tmp()
+            self.emit(f"  {is_up} = icmp slt i64 {sv}, {ev}")
             self.emit(f"  store i64 {sv}, i64* {var_ptr}")
             cond_l, body_l, cont_l, end_l = self.new_label("fcond"), self.new_label("fbody"), self.new_label("fcont"), self.new_label("fend")
             self.emit(f"  br label %{cond_l}\n{cond_l}:")
-            cur, cond = self.new_tmp(), self.new_tmp()
-            self.emit(f"  {cur} = load i64, i64* {var_ptr}\n  {cond} = icmp slt i64 {cur}, {ev}")
+            cur, cur_lt, cur_gt, cond = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
+            self.emit(f"  {cur} = load i64, i64* {var_ptr}")
+            self.emit(f"  {cur_lt} = icmp slt i64 {cur}, {ev}")
+            self.emit(f"  {cur_gt} = icmp sgt i64 {cur}, {ev}")
+            self.emit(f"  {cond} = select i1 {is_up}, i1 {cur_lt}, i1 {cur_gt}")
             self.emit(f"  br i1 {cond}, label %{body_l}, label %{end_l}\n{body_l}:")
             self.loop_end_stack.append(end_l)
             self.loop_cond_stack.append(cont_l)
             self.emit_body(node.body)
             self.loop_cond_stack.pop()
             self.loop_end_stack.pop()
-            # Continue target: increment and go to condition
             self.emit(f"  br label %{cont_l}\n{cont_l}:")
-            inc, cur2 = self.new_tmp(), self.new_tmp()
-            self.emit(f"  {cur2} = load i64, i64* {var_ptr}\n  {inc} = add i64 {cur2}, 1\n  store i64 {inc}, i64* {var_ptr}")
+            step, inc, cur2 = self.new_tmp(), self.new_tmp(), self.new_tmp()
+            self.emit(f"  {step} = select i1 {is_up}, i64 1, i64 -1")
+            self.emit(f"  {cur2} = load i64, i64* {var_ptr}\n  {inc} = add i64 {cur2}, {step}\n  store i64 {inc}, i64* {var_ptr}")
             self.emit(f"  br label %{cond_l}\n{end_l}:")
 
     def _emit_for_file(self, node):
@@ -1832,10 +1904,10 @@ class CodeGen:
             self.emit(f"  {tmp} = call {struct_t}* @_{node.class_name}_new()")
             return tmp, f"{struct_t}*"
         if isinstance(node, MethodCall):
-            if node.method == "set" and isinstance(node.obj, (FnCall, Var)):
+            if node.method == "set" and isinstance(node.obj, FnCall):
                 self.emit_collection_set(node)
                 return "0", "i64"
-            if node.method == "add" and isinstance(node.obj, (FnCall, Var)):
+            if node.method == "add" and isinstance(node.obj, FnCall):
                 self.emit_collection_add(node)
                 return "0", "i64"
             return self.emit_method_call_expr(node)
@@ -2488,6 +2560,12 @@ class CodeGen:
             tmp = self.new_tmp()
             self.emit(f"  {tmp} = call i32 @collection_len(%Box* {obj_val})")
             return tmp, "i32"
+
+        # Collection .combine() — join all items as a string
+        if obj_t == "%Box*" and node.method == "combine" and not node.args:
+            tmp = self.new_tmp()
+            self.emit(f"  {tmp} = call i8* @list_combine(%Box* {obj_val})")
+            return tmp, "i8*"
         
         if obj_t == "i8*":
             # Emit as string method; raises a clear RubidiumNameError on unknown methods
@@ -2797,6 +2875,30 @@ class CodeGen:
         return "0", "i64"
 
     def emit_compare(self, node):
+        # Null comparisons: Null behaves as negative infinity per spec.
+        left_is_null  = isinstance(node.left,  None_)
+        right_is_null = isinstance(node.right, None_)
+        if left_is_null or right_is_null:
+            # Null op Null — always constant fold
+            if left_is_null and right_is_null:
+                result = {"==": True, "!=": False, "<": False, ">": False, "<=": True, ">=": True}[node.op]
+                tmp = self.new_tmp()
+                self.emit(f"  {tmp} = add i1 0, {'1' if result else '0'}")
+                return tmp, "i1"
+            # Null op Literal (Number/Str/Bool/UnaryOp negation) — can constant fold safely
+            non_null = node.right if left_is_null else node.left
+            if isinstance(non_null, (Number, Str, Bool, UnaryOp)):
+                if left_is_null:
+                    result = {"==": False, "!=": True, "<": True, ">": False, "<=": True, ">=": False}[node.op]
+                else:
+                    result = {"==": False, "!=": True, "<": False, ">": True, "<=": False, ">=": True}[node.op]
+                tmp = self.new_tmp()
+                self.emit(f"  {tmp} = add i1 0, {'1' if result else '0'}")
+                return tmp, "i1"
+            # Null op Variable — fall through to runtime comparison.
+            # Variable assigned Null stores 0, so 0 == 0 → True correctly for == and !=.
+            # Note: Null < variable (ordinal) won't work correctly without runtime tagging (see bugs.log).
+
         l, lt = self.emit_expr(node.left); r, rt = self.emit_expr(node.right)
         if lt == "i8*" and rt == "i8*":
             cmp_r, tmp = self.new_tmp(), self.new_tmp()

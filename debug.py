@@ -844,6 +844,7 @@ class StaticAnalyzer:
         self.filepath, self.source_lines = filepath, source_lines
         self.is_main_file = is_main_file
         self.import_stack = import_stack or []
+        self.known_import_modules: set = set()  # modules loaded via import/use statements
 
     def report_error(self, code, msg, line):
         print(f"\033[1;31merror[{code}]\033[0m: {msg}\n \033[1;36m-->\033[0m {self.filepath}:{line}")
@@ -857,14 +858,14 @@ class StaticAnalyzer:
 
     def push_scope(self): self.scopes.append({})
         
-    def pop_scope(self): 
+    def pop_scope(self, is_class_scope=False): 
         popped = self.scopes.pop()
         for var_name, meta in popped.items():
             if not meta.is_read:
                 self.report_warning("W012", f"Unused variable `{var_name}`.", meta.declared_line, hint="Remove this variable if it is not needed.")
-            if meta.is_mut and not meta.is_reassigned and meta.is_initialized:
+            if meta.is_mut and not meta.is_reassigned and meta.is_initialized and not is_class_scope:
                 self.report_warning("W011", f"Variable `{var_name}` does not need to be mutable.", meta.declared_line, hint=f"Change to `let {var_name}`.")
-            if not meta.is_dropped:
+            if not meta.is_dropped and not is_class_scope:
                 self.report_warning("W010", f"Variable `{var_name}` is never dropped.", meta.declared_line, hint=f"Add `{var_name}.drop()` to free memory.")
 
     def declare_var(self, name, meta, line):
@@ -891,7 +892,9 @@ class StaticAnalyzer:
         if isinstance(expr, Literal):
             if expr.token.kind == 'NUMBER': return "Float" if '.' in expr.token.value else "Int"
             if expr.token.kind == 'STRING': return "String"
-            if expr.token.kind == 'BOOL': return "Bool"
+            if expr.token.kind == 'BOOL':
+                if expr.value is None: return "Unknown"  # Null literal — valid for all types
+                return "Bool"
             if expr.token.kind == 'TYPE': return "Int" if expr.value.startswith('i') else ("Float" if expr.value.startswith('f') else "Unknown")
         elif isinstance(expr, InterpolatedStr): return "String"
         elif isinstance(expr, Identifier):
@@ -986,7 +989,11 @@ class StaticAnalyzer:
             if target_file in self.import_stack:
                 self.report_error("E063", f"Circular import detected: `{target_file}`", node.line)
             else:
-                pass # Loading logic omitted for brevity; this ensures circular detection works
+                # Register the module namespace in the known-modules set so that
+                # module.func() calls don't produce false E002 "not in scope" errors.
+                # We don't put it in the variable scope to avoid spurious W010/E041.
+                mod_name = node.module.value
+                self.known_import_modules.add(mod_name)
 
         elif isinstance(node, FunctionDef):
             self.current_return_type = self.get_type_category(node.return_type) if node.return_type else "Void"
@@ -1017,7 +1024,7 @@ class StaticAnalyzer:
         elif isinstance(node, ClassDef):
             self.push_scope()
             self.visit_block(node.body)
-            self.pop_scope()
+            self.pop_scope(is_class_scope=True)
 
         elif isinstance(node, IfStmt):
             self.check_expr(node.condition, node.line)
@@ -1041,6 +1048,24 @@ class StaticAnalyzer:
             self.loop_depth += 1
             prev_unreachable = self.unreachable
             self.push_scope(); self.visit_block(node.body); self.pop_scope()
+            self.unreachable = prev_unreachable
+            self.loop_depth -= 1
+
+        elif isinstance(node, ForStmt):
+            # Mark iterable as read (fixes W012 for vars only used in for loops)
+            if node.iterable is not None:
+                self.check_expr(node.iterable, node.line)
+            self.loop_depth += 1
+            prev_unreachable = self.unreachable
+            self.push_scope()
+            # Declare loop variable as local, immutable, initialized, auto-dropped at scope end
+            if node.item:
+                self.declare_var(node.item.value, VarMetadata(False, node.line, "Unknown", True), node.line)
+                # Mark it as read immediately to suppress W012 (loop vars are implicitly used)
+                lv_meta = self.get_var(node.item.value)
+                if lv_meta: lv_meta.is_read = True
+            self.visit_block(node.body)
+            self.pop_scope()
             self.unreachable = prev_unreachable
             self.loop_depth -= 1
 
@@ -1149,7 +1174,10 @@ class StaticAnalyzer:
             if not meta:
                 # Check if it's a builtin module (time, random, thread, os, file)
                 if expr.token.value in ("time", "random", "thread", "os", "file"):
-                    return  # Module identifier, valid
+                    return  # Built-in module identifier, valid
+                # Check if it's a module loaded via import/use
+                if expr.token.value in self.known_import_modules:
+                    return  # Imported module namespace, valid
                 if expr.token.value not in self.builtins and expr.token.value not in self.global_functions and expr.token.value not in self.classes:
                     self.report_error("E002", f"Cannot find `{expr.token.value}` in scope", expr.token.line)
             else:
@@ -1187,6 +1215,15 @@ class StaticAnalyzer:
                 if isinstance(expr.obj, Identifier):
                     m = self.get_var(expr.obj.token.value)
                     if m: m.is_reassigned = True
+                elif isinstance(expr.obj, FunctionCall):
+                    # obj(key).set() or obj().add() — trace back to the collection variable
+                    m = self.get_var(expr.obj.name.value)
+                    if m: m.is_reassigned = True
+            # random.shuffle(items) marks the first argument as mutated
+            if expr.method.value == "shuffle" and expr.args:
+                if isinstance(expr.args[0], Identifier):
+                    m = self.get_var(expr.args[0].token.value)
+                    if m: m.is_reassigned = True
             
             if expr.method.value != "drop":
                 if b_type == "String" and expr.method.value not in ("len", "has", "to", "combine", "char", "set", "insert", "replace", "slice", "contains"):
@@ -1213,6 +1250,11 @@ class StaticAnalyzer:
                 c_name = b_type[6:-1]
                 if c_name in self.classes and expr.prop.value not in self.classes[c_name].properties:
                     self.report_error("E092", f"Property `{expr.prop.value}` not found on class `{c_name}`", current_line)
+
+        elif isinstance(expr, InterpolatedStr):
+            for part in expr.parts:
+                if isinstance(part, Identifier):
+                    self.check_expr(part, current_line)
 
         elif isinstance(expr, BinaryOp):
             self.check_expr(expr.left, current_line)

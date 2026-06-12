@@ -170,6 +170,37 @@ Box* list_get(void* col, Box* idx) {
 
 typedef struct { int magic; Box** keys; Box** vals; int count; int cap; } RDict;
 Box* make_dict() { RDict* d=malloc(sizeof(RDict)); d->magic=2; d->count=0; d->cap=8; d->keys=malloc(8*sizeof(Box*)); d->vals=malloc(8*sizeof(Box*)); return box_p(d); }
+
+// Recursive deep copy — creates a fully independent clone of any Box value.
+// Called on every variable assignment to satisfy the spec's deep-copy semantics.
+Box* box_deep_copy(Box* src) {
+    if(!src) return box_i(0);
+    if(src->type==0) return box_i(src->i);
+    if(src->type==1) return box_f(src->f);
+    if(src->type==2) return box_s(src->s ? src->s : "");
+    if(src->type!=3 || !src->p) { Box* b=malloc(sizeof(Box)); b->type=0; b->i=0; return b; }
+    int* magic = (int*)src->p;
+    if(*magic==1) {
+        RList* sl = (RList*)src->p;
+        RList* dl = malloc(sizeof(RList));
+        dl->magic=1; dl->count=sl->count; dl->cap=sl->count>0?sl->count:1;
+        dl->items = malloc(dl->cap * sizeof(Box*));
+        for(int i=0;i<sl->count;i++) dl->items[i]=box_deep_copy(sl->items[i]);
+        return box_p(dl);
+    }
+    if(*magic==2) {
+        RDict* sd = (RDict*)src->p;
+        RDict* dd = malloc(sizeof(RDict));
+        dd->magic=2; dd->count=sd->count; dd->cap=sd->count>0?sd->count:1;
+        dd->keys=malloc(dd->cap*sizeof(Box*)); dd->vals=malloc(dd->cap*sizeof(Box*));
+        for(int i=0;i<sd->count;i++) {
+            dd->keys[i]=box_deep_copy(sd->keys[i]);
+            dd->vals[i]=box_deep_copy(sd->vals[i]);
+        }
+        return box_p(dd);
+    }
+    return src;
+}
 int box_eq(Box* a, Box* b) {
     if(!a || !b || a->type!=b->type) return 0;
     if(a->type==0) return a->i==b->i;
@@ -415,8 +446,26 @@ char* box_to_cstr(Box* b) {
     return buf;
 }
 
-// -------------------------------------------------------
-// OS MODULE — hidden shell sessions per ID
+// list.combine() — joins all list items as strings with no separator
+char* list_combine(Box* col_box) {
+    if(!col_box || col_box->type != 3) return strdup("");
+    int* magic = (int*)col_box->p;
+    if(!magic || *magic != 1) return strdup("");
+    RList* l = (RList*)col_box->p;
+    size_t cap = 256;
+    char* out = malloc(cap);
+    size_t pos = 0;
+    for(int i = 0; i < l->count; i++) {
+        char* s = box_to_cstr(l->items[i]);
+        size_t slen = strlen(s);
+        while(pos + slen + 1 >= cap) { cap *= 2; out = realloc(out, cap); }
+        memcpy(out + pos, s, slen);
+        pos += slen;
+        free(s);
+    }
+    out[pos] = '\0';
+    return out;
+}
 // -------------------------------------------------------
 #include <unistd.h>
 #include <sys/wait.h>
