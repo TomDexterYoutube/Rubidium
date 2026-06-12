@@ -1264,8 +1264,23 @@ fn main() {
 #   - Accessing dropped memory causes a runtime error
 #   - Loop variables are automatically dropped when the loop ends
 #   - File handles are automatically dropped when an open() block ends
+#   - Global memory must be freed manually with .drop()
+#   - Temporary scoped values are dropped automatically
 #   - Null is a valid value for all types (exists but empty)
-#   - null == null is true
+#   - Null == Null is True
+
+
+# Global Variables:
+#   - Variables declared without local enter the global memory pool
+#   - Global variables remain alive until dropped
+#   - Global variables are accessible from functions and threads
+#   - Global variables may be shadowed by local variables
+
+# Assignment:
+#   - Assignment copies values
+#   - Assignment never creates references
+#   - Assignment never transfers ownership
+#   - Assignment always creates an independent value
 
 # Scope:
 #   - Variables created at the top level are visible everywhere
@@ -1273,6 +1288,43 @@ fn main() {
 #   - Function parameters exist only for the lifetime of the function
 #   - Classes create their own scope
 #   - Imported files create their own namespace
+#   - Symbols are resolved from the nearest scope outward
+#   - Local scope always takes priority over global scope
+
+# Functions:
+#   - Function names must be unique within a scope
+#   - Duplicate function definitions cause compile errors
+#   - Function overloading is not supported
+#   - Functions may access global variables
+#   - Parameters follow local-variable rules
+
+# Variable Creation & Assignment:
+#   - Variables must be created using let
+#   - Assignment without let modifies an existing variable
+#   - Attempting to assign to a variable that does not exist causes a compile error
+#   - let cannot be used to modify an existing variable
+#   - Creating a duplicate variable in the same scope causes a compile error
+
+# Mutability:
+#   - Variables are immutable by default
+#   - Variables must be declared with mut to allow reassignment
+#   - Attempting to modify a non-mut variable causes a compile error
+#   - Mutability rules apply equally to globals, locals, class fields, and parameters
+
+# Shadowing:
+#   - Local variables may use the same name as global variables
+#   - This is called shadowing
+#   - When shadowed, the global variable becomes inaccessible
+#   - All reads and writes affect the local variable
+#   - When the local variable is dropped, access returns to the global variable
+#   - There is no syntax to access a hidden global variable while a local shadow exists
+
+# Function Parameters:
+#   - Function parameters behave as local variables
+#   - Parameters may shadow global variables
+#   - Parameters are automatically dropped when the function returns
+#   - Parameters follow normal mutability rules
+#   - Parameters do not enter the global memory pool
 
 # Types:
 #   - Type checking happens at compile time
@@ -1282,6 +1334,8 @@ fn main() {
 #   - Unknown or missing symbols raise compile errors (error if fn/class not found)
 #   - Reassignment rules depend on mut (non-mut = compile error)
 #   - Not all errors are runtime; many are compile-time by design
+#   - Variables, functions, classes, and namespaces must have unique names within a scope
+#   - Duplicate symbol definitions cause compile errors
 
 # Null:
 #   - Null represents an existing value with no data
@@ -1304,13 +1358,13 @@ fn main() {
 #       * dict  -> keys
 #       * file  -> lines
 #   - Collections use deep copy on assignment
-#   - you can force types like let x: list: i32 = [0, 10, 32]
+#   - You can force collection types: let x: list: i32 = [0, 10, 32]
 
 # Collection Equality:
 #   - Collection equality compares contents
 #   - Two collections with identical contents are equal
 #   - Equality is checked recursively
-#   - null values inside collections are valid and comparable
+#   - Null values inside collections are valid and comparable
 
 # Strings:
 #   - Strings are zero indexed
@@ -1345,12 +1399,16 @@ fn main() {
 #   - Keys can be any type (not just strings)
 
 # Classes:
+#   - Class names must be unique within a scope
+#   - Duplicate class definitions cause compile errors
 #   - Class instances follow normal deep-copy rules
 #   - Assigning one instance to another creates a full copy
 #   - Class fields marked mut may be modified
 #   - Non-mut fields cannot be modified
 #   - No "self" keyword; fields are accessed directly
 #   - Methods operate on instance state implicitly
+#   - No self parameter is required
+#   - Class fields may be accessed directly from inside class methods
 #   - Attempting to modify locked fields causes compile error
 
 # Threads:
@@ -1359,6 +1417,13 @@ fn main() {
 #   - No race-condition protection is provided
 #   - Invalid memory access causes runtime error
 #   - Thread IDs are required for control and synchronization
+#   - Global variables are shared by all threads
+#   - Function parameters are private to the executing thread
+#   - Local variables are private to the executing thread
+#   - Loop variables are private to the executing thread
+#   - Shadowing rules work the same inside threads
+#   - Accessing a global variable inside a thread accesses the shared global variable
+#   - Modifying shared globals from multiple threads may produce undefined results
 
 # Imports:
 #   - use enables built-in modules
@@ -1373,11 +1438,32 @@ fn main() {
 #   - File operations support try/error handling
 #   - File iteration yields lines only inside open scope
 
-# Errors (new clarified behavior):
-#   - Some errors are compile-time (missing fn/class, bad types)
-#   - Some are runtime (invalid memory access, invalid indexing)
-#   - mut violations cause compile errors
-#   - Accessing null behaves as valid but empty state
+# Errors:
+#   - Compile errors prevent the program from running
+#   - Runtime errors occur during execution
+#
+# Compile Error Examples:
+#   - Unknown variable
+#   - Unknown function
+#   - Unknown class
+#   - Unknown namespace
+#   - Type mismatch
+#   - Mutability violation
+#   - Duplicate symbol definition
+#   - Invalid assignment target
+#
+# Runtime Error Examples:
+#   - Divide by zero
+#   - Invalid index access
+#   - Missing collection key
+#   - Accessing dropped memory
+#   - Invalid file operations
+#   - Invalid FFI calls
+#
+# General Rules:
+#   - Attempting to modify a non-mut value causes a compile error
+#   - Accessing null behaves as a valid but empty state
+#   - Missing symbols are detected at compile time when possible
 
 # Local Variables:
 #   - Declared using 'local'
@@ -1388,3 +1474,14 @@ fn main() {
 #   - May shadow global variables
 #   - Do not enter the global pool
 #   - Follow normal mutability rules
+
+# Integer Overflow:
+#   - Integer overflow does not stop program execution
+#   - When an operation exceeds the maximum value of a type,
+#     the result is clamped to the maximum value
+#   - When an operation exceeds the minimum value of a type,
+#     the result is clamped to the minimum value
+#   - An overflow runtime error is raised
+#   - Program execution continues after the error
+#   - Overflow errors are reported once per operation
+#   - The clamped result is stored before execution continues
