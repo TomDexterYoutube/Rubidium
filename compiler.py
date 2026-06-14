@@ -42,6 +42,15 @@ double _timer_starts[1024];
 double _timer_accum[1024];
 int _timer_running[1024];
 
+// Wall-clock time in seconds (clock() measures CPU time, which does NOT advance
+// during sleep() — timers must use wall-clock time per spec: "Read elapsed time
+// in seconds" should reflect real elapsed time including time.wait()/sleep()).
+static double _wall_time() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
 __attribute__((constructor)) void init_runtime() {
     _stdin_ptr = (void*)stdin;
     _main_thread_id = pthread_self();
@@ -317,25 +326,25 @@ Box* collection_get_at(Box* col_box, int idx) {
 // Timer functions
 void time_timer_start(int tid, double type_hint) {
     if(tid >= 0 && tid < 1024) {
-        _timer_starts[tid] = clock() / (double)CLOCKS_PER_SEC;
+        _timer_starts[tid] = _wall_time();
+        _timer_accum[tid] = 0.0;
         _timer_running[tid] = 1;
     }
 }
 
 void time_timer_pause(int tid) {
     if(tid >= 0 && tid < 1024 && _timer_running[tid]) {
-        double now = clock() / (double)CLOCKS_PER_SEC;
+        double now = _wall_time();
         _timer_accum[tid] += now - _timer_starts[tid];
         _timer_running[tid] = 0;
     }
 }
 
+// Stop a timer — resets it (per spec), unlike pause which keeps elapsed time.
 void time_timer_stop(int tid) {
     if(tid >= 0 && tid < 1024) {
-        if(_timer_running[tid]) {
-            double now = clock() / (double)CLOCKS_PER_SEC;
-            _timer_accum[tid] += now - _timer_starts[tid];
-        }
+        _timer_accum[tid] = 0.0;
+        _timer_starts[tid] = _wall_time();
         _timer_running[tid] = 0;
     }
 }
@@ -344,7 +353,7 @@ double time_timer_read(int tid) {
     double result = 0.0;
     if(tid >= 0 && tid < 1024) {
         if(_timer_running[tid]) {
-            double now = clock() / (double)CLOCKS_PER_SEC;
+            double now = _wall_time();
             result = _timer_accum[tid] + (now - _timer_starts[tid]);
         } else {
             result = _timer_accum[tid];

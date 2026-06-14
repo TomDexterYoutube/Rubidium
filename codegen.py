@@ -372,6 +372,11 @@ class CodeGen:
             if isinstance(node.obj, Var) and f"{obj_name}_{node.method}" in self.functions:
                 fn = self.functions[f"{obj_name}_{node.method}"]
                 return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
+
+            # FFI bindings: c_lib.my_c_func -> method name alone is the bound symbol
+            if isinstance(node.obj, Var) and node.method in self.functions and obj_name not in self.instances:
+                fn = self.functions[node.method]
+                return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
             
             if obj_name in self.instances:
                 class_name = self.instances[obj_name]
@@ -2169,14 +2174,14 @@ class CodeGen:
         if obj_name in self._file_handle_vars:
             return self.emit_file_handle_method(obj_name, node.method, node.args)
 
-        # 0a. Handle thread.wait and thread.running on thread handle variables
-        if node.method == "wait":
+        # 0a. Handle thread.wait and thread.running on the 'thread' module
+        if obj_name == "thread" and node.method == "wait":
             for texpr in node.args:
                 tid_v, tid_t = self.emit_expr(texpr)
                 tid_v = self.coerce(tid_v, tid_t, "i64")
                 self.emit(f"  call void @_thread_smart_wait(i64 {tid_v})")
             return "0", "i64"
-        if node.method == "running":
+        if obj_name == "thread" and node.method == "running":
             tid_v, tid_t = self.emit_expr(node.args[0])
             tid_v = self.coerce(tid_v, tid_t, "i64")
             result = self.new_tmp()
@@ -3010,7 +3015,15 @@ class CodeGen:
         if t == "%Box*":
             self.emit(f"  {tmp} = call i8* @box_to_cstr(%Box* {val})")
             return tmp
-        if t in ("i1", "i32", "i64"):
+        if t == "i1":
+            true_lbl, true_len = self.intern_str("True")
+            false_lbl, false_len = self.intern_str("False")
+            true_ptr = self.new_tmp(); false_ptr = self.new_tmp(); sel_ptr = self.new_tmp()
+            self.emit(f"  {true_ptr} = getelementptr [{true_len} x i8], [{true_len} x i8]* {true_lbl}, i64 0, i64 0")
+            self.emit(f"  {false_ptr} = getelementptr [{false_len} x i8], [{false_len} x i8]* {false_lbl}, i64 0, i64 0")
+            self.emit(f"  {sel_ptr} = select i1 {val}, i8* {true_ptr}, i8* {false_ptr}")
+            return sel_ptr
+        if t in ("i32", "i64"):
             fmt_lbl, flen = self.intern_str("%lld")
             fmt_ptr = self.new_tmp()
             self.emit(f"  {buf} = call i8* @malloc(i64 32)")

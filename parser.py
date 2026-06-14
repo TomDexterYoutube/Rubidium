@@ -731,29 +731,49 @@ class Parser:
 
     def _parse_istring_parts(self, raw):
         """Parse an i"..." string body into an InterpolatedStr node.
-        Supports {var}, {obj.field}, {obj.method()}, and chained access."""
-        import re
+        Each {...} segment is parsed as a full Rubidium expression (supports
+        variables, field/method chains, indexing like {items(0)}, arithmetic
+        like {age + 10}, comparisons like {age > 3}, etc.). If the contents of
+        a {...} don't form a single valid expression, it's left as literal text."""
+        from lexer import tokenize
         parts = []
-        # Match: {var}, {obj.field}, {obj.method()}, {a.b.c}, {a.b.c()}
-        pattern = re.compile(r'\{([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*(?:\(\))?)*)\}')
-        last = 0
-        for m in pattern.finditer(raw):
-            before = raw[last:m.start()]
-            if before:
-                parts.append(Str(before))
-            expr = m.group(1)
-            if '.' in expr:
-                segments = expr.split('.')
-                node = Var(segments[0])
-                for seg in segments[1:]:
-                    if seg.endswith('()'):
-                        node = MethodCall(node, seg[:-2], [])
-                    else:
-                        node = FieldAccess(node, seg)
-                parts.append(node)
-            else:
-                parts.append(Var(expr))
-            last = m.end()
+        i, last, n = 0, 0, len(raw)
+        while i < n:
+            if raw[i] == '{':
+                # Find the matching '}', tracking () [] nesting so calls/indexing work
+                depth, j = 0, i + 1
+                while j < n:
+                    c = raw[j]
+                    if c in '([': depth += 1
+                    elif c in ')]':
+                        if depth == 0: break
+                        depth -= 1
+                    elif c == '{': depth += 1
+                    elif c == '}':
+                        if depth == 0: break
+                        depth -= 1
+                    j += 1
+                if j < n and raw[j] == '}':
+                    inner = raw[i+1:j]
+                    node = None
+                    if inner.strip():
+                        try:
+                            sub_tokens = tokenize(inner)
+                            sub_parser = Parser(sub_tokens)
+                            candidate = sub_parser.expr()
+                            if sub_parser.pos == len(sub_tokens):
+                                node = candidate
+                        except Exception:
+                            node = None
+                    if node is not None:
+                        before = raw[last:i]
+                        if before:
+                            parts.append(Str(before))
+                        parts.append(node)
+                        last = j + 1
+                        i = j + 1
+                        continue
+            i += 1
         after = raw[last:]
         if after:
             parts.append(Str(after))
