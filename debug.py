@@ -818,6 +818,7 @@ class VarMetadata:
         self.type_cat = type_cat
         self.is_initialized = is_initialized
         self.is_dropped = False
+        self.is_auto_dropped = False  # True for loop vars, fn params, error vars — auto-freed by runtime
         self.is_reassigned = False 
         self.is_read = False       
 
@@ -865,7 +866,7 @@ class StaticAnalyzer:
                 self.report_warning("W012", f"Unused variable `{var_name}`.", meta.declared_line, hint="Remove this variable if it is not needed.")
             if meta.is_mut and not meta.is_reassigned and meta.is_initialized and not is_class_scope:
                 self.report_warning("W011", f"Variable `{var_name}` does not need to be mutable.", meta.declared_line, hint=f"Change to `let {var_name}`.")
-            if not meta.is_dropped and not is_class_scope:
+            if not meta.is_dropped and not is_class_scope and not meta.is_auto_dropped:
                 self.report_warning("W010", f"Variable `{var_name}` is never dropped.", meta.declared_line, hint=f"Add `{var_name}.drop()` to free memory.")
 
     def declare_var(self, name, meta, line):
@@ -1002,7 +1003,9 @@ class StaticAnalyzer:
             
             self.push_scope()
             for p_name, p_type in node.params:
-                self.declare_var(p_name, VarMetadata(False, node.line, self.get_type_category(p_type), True), node.line)
+                p_meta = VarMetadata(False, node.line, self.get_type_category(p_type), True)
+                p_meta.is_auto_dropped = True  # params are auto-freed when function returns
+                self.declare_var(p_name, p_meta, node.line)
             self.visit_block(node.body)
             self.pop_scope()
             
@@ -1060,10 +1063,10 @@ class StaticAnalyzer:
             self.push_scope()
             # Declare loop variable as local, immutable, initialized, auto-dropped at scope end
             if node.item:
-                self.declare_var(node.item.value, VarMetadata(False, node.line, "Unknown", True), node.line)
-                # Mark it as read immediately to suppress W012 (loop vars are implicitly used)
-                lv_meta = self.get_var(node.item.value)
-                if lv_meta: lv_meta.is_read = True
+                lv_meta = VarMetadata(False, node.line, "Unknown", True)
+                lv_meta.is_auto_dropped = True  # loop vars are auto-freed at loop end
+                lv_meta.is_read = True           # suppress W012 — loop vars are implicitly used
+                self.declare_var(node.item.value, lv_meta, node.line)
             self.visit_block(node.body)
             self.pop_scope()
             self.unreachable = prev_unreachable
@@ -1090,7 +1093,9 @@ class StaticAnalyzer:
             self.unreachable = prev_unreachable
             
             self.push_scope()
-            self.declare_var("error", VarMetadata(False, node.line, "String", True), node.line)
+            err_meta = VarMetadata(False, node.line, "String", True)
+            err_meta.is_auto_dropped = True  # error var is auto-freed at end of error block
+            self.declare_var("error", err_meta, node.line)
             self.visit_block(node.error_body)
             self.pop_scope()
             self.unreachable = prev_unreachable

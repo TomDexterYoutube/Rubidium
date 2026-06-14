@@ -141,6 +141,13 @@ class CodeGen:
     # Integer IR types are exact LLVM widths (iN).
     # Float types: f32→float, f64→double, f128+→fp128
     # (LLVM only has native float/double/fp128; f256+ map to fp128)
+    # Null sentinel: INT32_MIN (-2147483648). Chosen because sign-extension/truncation
+    # preserves this exact value across ALL int widths (i32..i2048), so a Null stored
+    # in an i32 var compares equal to a Null stored in an i64 var. Per spec, Null
+    # behaves as -infinity (smaller than any non-null value) — see syntax NULL BEHAVIOR.
+    _NULL_SENTINEL = "-2147483648"
+    _NULL_SENTINEL_FLOAT = "0xFFF0000000000000"  # IEEE -infinity, exact across float/double
+
     _INT_IR = {"i32": "i32", "i64": "i64", "i128": "i128",
                "i256": "i256", "i512": "i512", "i1024": "i1024", "i2048": "i2048"}
     _FLT_IR = {"f32": "float", "f64": "double",
@@ -490,7 +497,13 @@ class CodeGen:
         elif isinstance(node, While):
             for s in node.body: self._collect_global(s)
         elif isinstance(node, For):
-            self.declare_global(node.var, "i64" if not node.iterable else "%Box*")
+            if not node.iterable:
+                ir_t = "i64"
+            elif isinstance(node.iterable, MethodCall) and node.iterable.method == "len":
+                ir_t = "i64"
+            else:
+                ir_t = "%Box*"
+            self.declare_global(node.var, ir_t)
             for s in node.body: self._collect_global(s)
         elif isinstance(node, Try):
             for s in node.try_body: self._collect_global(s)
@@ -1115,6 +1128,17 @@ class CodeGen:
         obj_name = node.obj.name if hasattr(node.obj, 'name') else node.obj
         if obj_name not in self.instances: return
         class_name = self.instances[obj_name]
+
+        # Mutation rules (see syntax CLASSES section):
+        # - If the instance itself is not declared 'mut', nothing can be changed.
+        # - If the instance is 'mut', only fields declared 'mut' inside the class can change.
+        if obj_name != "__self" and obj_name not in self.mutable_vars:
+            raise RubidiumTypeError(f"Cannot assign to field '{node.field}': instance '{obj_name}' is not mutable")
+        cls = self.class_defs[class_name]
+        field_def = next((f for f in cls.fields if f.name == node.field), None)
+        if field_def is not None and not field_def.mutable:
+            raise RubidiumTypeError(f"Cannot assign to field '{node.field}': field is not declared 'mut' in class '{class_name}'")
+
         idx, ir_t  = self.field_index(class_name, node.field)
         struct_t   = self.class_ir_type(class_name)
         
@@ -1777,7 +1801,7 @@ class CodeGen:
             if isinstance(node.value, float): return f"{node.value:.17e}", "double"
             return str(int(node.value)), "i64"
         if isinstance(node, Bool): return ("1" if node.value else "0"), "i1"
-        if isinstance(node, None_): return "0", "i64"
+        if isinstance(node, None_): return self._NULL_SENTINEL, "i64"
         if isinstance(node, Str):
             lbl, blen = self.intern_str(node.value); ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{blen} x i8], [{blen} x i8]* {lbl}, i64 0, i64 0')
@@ -2016,22 +2040,53 @@ class CodeGen:
             # Store handle: _thread_handles[tid]
             h_ptr = self.new_tmp()
             self.emit(f"  {h_ptr} = getelementptr [1024 x i64], [1024 x i64]* @_thread_handles, i64 0, i64 {tid_v}")
-            # Build a wrapper: emit a trampoline that calls the function with no args via pthread
+
             fn_name = func_call_node.name if isinstance(func_call_node, FnCall) else str(func_call_node)
+            call_args = func_call_node.args if isinstance(func_call_node, FnCall) else []
+            fn_def = self.functions.get(fn_name)
+            param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_def.params] if (fn_def and fn_def.params) else []
+            ret_ir = self.rubi_type_to_ir(fn_def.ret_type) if (fn_def and fn_def.ret_type) else "i64"
             tramp = f"_tramp_{fn_name}"
+
+            # Marshal arguments (if any) into a heap-allocated struct for the trampoline
+            if call_args and param_types:
+                struct_t = "{" + ", ".join(param_types) + "}"
+                size_ptr, size_int, raw_ptr, struct_ptr = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
+                self.emit(f"  {size_ptr} = getelementptr {struct_t}, {struct_t}* null, i64 1")
+                self.emit(f"  {size_int} = ptrtoint {struct_t}* {size_ptr} to i64")
+                self.emit(f"  {raw_ptr} = call i8* @malloc(i64 {size_int})")
+                self.emit(f"  {struct_ptr} = bitcast i8* {raw_ptr} to {struct_t}*")
+                for i, (arg, pt) in enumerate(zip(call_args, param_types)):
+                    av, at = self.emit_expr(arg)
+                    av = self.coerce(av, at, pt)
+                    fptr = self.new_tmp()
+                    self.emit(f"  {fptr} = getelementptr {struct_t}, {struct_t}* {struct_ptr}, i32 0, i32 {i}")
+                    self.emit(f"  store {pt} {av}, {pt}* {fptr}")
+                arg_ptr_for_create = raw_ptr
+            else:
+                arg_ptr_for_create = "null"
+
             if tramp not in self.functions:
-                # defer trampoline emission until after the current function
-                self._pending_trampolines += [
-                    f"define i8* @{tramp}(i8* %_ignored) {{",
-                    "entry:",
-                    f"  call i64 @{fn_name}()",
-                    "  ret i8* null",
-                    "}", ""
-                ]
+                tramp_lines = [f"define i8* @{tramp}(i8* %_arg) {{", "entry:"]
+                if call_args and param_types:
+                    struct_t = "{" + ", ".join(param_types) + "}"
+                    tramp_lines.append(f"  %s = bitcast i8* %_arg to {struct_t}*")
+                    call_arg_strs = []
+                    for i, pt in enumerate(param_types):
+                        tramp_lines.append(f"  %fp{i} = getelementptr {struct_t}, {struct_t}* %s, i32 0, i32 {i}")
+                        tramp_lines.append(f"  %v{i} = load {pt}, {pt}* %fp{i}")
+                        call_arg_strs.append(f"{pt} %v{i}")
+                    tramp_lines.append(f"  call {ret_ir} @{fn_name}({', '.join(call_arg_strs)})")
+                    tramp_lines.append(f"  call void @free(i8* %_arg)")
+                else:
+                    tramp_lines.append(f"  call {ret_ir} @{fn_name}()")
+                tramp_lines += ["  ret i8* null", "}", ""]
+                self._pending_trampolines += tramp_lines
                 self.functions[tramp] = FnDef(tramp, [], None, [])
+
             tramp_ptr = self.new_tmp()
             self.emit(f"  {tramp_ptr} = bitcast i8* (i8*)* @{tramp} to i8* (i8*)*")
-            self.emit(f"  call i32 @pthread_create(i64* {h_ptr}, i64* null, i8* (i8*)* {tramp_ptr}, i8* null)")
+            self.emit(f"  call i32 @pthread_create(i64* {h_ptr}, i64* null, i8* (i8*)* {tramp_ptr}, i8* {arg_ptr_for_create})")
             return "0", "i64"
 
         if node.name == "thread_wait":
@@ -3009,9 +3064,9 @@ class CodeGen:
 
         if to_t == "%Box*": return self.coerce_to_box(val, from_t)
 
-        # ---- i8* (string) special case: 0 (Null) converts to null pointer ----
+        # ---- i8* (string) special case: 0 or Null sentinel converts to null pointer ----
         if to_t == "i8*" and from_t in self._INT_IR_SET:
-            if val == "0":
+            if val == "0" or val == self._NULL_SENTINEL:
                 return "null"
             self.emit(f"  {tmp} = inttoptr {from_t} {val} to i8*")
             return tmp
@@ -3038,6 +3093,8 @@ class CodeGen:
 
         # ---- Integer → Float ----
         if from_t in self._INT_IR_SET and to_t in self._FLOAT_IR_SET:
+            if val == self._NULL_SENTINEL and to_t in ("float", "double"):
+                return self._NULL_SENTINEL_FLOAT
             self.emit(f"  {tmp} = sitofp {from_t} {val} to {to_t}"); return tmp
 
         # ---- Float → Integer ----
