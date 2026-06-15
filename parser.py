@@ -218,6 +218,12 @@ class Parser:
             vtype = self.match("TYPE")
         elif self.peek() and self.peek()[0] == "TYPE":
             vtype = self.match("TYPE")
+        # Optional element-type annotation for collections: let x: list: i32 = [0,10,32]
+        # The element type is informational only (collections are dynamically boxed
+        # at runtime regardless), but the syntax must still parse correctly.
+        if vtype in ("list", "index", "dict") and self.peek() and self.peek()[0] == "COLON":
+            self.match("COLON")
+            self.match("TYPE")
         self.match("OP")
         value = self.expr()
         return VarDecl(name, mut, is_local, vtype, value)

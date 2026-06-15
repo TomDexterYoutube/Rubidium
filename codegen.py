@@ -37,6 +37,7 @@ declare void @collection_set(%Box*, %Box*, %Box*)
 declare void @print_boxed(%Box*)
 declare i8* @box_to_cstr(%Box*)
 declare i32 @collection_len(%Box*)
+declare i32 @box_equal(%Box*, %Box*)
 declare %Box* @collection_get_at(%Box*, i32)
 declare void @box_drop(%Box*)
 declare %Box* @box_copy(%Box*)
@@ -172,6 +173,14 @@ class CodeGen:
         # Fallback: already an IR type (e.g. "i64" from internal use)
         if t in self._TYPE_RANK: return t
         return "i64"
+
+    def _ffi_type_to_ir(self, t):
+        """Like rubi_type_to_ir, but for FFI signatures. 'Any' here means an opaque
+        C pointer or int-sized value (e.g. GLFWwindow*, int) — mapping it to
+        Rubidium's %Box* (an internal boxed-value struct pointer) would be an ABI
+        mismatch with the foreign function, which knows nothing about Boxes."""
+        if t == "Any": return "i64"
+        return self.rubi_type_to_ir(t)
 
     def promote_type(self, a, b):
         """Return the higher-ranked IR type for mixed-width arithmetic."""
@@ -374,9 +383,10 @@ class CodeGen:
                 return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
 
             # FFI bindings: c_lib.my_c_func -> method name alone is the bound symbol
-            if isinstance(node.obj, Var) and node.method in self.functions and obj_name not in self.instances:
+            # (also covers chained namespace access, e.g. wrap.glfw.glfwInit())
+            if node.method in self.functions and obj_name not in self.instances:
                 fn = self.functions[node.method]
-                return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
+                return self._ffi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
             
             if obj_name in self.instances:
                 class_name = self.instances[obj_name]
@@ -830,6 +840,16 @@ class CodeGen:
             pass  # module activation — tracked at parse time, no IR needed
         return False
 
+    def _check_collection_mutable(self, curr):
+        """Per spec (NOTES/Collections): 'Collections require mut to be modified'.
+        `curr` is the resolved base of a chained collection access (a Var, a plain
+        variable-name string, or an inner expression node for class-field/nested
+        cases, which are checked elsewhere — e.g. BUG-018 for class fields)."""
+        name = curr.name if isinstance(curr, Var) else (curr if isinstance(curr, str) else None)
+        if name is not None and not self.is_class_field(name):
+            if name not in self.mutable_vars:
+                raise RubidiumTypeError(f"Cannot modify '{name}': collection is not declared 'mut'")
+
     def emit_collection_set(self, method_call_node):
         access_node = method_call_node.obj
         val_node = method_call_node.args[0]
@@ -864,6 +884,7 @@ class CodeGen:
                 keys = curr.args + keys
             curr = curr.obj if isinstance(curr, MethodCall) else curr.name
             
+        self._check_collection_mutable(curr)
         # Handle Var that is a class field (e.g., scores inside a class method)
         if isinstance(curr, Var) and self.is_class_field(curr.name):
             col_v, col_t = self.emit_field_access(Var("__self"), curr.name)
@@ -958,6 +979,7 @@ class CodeGen:
                 keys = curr.args + keys
             curr = curr.obj if isinstance(curr, MethodCall) else curr.name
         
+        self._check_collection_mutable(curr)
         # Handle Var that is a class field (e.g., scores inside a class method)
         if isinstance(curr, Var) and self.is_class_field(curr.name):
             col_v, col_t = self.emit_field_access(Var("__self"), curr.name)
@@ -1740,8 +1762,8 @@ class CodeGen:
         We store the binding so calling symbol(args) works normally afterwards.
         """
         # Build param IR types
-        param_ir_types = [self.rubi_type_to_ir(pt) for _, pt in node.params]
-        ret_ir = self.rubi_type_to_ir(node.ret_type) if node.ret_type else "i64"
+        param_ir_types = [self._ffi_type_to_ir(pt) for _, pt in node.params]
+        ret_ir = self._ffi_type_to_ir(node.ret_type) if node.ret_type else "i64"
         fn_ptr_t = f"{ret_ir} ({', '.join(param_ir_types)})*" if param_ir_types else f"{ret_ir} ()*"
         fn_name = node.symbol_name
         params_ir = ", ".join(f"{pt} %p{i}" for i, pt in enumerate(param_ir_types))
@@ -2561,12 +2583,18 @@ class CodeGen:
 
             # FFI bindings: c_lib.my_c_func -> method name alone is the bound symbol
             if node.method in self.functions:
+                fn_def = self.functions[node.method]
                 args_ir = []
-                for a in node.args:
-                    v, t = self.emit_expr(a); args_ir.append(f"{t} {v}")
+                for i, a in enumerate(node.args):
+                    v, t = self.emit_expr(a)
+                    if i < len(fn_def.params):
+                        target_t = self._ffi_type_to_ir(fn_def.params[i][1])
+                        v = self.coerce(v, t, target_t)
+                        t = target_t
+                    args_ir.append(f"{t} {v}")
                 tmp = self.new_tmp()
-                fn_ret = self.functions[node.method].ret_type
-                ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else "i64"
+                fn_ret = fn_def.ret_type
+                ret_ir = self._ffi_type_to_ir(fn_ret) if fn_ret else "i64"
                 self.emit(f"  {tmp} = call {ret_ir} @{node.method}({', '.join(args_ir)})")
                 return tmp, ret_ir
 
@@ -2960,6 +2988,13 @@ class CodeGen:
             # Note: Null < variable (ordinal) won't work correctly without runtime tagging (see bugs.log).
 
         l, lt = self.emit_expr(node.left); r, rt = self.emit_expr(node.right)
+        # Collection equality (list/index/dict) — compare contents recursively
+        if lt == "%Box*" and rt == "%Box*" and node.op in ("==", "!="):
+            eq_i32, tmp = self.new_tmp(), self.new_tmp()
+            self.emit(f"  {eq_i32} = call i32 @box_equal(%Box* {l}, %Box* {r})")
+            pred = "ne" if node.op == "==" else "eq"
+            self.emit(f"  {tmp} = icmp {pred} i32 {eq_i32}, 0")
+            return tmp, "i1"
         if lt == "i8*" and rt == "i8*":
             cmp_r, tmp = self.new_tmp(), self.new_tmp()
             self.emit(f"  {cmp_r} = call i32 @strcmp(i8* {l}, i8* {r})")

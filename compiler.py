@@ -174,11 +174,58 @@ Box* list_get(void* col, Box* idx) {
     if(!col) return box_i(0);
     RList* l=col; int i=idx->i; /* 0-based indexing */
     if(i>=0 && i<l->count) return l->items[i];
-    return box_i(0);
+    fprintf(stderr, "Runtime Error: list index %d out of bounds (length %d)\n", i, l->count);
+    exit(1);
 }
 
 typedef struct { int magic; Box** keys; Box** vals; int count; int cap; } RDict;
 Box* make_dict() { RDict* d=malloc(sizeof(RDict)); d->magic=2; d->count=0; d->cap=8; d->keys=malloc(8*sizeof(Box*)); d->vals=malloc(8*sizeof(Box*)); return box_p(d); }
+
+// Recursive content equality for any Box value, including nested list/index/dict
+// collections. Per spec: "Collection equality compares contents... checked
+// recursively... identical contents are equal" regardless of insertion order
+// for index/dict (key->value maps), and element-by-element for lists.
+int box_equal(Box* a, Box* b) {
+    if (a == b) return 1;
+    if (!a || !b) return 0;
+    if (a->type != b->type) return 0;
+    switch (a->type) {
+        case 0: return a->i == b->i;
+        case 1: return a->f == b->f;
+        case 2:
+            if (!a->s || !b->s) return a->s == b->s;
+            return strcmp(a->s, b->s) == 0;
+        case 3: {
+            if (!a->p || !b->p) return a->p == b->p;
+            int magic_a = *(int*)a->p;
+            int magic_b = *(int*)b->p;
+            if (magic_a != magic_b) return 0;
+            if (magic_a == 1) {
+                RList* la = (RList*)a->p; RList* lb = (RList*)b->p;
+                if (la->count != lb->count) return 0;
+                for (int i = 0; i < la->count; i++) {
+                    if (!box_equal(la->items[i], lb->items[i])) return 0;
+                }
+                return 1;
+            } else if (magic_a == 2) {
+                RDict* da = (RDict*)a->p; RDict* db = (RDict*)b->p;
+                if (da->count != db->count) return 0;
+                for (int i = 0; i < da->count; i++) {
+                    int found = 0;
+                    for (int j = 0; j < db->count; j++) {
+                        if (box_equal(da->keys[i], db->keys[j]) && box_equal(da->vals[i], db->vals[j])) {
+                            found = 1; break;
+                        }
+                    }
+                    if (!found) return 0;
+                }
+                return 1;
+            }
+            return a->p == b->p;
+        }
+    }
+    return 0;
+}
 
 // Recursive deep copy — creates a fully independent clone of any Box value.
 // Called on every variable assignment to satisfy the spec's deep-copy semantics.
@@ -233,7 +280,8 @@ Box* dict_get(void* col, Box* k) {
     if(!col) return box_i(0);
     RDict* d=col;
     for(int i=0;i<d->count;i++) if(box_eq(d->keys[i],k)) return d->vals[i];
-    return box_i(0);
+    fprintf(stderr, "Runtime Error: key not found in collection\n");
+    exit(1);
 }
 
 Box* collection_get(Box* col_box, Box* key) {
