@@ -38,6 +38,7 @@ declare void @print_boxed(%Box*)
 declare i8* @box_to_cstr(%Box*)
 declare i32 @collection_len(%Box*)
 declare i32 @box_equal(%Box*, %Box*)
+declare %Box* @str_split(i8*, i8*)
 declare %Box* @collection_get_at(%Box*, i32)
 declare void @box_drop(%Box*)
 declare %Box* @box_copy(%Box*)
@@ -399,7 +400,10 @@ class CodeGen:
             if node.method == "char": return "i8*"
             if node.method in ("contains", "has"): return "i1"
             if node.method == "combine": return "i8*"
-            if node.method == "slice": 
+            if node.method in ("concat", "set", "insert", "replace"): return "i8*"
+            if node.method in ("to_int", "to_str"): return "i64"
+            if node.method == "split": return "%Box*"
+            if node.method == "slice":
                 if len(node.args) == 0:
                     return "%Box*"
                 return "i8*"
@@ -1992,6 +1996,19 @@ class CodeGen:
         return val, ir_t
 
     def emit_call_expr(self, node):
+        # Chained collection access: nested(0)(1) parses as FnCall(FnCall("nested",[0]),[1])
+        # Evaluate the inner call first, then do collection_get for the outer args.
+        if not isinstance(node.name, str):
+            col_v, col_t = self.emit_expr(node.name)
+            col_b = self.coerce_to_box(col_v, col_t)
+            for arg in node.args:
+                idx_v, idx_t = self.emit_expr(arg)
+                idx_b = self.coerce_to_box(idx_v, idx_t)
+                res = self.new_tmp()
+                self.emit(f"  {res} = call %Box* @collection_get(%Box* {col_b}, %Box* {idx_b})")
+                col_b = res
+            return col_b, "%Box*"
+
         if isinstance(node.name, str):
             node.name = node.name.replace(".", "_")
 
@@ -2618,9 +2635,9 @@ class CodeGen:
         
         # Handle .to() for numeric types (i64, i32, f64, f32, etc.)
         if node.method == "to" and obj_t in ("i32", "i64", "i1", "float", "double"):
-            if len(args) == 1:
+            if len(node.args) == 1:
                 # Check if arg is a Var with type-looking name (str, i32, etc.)
-                arg = args[0]
+                arg = node.args[0]
                 if hasattr(arg, 'name') and arg.name in ("i32", "i64", "i128", "i256", "i512", "i1024", "i2048", "f32", "f64", "f128", "f256", "f512", "f1024", "f2048", "str", "bool"):
                     target_type = arg.name
                 elif hasattr(arg, 'value'):
@@ -2654,6 +2671,23 @@ class CodeGen:
             tmp = self.new_tmp()
             self.emit(f"  {tmp} = call i8* @list_combine(%Box* {obj_val})")
             return tmp, "i8*"
+
+        # String methods on Box*-typed variables (global scope): unbox to i8* first
+        # Exception: numeric-returning methods on numeric Boxes must unbox via i64, not i8*
+        known_str_methods_on_box = ("len", "to_int", "contains", "slice", "split",
+                                    "concat", "combine", "has", "to", "char",
+                                    "set", "insert", "replace")
+        if obj_t == "%Box*" and node.method in known_str_methods_on_box:
+            if node.method in ("to_int", "to") and (not node.args or self._ffi_type_to_ir(
+                    getattr(node.args[0], 'name', getattr(node.args[0], 'value', 'i64'))
+                ) in self._INT_IR_SET):
+                # Numeric unbox path: Box* → i64 directly
+                i64_tmp = self.new_tmp()
+                self.emit(f"  {i64_tmp} = call i64 @unbox_i(%Box* {obj_val})")
+                return i64_tmp, "i64"
+            unboxed = self.new_tmp()
+            self.emit(f"  {unboxed} = call i8* @box_to_cstr(%Box* {obj_val})")
+            return self.emit_string_method(unboxed, node.method, node.args)
         
         if obj_t == "i8*":
             # Emit as string method; raises a clear RubidiumNameError on unknown methods
@@ -2677,9 +2711,8 @@ class CodeGen:
             ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else "i64"
             self.emit(f"  {tmp} = call {ret_ir} @{target_name}({', '.join(args_ir)})")
             return tmp, ret_ir
-        node.name = target_name
-        node.obj = None
-        return self.emit_call_expr(node)
+        from rub_ast import FnCall as _FnCall
+        return self.emit_call_expr(_FnCall(target_name, node.args))
 
     def emit_string_method(self, obj_val, method, args):
         if method == "len":
@@ -2752,15 +2785,11 @@ class CodeGen:
             self.emit(f"  call i8* @strcat(i8* {buf}, i8* {other})")
             return buf, "i8*"
         if method == "split" and len(args) == 1:
-            delim, _ = self.emit_expr(args[0])
-            tok_ptr = self.new_tmp()
-            self.emit(f"  {tok_ptr} = call i8* @strstr(i8* {obj_val}, i8* {delim})")
-            result, dist, o_int, t_int = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
-            self.emit(f"  {o_int}  = ptrtoint i8* {obj_val} to i64")
-            self.emit(f"  {t_int}  = ptrtoint i8* {tok_ptr} to i64")
-            self.emit(f"  {dist}   = sub i64 {t_int}, {o_int}")
-            self.emit(f"  {result} = call i8* @strndup(i8* {obj_val}, i64 {dist})")
-            return result, "i8*"
+            delim_v, delim_t = self.emit_expr(args[0])
+            delim_v = self.coerce(delim_v, delim_t, "i8*")
+            result = self.new_tmp()
+            self.emit(f"  {result} = call %Box* @str_split(i8* {obj_val}, i8* {delim_v})")
+            return result, "%Box*"
         if method == "combine" and len(args) == 1:
             other, _ = self.emit_expr(args[0])
             llen, rlen, total, total2, buf = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()

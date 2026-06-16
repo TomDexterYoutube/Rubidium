@@ -471,12 +471,12 @@ class Parser:
             self.match("AND"); left = BinOp(left, "and", self.comparison())
         return left
     def comparison(self):
-        left = self.cast_expr()
+        left = self.arithmetic()
         while self.peek() and self.peek()[1] in ("==","!=","<",">","<=",">="):
-            op = self.match("OP"); left = Compare(left, op, self.cast_expr())
+            op = self.match("OP"); left = Compare(left, op, self.arithmetic())
         return left
     def cast_expr(self):
-        left = self.arithmetic()
+        left = self.factor()
         while self.peek() and self.peek()[0] == "AS":
             self.match("AS"); left = TypeCast(left, self.match("TYPE"))
         return left
@@ -486,13 +486,13 @@ class Parser:
             op = self.match("OP"); left = BinOp(left, op, self.term())
         return left
     def term(self):
-        left = self.factor()
+        left = self.cast_expr()
         while self.peek() and self.peek()[1] in ("*","/","**"):
             op = self.match("OP")
             if op == "**":
-                left = BinOp(left, "**", self.factor())
+                left = BinOp(left, "**", self.cast_expr())
             else:
-                left = BinOp(left, op, self.factor())
+                left = BinOp(left, op, self.cast_expr())
         return left
 
     def factor(self):

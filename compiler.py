@@ -163,6 +163,26 @@ void list_append(Box* lst, Box* b) {
     if(l->count==l->cap){l->cap*=2; l->items=realloc(l->items,l->cap*sizeof(Box*));} 
     l->items[l->count++]=b; 
 }
+// Split a string by a delimiter — returns a Box* list of string Box* parts.
+Box* str_split(char* src, char* delim) {
+    Box* result = make_list();
+    if (!src || !delim || !delim[0]) {
+        list_append(result, box_s(src ? src : ""));
+        return result;
+    }
+    int dlen = (int)strlen(delim);
+    char* cur = src;
+    char* found;
+    while ((found = strstr(cur, delim)) != NULL) {
+        int partlen = (int)(found - cur);
+        char* part = strndup(cur, partlen);
+        list_append(result, box_s(part));
+        free(part);
+        cur = found + dlen;
+    }
+    list_append(result, box_s(cur));
+    return result;
+}
 void list_swap(Box* lst, int i, int j) {
     if(!lst) return;
     RList* l=lst->p;
