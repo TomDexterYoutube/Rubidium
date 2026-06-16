@@ -22,6 +22,16 @@ class Parser:
             return tok[1]
         return None
 
+    def match_attr(self):
+        """Match any token as a method/field name after a dot.
+        Keywords like 'range', 'int', 'float', 'type' are valid method names
+        when they follow a dot (e.g. random.range, random.int, random.float)."""
+        tok = self.peek()
+        if tok:
+            self.advance()
+            return tok[1]
+        return None
+
     def parse(self):
         stmts = []
         while self.peek():
@@ -40,7 +50,7 @@ class Parser:
         while self.peek():
             if self.peek()[0] == "DOT":
                 self.advance()  # consume DOT
-                attr = self.match("IDENT")  # consume the IDENT after the dot
+                attr = self.match_attr()  # consume the IDENT after the dot
                 if self.peek() and self.peek()[0] == "LPAREN":
                     # Method call: DOT IDENT LPAREN args RPAREN
                     self.match("LPAREN")
@@ -374,7 +384,7 @@ class Parser:
         # Handle thread.wait(1, 2) -> ThreadWait / thread.running(1) -> ThreadRunning
         if name == "thread" and self.peek() and self.peek()[0] == "DOT":
             self.match("DOT")
-            attr = self.match("IDENT")
+            attr = self.match_attr()
             if attr == "wait":
                 self.match("LPAREN")
                 ids = []
@@ -414,13 +424,13 @@ class Parser:
             id_expr = self.expr()
             self.match("RPAREN")
             self.match("DOT")
-            method = self.match("IDENT")
+            method = self.match_attr()
             if method == "drop":
                 return OsDrop(id_expr)
             raise SyntaxError(f"Unknown os() method: {method}")
         # os.start(...) or os.run(...)
         self.match("DOT")
-        method = self.match("IDENT")
+        method = self.match_attr()
         if method == "start":
             self.match("LPAREN")
             id_expr = self.expr()
@@ -564,7 +574,7 @@ class Parser:
             # Allow method chaining on string literals: "foo".len(), "foo".combine(...)
             while self.peek() and self.peek()[0] == "DOT":
                 self.match("DOT")
-                attr = self.match("IDENT")
+                attr = self.match_attr()
                 if self.peek() and self.peek()[0] == "LPAREN":
                     self.match("LPAREN")
                     args = []
@@ -595,7 +605,7 @@ class Parser:
             res = Var(var_name)
             while self.peek() and self.peek()[0] == "DOT":
                 self.match("DOT")
-                attr = self.match("IDENT")
+                attr = self.match_attr()
                 if self.peek() and self.peek()[0] == "LPAREN":
                     self.match("LPAREN")
                     args = []
@@ -622,7 +632,7 @@ class Parser:
             while self.peek():
                 if self.peek()[0] == "DOT":
                     self.match("DOT")
-                    attr = self.match("IDENT")
+                    attr = self.match_attr()
                     if self.peek() and self.peek()[0] == "LPAREN":
                         self.match("LPAREN")
                         args = []
@@ -663,7 +673,7 @@ class Parser:
             if name == "os" and self.peek() and self.peek()[0] == "DOT":
                 saved = self.pos
                 self.match("DOT")
-                method = self.match("IDENT")
+                method = self.match_attr()
                 if method == "run":
                     self.match("LPAREN")
                     if self.peek() and self.peek()[0] == "LBRACE":
@@ -684,7 +694,7 @@ class Parser:
             if name == "thread" and self.peek() and self.peek()[0] == "DOT":
                 saved_pos = self.pos
                 self.match("DOT")
-                attr = self.match("IDENT")
+                attr = self.match_attr()
                 if attr == "wait":
                     self.match("LPAREN")
                     ids = []
@@ -703,7 +713,7 @@ class Parser:
             while self.peek():
                 if self.peek()[0] == "DOT":
                     self.match("DOT")
-                    attr = self.match("IDENT")
+                    attr = self.match_attr()
                     if self.peek() and self.peek()[0] == "LPAREN":
                         self.match("LPAREN")
                         args = []

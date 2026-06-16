@@ -604,14 +604,27 @@ char* os_run(long long id, const char* cmd, const char* input) {
 
     OsTerminal* t = &_os_terminals[id];
 
-    // Write command + newline
-    write(t->stdin_fd, cmd, strlen(cmd));
-    write(t->stdin_fd, "\n", 1);
-    // If there's interactive input to send, write it after a short delay
+    // Write command + newline.
+    // When input is provided, use printf 'INPUT' | CMD so the child process
+    // gets a self-contained closed stdin — prevents it lingering and consuming
+    // subsequent os.run commands as its own stdin.
     if(input && strlen(input)>0) {
-        usleep(200000);
-        write(t->stdin_fd, input, strlen(input));
-        if(input[strlen(input)-1]!='\n') write(t->stdin_fd, "\n", 1);
+        size_t ilen = strlen(input);
+        char* escaped = malloc(ilen*4+4);
+        size_t ei = 0;
+        for(size_t k=0; k<ilen; k++) {
+            if(input[k]=='\'') { escaped[ei++]='\''; escaped[ei++]='\\'; escaped[ei++]='\''; escaped[ei++]='\''; }
+            else escaped[ei++] = input[k];
+        }
+        escaped[ei] = '\0';
+        size_t clen = strlen(cmd);
+        char* full = malloc(clen + ei + 32);
+        sprintf(full, "printf '%%s' '%s' | %s\n", escaped, cmd);
+        write(t->stdin_fd, full, strlen(full));
+        free(escaped); free(full);
+    } else {
+        write(t->stdin_fd, cmd, strlen(cmd));
+        write(t->stdin_fd, "\n", 1);
     }
 
     // Collect output with timeout

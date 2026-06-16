@@ -422,7 +422,8 @@ class CodeGen:
                 return "i64"
             if obj_name == "random":
                 if node.method == "choice": return "%Box*"
-                return "i64"  # shuffle returns void/0
+                if node.method == "float": return "double"
+                return "i64"  # int, range, shuffle, seed all return i64/void
             # File handle methods (inside open() block)
             if obj_name in self._file_handle_vars:
                 if node.method in ("read", "readln"): return "i8*"
@@ -2432,6 +2433,40 @@ class CodeGen:
                 return tmp, "double"
 
         if obj_name == "random":
+            if node.method in ("int", "range"):
+                # random.int(min, max) / random.range(min, max) → i64 in [min, max]
+                lo_v, lo_t = self.emit_expr(node.args[0])
+                hi_v, hi_t = self.emit_expr(node.args[1])
+                lo_v = self.coerce(lo_v, lo_t, "i64")
+                hi_v = self.coerce(hi_v, hi_t, "i64")
+                r_raw, span, r_mod, result = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
+                self.emit(f"  {r_raw} = call i32 @rand()")
+                r_64 = self.new_tmp()
+                self.emit(f"  {r_64} = zext i32 {r_raw} to i64")
+                self.emit(f"  {span} = sub i64 {hi_v}, {lo_v}")
+                span1 = self.new_tmp()
+                self.emit(f"  {span1} = add i64 {span}, 1")
+                self.emit(f"  {r_mod} = srem i64 {r_64}, {span1}")
+                self.emit(f"  {result} = add i64 {r_mod}, {lo_v}")
+                return result, "i64"
+
+            if node.method == "float":
+                # random.float(min, max) → double in [min, max)
+                lo_v, lo_t = self.emit_expr(node.args[0])
+                hi_v, hi_t = self.emit_expr(node.args[1])
+                lo_v = self.coerce(lo_v, lo_t, "double")
+                hi_v = self.coerce(hi_v, hi_t, "double")
+                r_raw = self.new_tmp(); r_d = self.new_tmp(); rand_max = self.new_tmp()
+                scaled = self.new_tmp(); span = self.new_tmp(); mul = self.new_tmp(); result = self.new_tmp()
+                self.emit(f"  {r_raw} = call i32 @rand()")
+                self.emit(f"  {r_d} = sitofp i32 {r_raw} to double")
+                self.emit(f"  {rand_max} = sitofp i32 2147483647 to double")
+                self.emit(f"  {scaled} = fdiv double {r_d}, {rand_max}")
+                self.emit(f"  {span} = fsub double {hi_v}, {lo_v}")
+                self.emit(f"  {mul} = fmul double {scaled}, {span}")
+                self.emit(f"  {result} = fadd double {lo_v}, {mul}")
+                return result, "double"
+
             if node.method == "shuffle":
                 # random.shuffle(list) — Fisher-Yates shuffle on collection
                 col_v, col_t = self.emit_expr(node.args[0])
