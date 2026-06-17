@@ -2013,6 +2013,28 @@ class CodeGen:
         if isinstance(node.name, str):
             node.name = node.name.replace(".", "_")
 
+        # 1b. Class method calling another method of the SAME class (no 'self' keyword
+        #     per spec — bare call like heal(40) inside use_potion resolves to
+        #     _ClassName_heal(__self, 40) automatically).
+        if self.cur_class:
+            ir_method = self.method_ir_name(self.cur_class, node.name)
+            if ir_method in self.functions:
+                struct_t = self.class_ir_type(self.cur_class)
+                self_ptr, _ = self.get_var_ptr("__self")
+                fn_def = self.functions[ir_method]
+                param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_def.params]
+                ret_ir = self.rubi_type_to_ir(fn_def.ret_type) if fn_def.ret_type else "i64"
+                args_ir = [f"{struct_t}* {self_ptr}"]
+                for i, a in enumerate(node.args):
+                    av, at = self.emit_expr(a)
+                    if i < len(param_types):
+                        av = self.coerce(av, at, param_types[i])
+                        at = param_types[i]
+                    args_ir.append(f"{at} {av}")
+                tmp = self.new_tmp()
+                self.emit(f"  {tmp} = call {ret_ir} @{ir_method}({', '.join(args_ir)})")
+                return tmp, ret_ir
+
         # 1. PRIORITY 1: Hardcoded System Built-ins
         # If it's one of these, it CANNOT be a collection or class method.
         if node.name == "print":
