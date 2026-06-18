@@ -2796,15 +2796,17 @@ class CodeGen:
             self.emit(f"  store i8 0, i8* {next_ptr}")
             return result, "i8*"
         if method == "contains" and len(args) == 1:
-            needle, _ = self.emit_expr(args[0])
+            needle_v, needle_t = self.emit_expr(args[0])
+            needle_v = self.coerce(needle_v, needle_t, "i8*")
             strstr_r, tmp = self.new_tmp(), self.new_tmp()
-            self.emit(f"  {strstr_r} = call i8* @strstr(i8* {obj_val}, i8* {needle})")
+            self.emit(f"  {strstr_r} = call i8* @strstr(i8* {obj_val}, i8* {needle_v})")
             self.emit(f"  {tmp} = icmp ne i8* {strstr_r}, null")
             return tmp, "i1"
         if method == "has" and len(args) == 1:
-            needle, _ = self.emit_expr(args[0])
+            needle_v, needle_t = self.emit_expr(args[0])
+            needle_v = self.coerce(needle_v, needle_t, "i8*")
             strstr_r, tmp = self.new_tmp(), self.new_tmp()
-            self.emit(f"  {strstr_r} = call i8* @strstr(i8* {obj_val}, i8* {needle})")
+            self.emit(f"  {strstr_r} = call i8* @strstr(i8* {obj_val}, i8* {needle_v})")
             self.emit(f"  {tmp} = icmp ne i8* {strstr_r}, null")
             return tmp, "i1"
         if method == "to" or method == "to_int":

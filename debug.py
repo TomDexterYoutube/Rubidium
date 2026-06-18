@@ -838,6 +838,7 @@ class StaticAnalyzer:
         self.has_returned = False
         self.unreachable = False
         self.loop_depth = 0
+        self.cur_class: Optional[str] = None  # set while visiting a ClassDef body
         self.in_try_block = False
         
         self.builtins = {"print", "println", "input", "thread", "thread.wait", "thread.running", "range", "random", "time", "time.wait", "time.timer_start", "time.timer_pause", "time.timer_stop", "time.timer_read", "os", "os.start", "os.run", "file", "file.exists", "file.delete", "file.rename", "file.copy", "file.new", "FFI"}
@@ -859,14 +860,15 @@ class StaticAnalyzer:
 
     def push_scope(self): self.scopes.append({})
         
-    def pop_scope(self, is_class_scope=False): 
+    def pop_scope(self, is_class_scope=False, is_global_scope=False): 
         popped = self.scopes.pop()
         for var_name, meta in popped.items():
-            if not meta.is_read:
+            if not meta.is_read and not is_class_scope:
                 self.report_warning("W012", f"Unused variable `{var_name}`.", meta.declared_line, hint="Remove this variable if it is not needed.")
             if meta.is_mut and not meta.is_reassigned and meta.is_initialized and not is_class_scope:
                 self.report_warning("W011", f"Variable `{var_name}` does not need to be mutable.", meta.declared_line, hint=f"Change to `let {var_name}`.")
-            if not meta.is_dropped and not is_class_scope and not meta.is_auto_dropped:
+            # W010 only fires for global-scope vars — function/loop locals are auto-freed on return/exit
+            if not meta.is_dropped and not is_class_scope and not meta.is_auto_dropped and is_global_scope:
                 self.report_warning("W010", f"Variable `{var_name}` is never dropped.", meta.declared_line, hint=f"Add `{var_name}.drop()` to free memory.")
 
     def declare_var(self, name, meta, line):
@@ -966,7 +968,7 @@ class StaticAnalyzer:
                 self.classes[node.name.value] = c_meta
 
         for node in ast_nodes: self.visit(node)
-        self.pop_scope()
+        self.pop_scope(is_global_scope=True)
         
         # Missing Main Check
         if self.is_main_file and "main" not in self.global_functions:
@@ -1025,9 +1027,11 @@ class StaticAnalyzer:
             )
 
         elif isinstance(node, ClassDef):
+            self.cur_class = node.name.value
             self.push_scope()
             self.visit_block(node.body)
             self.pop_scope(is_class_scope=True)
+            self.cur_class = None
 
         elif isinstance(node, IfStmt):
             self.check_expr(node.condition, node.line)
@@ -1197,6 +1201,9 @@ class StaticAnalyzer:
                 # Variable exists — calling with args is always collection access in Rubidium
                 for arg in expr.args: self.check_expr(arg, current_line)
                 meta.is_read = True
+            elif self.cur_class and target_name in self.classes.get(self.cur_class, ClassMeta("")).methods:
+                # Sibling method call (e.g. heal(40) inside use_potion — no 'self' keyword per spec)
+                for arg in expr.args: self.check_expr(arg, current_line)
             elif target_name not in self.global_functions and target_name not in self.builtins and target_name not in self.classes:
                 self.report_error("E003", f"Cannot find function or class `{target_name}`", expr.line)
             else:
@@ -1238,6 +1245,12 @@ class StaticAnalyzer:
                 elif b_type.startswith("Class<"):
                     c_name = b_type[6:-1]
                     if c_name in self.classes:
+                        # Mark all fields of this class as read — they may be used inside the method body
+                        for field_name in self.classes[c_name].properties:
+                            for scope in reversed(self.scopes):
+                                if field_name in scope:
+                                    scope[field_name].is_read = True
+                                    break
                         if expr.method.value in self.classes[c_name].properties:
                             pass
                         else:
@@ -1253,8 +1266,15 @@ class StaticAnalyzer:
             b_type = self.infer_type(expr.obj)
             if b_type.startswith("Class<"):
                 c_name = b_type[6:-1]
-                if c_name in self.classes and expr.prop.value not in self.classes[c_name].properties:
-                    self.report_error("E092", f"Property `{expr.prop.value}` not found on class `{c_name}`", current_line)
+                if c_name in self.classes:
+                    if expr.prop.value not in self.classes[c_name].properties:
+                        self.report_error("E092", f"Property `{expr.prop.value}` not found on class `{c_name}`", current_line)
+                    else:
+                        # Mark the class field as read so W012 doesn't fire on it
+                        for scope in reversed(self.scopes):
+                            if expr.prop.value in scope:
+                                scope[expr.prop.value].is_read = True
+                                break
 
         elif isinstance(expr, InterpolatedStr):
             for part in expr.parts:
