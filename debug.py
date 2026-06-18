@@ -1139,6 +1139,7 @@ class StaticAnalyzer:
             self.check_expr(node.id_expr, node.line)
 
         elif isinstance(node, ExprStmt): self.check_expr(node.expr, node.line)
+        elif isinstance(node, MethodCall): self.check_expr(node, node.line if hasattr(node, 'line') else 0)
 
         elif isinstance(node, VarDecl):
             is_init = node.expr is not None
@@ -1251,6 +1252,13 @@ class StaticAnalyzer:
                                 if field_name in scope:
                                     scope[field_name].is_read = True
                                     break
+                        # Mark the instance itself as reassigned if the method mutates state
+                        # (any method call on an instance counts — we can't know statically)
+                        # debug.py AST: obj is Identifier(token), so name is obj.token.value
+                        if isinstance(expr.obj, Identifier):
+                            obj_meta = self.get_var(expr.obj.token.value)
+                            if obj_meta:
+                                obj_meta.is_reassigned = True
                         if expr.method.value in self.classes[c_name].properties:
                             pass
                         else:

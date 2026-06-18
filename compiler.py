@@ -152,6 +152,22 @@ double unbox_f(Box* b) { return b ? b->f : 0.0; }
 char* unbox_s(Box* b) { return (b && b->type==2) ? b->s : ""; }
 void* unbox_p(Box* b) { return (b && b->type==3) ? b->p : NULL; }
 
+// ── Rubidium runtime error mechanism ──────────────────────────────────────
+// try/error uses explicit IR branches (no setjmp/longjmp). Collection errors
+// call rub_throw() which writes the message and then crashes so the caller's
+// IR-level branch can never fire... UNLESS we're inside a try block, in which
+// case the IR branch was already emitted *before* the collection call and the
+// throw path is taken. For safety, rub_throw also prints to stderr and exits.
+// The _rub_error_msg global is written before branching to the error block.
+char* _rub_error_buf[256];
+extern char* _rub_error_msg;  // defined in IR preamble
+
+void rub_throw(const char* msg) {
+    _rub_error_msg = (char*)msg;
+    fprintf(stderr, "Runtime Error: %s\n", msg);
+    exit(1);
+}
+
 double _rubidium_pow(double base, double exp) { return pow(base, exp); }
 
 typedef struct { int magic; Box** items; int count; int cap; } RList;
@@ -194,8 +210,9 @@ Box* list_get(void* col, Box* idx) {
     if(!col) return box_i(0);
     RList* l=col; int i=idx->i; /* 0-based indexing */
     if(i>=0 && i<l->count) return l->items[i];
-    fprintf(stderr, "Runtime Error: list index %d out of bounds (length %d)\n", i, l->count);
-    exit(1);
+    char msg[64]; snprintf(msg, sizeof(msg), "list index %d out of bounds (length %d)", i, l->count);
+    _rub_error_msg = strdup(msg);
+    rub_throw(msg); return box_i(0);
 }
 
 typedef struct { int magic; Box** keys; Box** vals; int count; int cap; } RDict;
@@ -300,8 +317,22 @@ Box* dict_get(void* col, Box* k) {
     if(!col) return box_i(0);
     RDict* d=col;
     for(int i=0;i<d->count;i++) if(box_eq(d->keys[i],k)) return d->vals[i];
-    fprintf(stderr, "Runtime Error: key not found in collection\n");
-    exit(1);
+    _rub_error_msg = "key not found in collection";
+    rub_throw("key not found in collection"); return box_i(0);
+}
+
+// Returns NULL on out-of-bounds/missing-key instead of exiting.
+// Used inside try blocks so the IR can null-check and branch to the error label.
+Box* try_collection_get(Box* col_box, Box* key) {
+    if (!col_box || col_box->type != 3 || !col_box->p) return NULL;
+    int magic = *(int*)col_box->p;
+    if (magic == 1) {
+        RList* l = (RList*)col_box->p; int i = key->i;
+        return (i >= 0 && i < l->count) ? l->items[i] : NULL;
+    }
+    RDict* d = (RDict*)col_box->p;
+    for (int j = 0; j < d->count; j++) if (box_eq(d->keys[j], key)) return d->vals[j];
+    return NULL;
 }
 
 Box* collection_get(Box* col_box, Box* key) {

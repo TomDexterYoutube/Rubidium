@@ -39,6 +39,8 @@ declare i8* @box_to_cstr(%Box*)
 declare i32 @collection_len(%Box*)
 declare i32 @box_equal(%Box*, %Box*)
 declare %Box* @str_split(i8*, i8*)
+declare %Box* @try_collection_get(%Box*, %Box*)
+@_rub_error_msg = global i8* null
 declare %Box* @collection_get_at(%Box*, i32)
 declare void @box_drop(%Box*)
 declare %Box* @box_copy(%Box*)
@@ -561,6 +563,7 @@ class CodeGen:
             elif ret_ir == "i1": self.emit("  ret i1 0")
             elif ret_ir in ("float","double"): self.emit(f"  ret {ret_ir} 0.0")
             elif ret_ir == "i8*": self.emit("  ret i8* null")
+            elif ret_ir in self._INT_IR_SET: self.emit(f"  ret {ret_ir} 0")
             else: self.emit(f"  ret {ret_ir} null")
         self.emit("}\n")
         # Flush any trampolines generated during this function
@@ -607,6 +610,7 @@ class CodeGen:
             elif ret_ir == "i1": self.emit("  ret i1 0")
             elif ret_ir in ("float","double"): self.emit(f"  ret {ret_ir} 0.0")
             elif ret_ir == "i8*": self.emit("  ret i8* null")
+            elif ret_ir in self._INT_IR_SET: self.emit(f"  ret {ret_ir} 0")
             else: self.emit(f"  ret {ret_ir} null")
         self.emit("}\n")
 
@@ -854,6 +858,26 @@ class CodeGen:
         if name is not None and not self.is_class_field(name):
             if name not in self.mutable_vars:
                 raise RubidiumTypeError(f"Cannot modify '{name}': collection is not declared 'mut'")
+
+    def emit_guarded_collection_get(self, col_b, key_b, err_msg="collection access error"):
+        """Emit a collection_get with a try-block null-check guard if inside a try."""
+        if self._try_error_label:
+            res = self.new_tmp()
+            self.emit(f"  {res} = call %Box* @try_collection_get(%Box* {col_b}, %Box* {key_b})")
+            # Check for null — null means out-of-bounds or missing key
+            is_null = self.new_tmp(); ok_l = self.new_label("cgok")
+            err_lbl, err_len = self.intern_str(err_msg)
+            err_ptr = self.new_tmp()
+            self.emit(f"  {is_null} = icmp eq %Box* {res}, null")
+            self.emit(f"  {err_ptr} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
+            self.emit(f"  store i8* {err_ptr}, i8** @_rub_error_msg")
+            self.emit(f"  br i1 {is_null}, label %{self._try_error_label}, label %{ok_l}")
+            self.emit(f"{ok_l}:")
+            return res
+        else:
+            res = self.new_tmp()
+            self.emit(f"  {res} = call %Box* @collection_get(%Box* {col_b}, %Box* {key_b})")
+            return res
 
     def emit_collection_set(self, method_call_node):
         access_node = method_call_node.obj
@@ -1519,24 +1543,21 @@ class CodeGen:
         self.emit(f"  call void @file_close(i64 {slot})")
 
     def emit_try(self, node):
-        # NOTE: Rubidium's try/on_error does NOT use LLVM invoke/landingpad.
-        # It cannot catch hardware exceptions like segfaults or FPE signals.
-        # What it CAN catch is explicit runtime division-by-zero: any sdiv
-        # inside the try body is emitted with a zero-check that branches to
-        # on_error instead of faulting. All other errors still crash.
+        # Rubidium try/error uses a global error buffer + explicit branch guards.
+        # What IS catchable: division-by-zero, collection out-of-bounds, missing key
+        #   (all emit an explicit branch to err_l before the faulting operation).
+        # What is NOT catchable: segfaults, C-level aborts, FFI crashes.
         ok_l, err_l, end_l = self.new_label("tok"), self.new_label("terr"), self.new_label("tend")
         self._try_error_label = err_l
         self.emit(f"  br label %{ok_l}\n{ok_l}:")
         self.emit_body(node.try_body)
         self._try_error_label = None
         self.emit(f"  br label %{end_l}\n{err_l}:")
-        # Declare 'error' variable as a string in the error scope
-        err_str = "Division by zero"
-        err_lbl, err_len = self.intern_str(err_str)
+        # Load the error message from the global _rub_error_msg buffer
         err_ptr = self.new_tmp()
-        self.emit(f"  %{err_ptr[1:]} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
+        self.emit(f"  {err_ptr} = load i8*, i8** @_rub_error_msg")
         self.declare_global("error", "i8*")
-        self.emit(f'  store i8* %{err_ptr[1:]}, i8** @error')
+        self.emit(f"  store i8* {err_ptr}, i8** @error")
         self.emit_body(node.error_body)
         self.emit(f"  br label %{end_l}\n{end_l}:")
 
@@ -2199,9 +2220,7 @@ class CodeGen:
             for arg in node.args:
                 idx_v, idx_t = self.emit_expr(arg)
                 idx_b = self.coerce_to_box(idx_v, idx_t)
-                res = self.new_tmp()
-                self.emit(f"  {res} = call %Box* @collection_get(%Box* {col_b}, %Box* {idx_b})")
-                col_b = res
+                col_b = self.emit_guarded_collection_get(col_b, idx_b)
             return col_b, "%Box*"
 
         # 4.5 Class field access via call syntax: e.g., inv() inside class → loads field "inv"
@@ -3024,10 +3043,15 @@ class CodeGen:
             instr = {"+":"add","-":"sub","*":"mul","/":"sdiv","%":"srem"}.get(node.op)
             if instr:
                 if node.op in ("/", "%") and self._try_error_label:
-                    # Runtime div-by-zero guard: branch to on_error instead of faulting
+                    # Runtime div-by-zero guard: set error message, branch to on_error
                     is_zero = self.new_tmp()
                     safe_l  = self.new_label("divok")
+                    err_lbl, err_len = self.intern_str("Division by zero")
+                    err_ptr = self.new_tmp()
                     self.emit(f"  {is_zero} = icmp eq i64 {r}, 0")
+                    # Store error message before the conditional branch (always safe, only used on error path)
+                    self.emit(f"  {err_ptr} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
+                    self.emit(f"  store i8* {err_ptr}, i8** @_rub_error_msg")
                     self.emit(f"  br i1 {is_zero}, label %{self._try_error_label}, label %{safe_l}")
                     self.emit(f"{safe_l}:")
                 self.emit(f"  {tmp} = {instr} i64 {l}, {r}")
