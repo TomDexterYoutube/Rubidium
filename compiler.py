@@ -176,6 +176,13 @@ void list_append(Box* lst, Box* b) {
     if(!lst || lst->type != 3) return;
     RList* l=lst->p; 
     if(!l || l->magic != 1) return; /* not a list */
+    // Spec: [Null].add(x) -> [x]  (single null is replaced, not appended to)
+    // [1, Null].add(x) -> [1, Null, x]  (null in non-singleton list is kept)
+    if (l->count == 1 && l->items[0] && l->items[0]->type == 0 && l->items[0]->i == -2147483648LL) {
+        box_drop(l->items[0]);
+        l->items[0] = b;
+        return;
+    }
     if(l->count==l->cap){l->cap*=2; l->items=realloc(l->items,l->cap*sizeof(Box*));} 
     l->items[l->count++]=b; 
 }
