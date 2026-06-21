@@ -2,7 +2,7 @@ import re
 
 TOKEN_SPEC = [
     ("NUMBER",   r"\d+\.\d+|\d+"),
-    ("ISTRING",  r'i"[^"]*"'),
+    ("ISTRING_PLACEHOLDER", r"i\"PLACEHOLDER\""),  # placeholder — handled below
     ("STRING",   r'"[^"]*"'),
     ("BOOL",     r"True|False|Null|None"),
 
@@ -55,14 +55,64 @@ TOKEN_SPEC = [
     ("MISMATCH", r"."),
 ]
 
-token_regex = "|".join(f"(?P<{n}>{r})" for n, r in TOKEN_SPEC)
+token_regex = "|".join(f"(?P<{n}>{r})" for n, n_r in TOKEN_SPEC for n, r in [(n, n_r)] if n != "ISTRING_PLACEHOLDER")
+# Re-build without the placeholder (it was never in TOKEN_SPEC under that name)
+_REAL_SPEC = [(n, r) for n, r in TOKEN_SPEC if n != "ISTRING_PLACEHOLDER"]
+token_regex = "|".join(f"(?P<{n}>{r})" for n, r in _REAL_SPEC)
+
+
+def _scan_istring(code, start):
+    """Scan a brace-aware i\"...\" token starting at position start (the 'i').
+    Returns (full_token_text, end_pos) or raises SyntaxError."""
+    assert code[start] == 'i' and code[start+1] == '"', "Not an ISTRING"
+    i = start + 2  # skip i"
+    depth = 0       # brace nesting depth
+    in_str = False  # are we inside a nested " string inside {}?
+    while i < len(code):
+        c = code[i]
+        if in_str:
+            if c == '\\':
+                i += 2; continue  # skip escaped char
+            if c == '"':
+                in_str = False
+        else:
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+            elif c == '"':
+                if depth == 0:
+                    # Closing quote of the i-string
+                    return code[start:i+1], i+1
+                else:
+                    in_str = True  # entering nested string inside {}
+        i += 1
+    raise SyntaxError("Unterminated interpolated string")
+
+
+_token_re = re.compile(token_regex)
 
 def tokenize(code):
     tokens = []
     line_no = 1
-    for m in re.finditer(token_regex, code):
+    pos = 0
+    n = len(code)
+
+    while pos < n:
+        # Fast-path: detect i" at current position
+        if code[pos] == 'i' and pos + 1 < n and code[pos+1] == '"':
+            text, pos = _scan_istring(code, pos)
+            tokens.append(("ISTRING", text, line_no))
+            line_no += text.count('\n')
+            continue
+
+        m = _token_re.match(code, pos)
+        if not m:
+            raise SyntaxError(f"Line {line_no}: Unexpected character: {code[pos]!r}")
+
         kind = m.lastgroup
         value = m.group()
+        pos = m.end()
 
         if kind == "NEWLINE":
             line_no += 1

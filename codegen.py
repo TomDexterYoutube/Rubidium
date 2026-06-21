@@ -40,6 +40,7 @@ declare i32 @collection_len(%Box*)
 declare i32 @box_equal(%Box*, %Box*)
 declare %Box* @str_split(i8*, i8*)
 declare %Box* @try_collection_get(%Box*, %Box*)
+declare void @collection_add1(%Box*, %Box*)
 @_rub_error_msg = global i8* null
 declare %Box* @collection_get_at(%Box*, i32)
 declare void @box_drop(%Box*)
@@ -268,6 +269,40 @@ class CodeGen:
     def method_ir_name(self, class_name, method_name):
         return f"{class_name}__{method_name}"
 
+    def _register_implicit_class_fields(self):
+        """Per spec (Scope: 'Classes create their own scope'): any `let` declared
+        inside a class method WITHOUT `local` becomes an implicit instance field —
+        persistent across method calls on that instance, accessible externally as
+        `instance.name`. Only `let local x = ...` stays a true per-call stack local.
+        This walks every method body (recursively through if/while/for/try blocks)
+        collecting non-local VarDecl names not already declared as explicit fields,
+        and appends them to cls.fields so the existing field-access machinery
+        (is_class_field, field_index, emit_field_access) picks them up automatically."""
+        def walk(body, cls, seen_names):
+            for stmt in body:
+                if isinstance(stmt, VarDecl) and not getattr(stmt, "is_local", False):
+                    if stmt.name not in seen_names and not any(f.name == stmt.name for f in cls.fields):
+                        stmt._is_implicit_field = True  # zero-init at construction, real value set when method runs
+                        cls.fields.append(stmt)
+                        seen_names.add(stmt.name)
+                elif isinstance(stmt, If):
+                    walk(stmt.then_body, cls, seen_names)
+                    if getattr(stmt, "else_body", None): walk(stmt.else_body, cls, seen_names)
+                elif isinstance(stmt, While):
+                    walk(stmt.body, cls, seen_names)
+                elif isinstance(stmt, For):
+                    walk(stmt.body, cls, seen_names)
+                elif isinstance(stmt, Try):
+                    walk(stmt.try_body, cls, seen_names)
+                    walk(stmt.error_body, cls, seen_names)
+                elif isinstance(stmt, FileOpen):
+                    walk(stmt.body, cls, seen_names)
+
+        for cls in self.class_defs.values():
+            seen = {f.name for f in cls.fields}
+            for m in cls.methods:
+                walk(m.body, cls, seen)
+
     def gen(self, stmts):
         for s in stmts:
             if isinstance(s, ClassDef):
@@ -280,6 +315,7 @@ class CodeGen:
             elif isinstance(s, FnDef):
                 self.functions[s.name] = s
 
+        self._register_implicit_class_fields()
         self.collect_globals(stmts)
         for cls in self.class_defs.values(): self.emit_class_type(cls)
 
@@ -397,6 +433,12 @@ class CodeGen:
                 if mangled in self.functions:
                     fn = self.functions[mangled]
                     return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
+                # node.method might actually be a FIELD name being accessed via call
+                # syntax (e.g. model.input_w() reads the field, model.input_w(x) is
+                # collection access on it) — not a real method.
+                cls = self.class_defs.get(class_name)
+                if cls and any(f.name == node.method for f in cls.fields):
+                    return "%Box*" if node.args else self.field_index(class_name, node.method)[1]
             
             if node.method == "len": return "i64"
             if node.method == "char": return "i8*"
@@ -666,16 +708,21 @@ class CodeGen:
                     return False
 
                 ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
-                self.local_vars_stack[-1][node.name] = ir_t
                 if node.mutable: self.mutable_vars.add(node.name)
-                ptr_str = f"%ptr_{node.name}"
-                if node.name not in self._alloca_emitted:
-                    self.emit(f"  {ptr_str} = alloca {ir_t}")
-                    self._alloca_emitted.add(node.name)
+                # Per spec: non-local `let` inside a class method is an IMPLICIT
+                # INSTANCE FIELD (registered by _register_implicit_class_fields),
+                # not a stack-local — it persists across method calls on the same
+                # instance and is readable externally as `instance.name`.
+                idx, field_ir_t = self.field_index(self.cur_class, node.name)
+                struct_t = self.class_ir_type(self.cur_class)
+                self_ptr_str, _ = self.get_var_ptr("__self")
+                inst_ptr = self.new_tmp(); fptr = self.new_tmp()
+                self.emit(f"  {inst_ptr} = load {struct_t}*, {struct_t}** {self_ptr_str}")
+                self.emit(f"  {fptr} = getelementptr {struct_t}, {struct_t}* {inst_ptr}, i32 0, i32 {idx}")
                 val, val_t = self.emit_expr(node.value)
-                val = self.coerce(val, val_t, ir_t)
+                val = self.coerce(val, val_t, field_ir_t)
                 val = self._deep_copy_if_var(val, val_t, node.value)
-                self.emit(f"  store {ir_t} {val}, {ir_t}* {ptr_str}")
+                self.emit(f"  store {field_ir_t} {val}, {field_ir_t}* {fptr}")
                 if isinstance(node.value, FFILoad):
                     slot = f"@_ffi_slot_{node.name}"
                     if not any(d.startswith(slot) for d in self.global_decls):
@@ -891,18 +938,26 @@ class CodeGen:
                 class_name = self.instances[inner_obj_name]
                 cls = self.class_defs.get(class_name)
                 if cls and any(f.name == inner.method for f in cls.fields):
-                    # p.scores(0).set(99) - inner is MethodCall(Var('p'), 'scores', [Number(0)])
+                    # p.scores(0).set(99) or p.dict_field("key", 0).set(99)
+                    # inner.args holds N navigation indices; chain all but the last as
+                    # collection_get, then collection_set with the final index.
                     field_val, field_t = self.emit_field_access(inner.obj, inner.method)
                     col_b = self.coerce_to_box(field_val, field_t)
-                    
-                    # Get the index from inner.args[0]
-                    idx_v, idx_t = self.emit_expr(inner.args[0])
+
+                    nav_args = inner.args[:-1]
+                    final_idx_arg = inner.args[-1]
+                    for nav in nav_args:
+                        nv, nt = self.emit_expr(nav)
+                        nb = self.coerce_to_box(nv, nt)
+                        col_b = self.emit_guarded_collection_get(col_b, nb)
+
+                    idx_v, idx_t = self.emit_expr(final_idx_arg)
                     idx_b = self.coerce_to_box(idx_v, idx_t)
-                    
+
                     # Get the value from outer.args[0]
                     val_v, val_t = self.emit_expr(val_node)
                     val_b = self.coerce_to_box(val_v, val_t)
-                    
+
                     self.emit(f"  call void @collection_set(%Box* {col_b}, %Box* {idx_b}, %Box* {val_b})")
                     return "0", "i64"
         
@@ -992,7 +1047,7 @@ class CodeGen:
                     if len(val_nodes) == 1:
                         val_v, val_t = self.emit_expr(val_nodes[0])
                         val_b = self.coerce_to_box(val_v, val_t)
-                        self.emit(f"  call void @list_append(%Box* {col_b}, %Box* {val_b})")
+                        self.emit(f"  call void @collection_add1(%Box* {col_b}, %Box* {val_b})")
                     elif len(val_nodes) == 2:
                         key_v, key_t = self.emit_expr(val_nodes[0])
                         val_v, val_t = self.emit_expr(val_nodes[1])
@@ -1031,7 +1086,7 @@ class CodeGen:
             if len(val_nodes) == 1:
                 val_v, val_t = self.emit_expr(val_nodes[0])
                 val_b = self.coerce_to_box(val_v, val_t)
-                self.emit(f"  call void @list_append(%Box* {col_b}, %Box* {val_b})")
+                self.emit(f"  call void @collection_add1(%Box* {col_b}, %Box* {val_b})")
             elif len(val_nodes) == 2:
                 key_v, key_t = self.emit_expr(val_nodes[0])
                 val_v, val_t = self.emit_expr(val_nodes[1])
@@ -1093,7 +1148,7 @@ class CodeGen:
         if len(method_call_node.args) == 1:
             val_v, val_t = self.emit_expr(method_call_node.args[0])
             val_b = self.coerce_to_box(val_v, val_t)
-            self.emit(f"  call void @list_append(%Box* {col_b}, %Box* {val_b})")
+            self.emit(f"  call void @collection_add1(%Box* {col_b}, %Box* {val_b})")
         elif len(method_call_node.args) == 2:
             key_v, key_t = self.emit_expr(method_call_node.args[0])
             val_v, val_t = self.emit_expr(method_call_node.args[1])
@@ -1115,7 +1170,7 @@ class CodeGen:
             if len(outer_method_call.args) == 1:
                 val_v, val_t = self.emit_expr(outer_method_call.args[0])
                 val_b = self.coerce_to_box(val_v, val_t)
-                self.emit(f"  call void @list_append(%Box* {col_b}, %Box* {val_b})")
+                self.emit(f"  call void @collection_add1(%Box* {col_b}, %Box* {val_b})")
             elif len(outer_method_call.args) == 2:
                 key_v, key_t = self.emit_expr(outer_method_call.args[0])
                 val_v, val_t = self.emit_expr(outer_method_call.args[1])
@@ -1137,9 +1192,19 @@ class CodeGen:
             ir_t = self.rubi_type_to_ir(field.vtype) if field.vtype else self._infer_type(field.value)
             fptr = self.new_tmp()
             self.emit(f"  {fptr} = getelementptr {struct_t}, {struct_t}* {typed_ptr}, i32 0, i32 {i}")
-            val, val_t = self.emit_expr(field.value)
-            val = self.coerce(val, val_t, ir_t)
-            self.emit(f"  store {ir_t} {val}, {ir_t}* {fptr}")
+            if getattr(field, "_is_implicit_field", False):
+                # Implicit field (from a non-local `let` inside a method body): the
+                # declaration's value expression may reference other fields/params
+                # only valid when the owning method actually runs — so zero-init
+                # here instead of evaluating it now. The real value gets stored the
+                # first time that VarDecl statement executes during a method call.
+                zero_val = {"i1": "0", "i8*": "null", "%Box*": "null",
+                            "float": "0.0", "double": "0.0"}.get(ir_t, "0" if ir_t in self._INT_IR_SET else "null")
+                self.emit(f"  store {ir_t} {zero_val}, {ir_t}* {fptr}")
+            else:
+                val, val_t = self.emit_expr(field.value)
+                val = self.coerce(val, val_t, ir_t)
+                self.emit(f"  store {ir_t} {val}, {ir_t}* {fptr}")
         # Call __init__ if it exists and we have init_args
         if init_args and f"{class_name}__init__" in self.functions:
             mangled = f"{class_name}__init__"
@@ -2366,7 +2431,7 @@ class CodeGen:
                     if len(node.args) == 1:
                         val_v, val_t = self.emit_expr(node.args[0])
                         val_b = self.coerce_to_box(val_v, val_t)
-                        self.emit(f"  call void @list_append(%Box* {col_b}, %Box* {val_b})")
+                        self.emit(f"  call void @collection_add1(%Box* {col_b}, %Box* {val_b})")
                     elif len(node.args) == 2:
                         key_v, key_t = self.emit_expr(node.args[0])
                         val_v, val_t = self.emit_expr(node.args[1])
@@ -2383,7 +2448,7 @@ class CodeGen:
             if len(node.args) == 1:
                 val_v, val_t = self.emit_expr(node.args[0])
                 val_b = self.coerce_to_box(val_v, val_t)
-                self.emit(f"  call void @list_append(%Box* {col_b}, %Box* {val_b})")
+                self.emit(f"  call void @collection_add1(%Box* {col_b}, %Box* {val_b})")
             elif len(node.args) == 2:
                 key_v, key_t = self.emit_expr(node.args[0])
                 val_v, val_t = self.emit_expr(node.args[1])
@@ -2593,12 +2658,13 @@ class CodeGen:
                         # This is handled by the outer MethodCall, so we shouldn't reach here
                         pass
                     else:
-                        # p.scores(0) - get element at index
-                        idx_v, idx_t = self.emit_expr(node.args[0])
-                        idx_b = self.coerce_to_box(idx_v, idx_t)
-                        res = self.new_tmp()
-                        self.emit(f"  {res} = call %Box* @collection_get(%Box* {field_val}, %Box* {idx_b})")
-                        return res, "%Box*"
+                        # p.scores(0) or p.dict_field("key", 0) — chain get for each arg
+                        col_b = field_val
+                        for arg in node.args:
+                            idx_v, idx_t = self.emit_expr(arg)
+                            idx_b = self.coerce_to_box(idx_v, idx_t)
+                            col_b = self.emit_guarded_collection_get(col_b, idx_b)
+                        return col_b, "%Box*"
                 return field_val, field_t
 
         # 2d. Handle FieldAccess on class instances (e.g., p.scores(0).set(99))

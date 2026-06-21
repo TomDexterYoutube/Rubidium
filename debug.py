@@ -957,6 +957,32 @@ class StaticAnalyzer:
              return self.infer_type(expr.left)
         return "Unknown"
 
+    def _register_implicit_class_fields(self):
+        """Mirrors codegen.py's _register_implicit_class_fields: per spec ('Classes
+        create their own scope'), any non-local `let` inside a class method becomes
+        an implicit instance field. Without this, E091/E092 would false-positive on
+        valid external access like `model.input_w`."""
+        def walk(body, c_meta):
+            for stmt in body:
+                if isinstance(stmt, VarDecl) and not stmt.is_local:
+                    if stmt.name.value not in c_meta.properties:
+                        c_meta.properties[stmt.name.value] = self.get_type_category(stmt.v_type.value) if stmt.v_type else "Unknown"
+                elif isinstance(stmt, IfStmt):
+                    walk(stmt.body, c_meta)
+                    if stmt.else_body: walk(stmt.else_body, c_meta)
+                elif isinstance(stmt, WhileStmt):
+                    walk(stmt.body, c_meta)
+                elif isinstance(stmt, ForStmt):
+                    walk(stmt.body, c_meta)
+                elif isinstance(stmt, TryErrorBlock):
+                    walk(stmt.try_body, c_meta); walk(stmt.error_body, c_meta)
+                elif isinstance(stmt, FileOpenBlock):
+                    walk(stmt.body, c_meta)
+
+        for c_meta in self.classes.values():
+            for m in c_meta.methods.values():
+                walk(m.body, c_meta)
+
     def run(self, ast_nodes, tokens):
         for node in ast_nodes:
             if isinstance(node, FunctionDef): self.global_functions[node.name.value] = node
@@ -967,6 +993,7 @@ class StaticAnalyzer:
                     elif isinstance(stmt, VarDecl): c_meta.properties[stmt.name.value] = self.get_type_category(stmt.v_type.value) if stmt.v_type else "Unknown"
                 self.classes[node.name.value] = c_meta
 
+        self._register_implicit_class_fields()
         for node in ast_nodes: self.visit(node)
         self.pop_scope(is_global_scope=True)
         
@@ -1296,8 +1323,9 @@ class StaticAnalyzer:
             
             if expr.op.kind == 'LOGIC' and (l_t not in ("Unknown", "Bool") or r_t not in ("Unknown", "Bool")):
                 self.report_error("E036", "Logical operators (and/or) require `bool` operands.", current_line)
-            elif l_t != "Unknown" and r_t != "Unknown" and l_t != r_t and expr.op.value in ('+', '-', '*', '/', '<', '>', '<=', '>=') and not (l_t == "String" and r_t != "String" and expr.op.value == '+'):
-                # String + Other type is allowed (int to string coercion)
+            elif l_t != "Unknown" and r_t != "Unknown" and l_t != r_t and expr.op.value in ('+', '-', '*', '/', '<', '>', '<=', '>=') and not (l_t == "String" and r_t != "String" and expr.op.value == '+') and not ({l_t, r_t} == {"Int", "Float"}):
+                # String + Other type is allowed (int to string coercion).
+                # Int/Float mixing is allowed (compiler promotes to float, matches `coerce`/`promote_type`).
                 self.report_error("E033", f"Type mismatch in binary operation: cannot apply `{expr.op.value}` to `{l_t}` and `{r_t}`", current_line)
             if expr.op.value == '/' and isinstance(expr.right, Literal) and expr.right.value == 0:
                 if self.in_try_block:

@@ -313,6 +313,19 @@ void dict_set(Box* dct, Box* k, Box* v) {
     if(d->count==d->cap){d->cap*=2; d->keys=realloc(d->keys,d->cap*sizeof(Box*)); d->vals=realloc(d->vals,d->cap*sizeof(Box*));}
     d->keys[d->count]=k; d->vals[d->count]=v; d->count++;
 }
+// Single-arg .add(): dispatches based on the collection's runtime type.
+// list.add(val)    -> append val to the list.
+// dict.add(new_key) -> create a new top-level key with value Null (per spec).
+void collection_add1(Box* col_box, Box* arg) {
+    if (!col_box || col_box->type != 3 || !col_box->p) return;
+    int magic = *(int*)col_box->p;
+    if (magic == 1) {
+        list_append(col_box, arg);
+    } else if (magic == 2) {
+        Box* null_val = box_i(-2147483648LL);  // Rubidium Null sentinel (BUG-017)
+        dict_set(col_box, arg, null_val);
+    }
+}
 Box* dict_get(void* col, Box* k) {
     if(!col) return box_i(0);
     RDict* d=col;
