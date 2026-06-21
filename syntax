@@ -1188,27 +1188,83 @@ os(1).drop()
 
 use FFI
 
-# Load a compiled shared library (.so on Linux, .dll on Windows).
-# The path starts from the folder your .rub file is in.
 
-let c_lib = FFI("libs/mylib.so")
+# Load a compiled shared library.
 
-# Bind a foreign function using fn with the FFI handle as the first identifier.
-# This does NOT define a new Rubidium function.
-# It creates a binding to the symbol inside the library.
+let ffi_lib = FFI("libs/mylib.so")
 
-fn c_lib my_c_func(msg: str) -> i32
 
-# Call the bound function like a normal function:
+# Bind the foreign symbol.
 
-c_lib.my_c_func("hello from Rubidium")
+fn ffi_lib my_c_function(msg: str) -> i32 as my_function
 
-# Binding rules:
-# - The first identifier must be an FFI handle.
-# - The second identifier is the exact symbol name inside the library.
-# - The type signature is used for ABI mapping and compile-time type checking.
-# - Bindings are resolved at load time.
-# - Compatible with C, C++, C#, and Rust shared libraries.
+
+# Call using the Rubidium name.
+
+my_function("hello from Rubidium")
+
+
+
+# -----------------------------------------
+# FFI FUNCTION RENAMING
+# -----------------------------------------
+
+# External libraries often have ugly names:
+#
+# calculate_vector3_fast()
+# rb_internal_math_v2()
+# _ZN12SomethingFoo...
+#
+# Rubidium can expose cleaner names.
+
+
+let math_lib = FFI("libs/math.so")
+
+
+fn math_lib rb_sin(x: f64) -> f64 as sin
+
+
+print(sin(0.5))
+
+
+
+# -----------------------------------------
+# FFI WRAPPERS
+# -----------------------------------------
+
+# Foreign functions can be wrapped normally.
+
+fn sqrt(value: f64) -> f64 {
+
+    return math_lib.sqrt(value)
+
+}
+
+
+
+# -----------------------------------------
+# IMPORTING FFI WRAPPERS
+# -----------------------------------------
+
+# math_tools.rub
+
+let native = FFI("libs/math.so")
+
+
+fn native native_sin(x: f64) -> f64 as sin
+
+
+fn native_sqrt(x: f64) -> f64 as sqrt
+
+
+
+# another_file.rub
+
+import math_tools as mt
+
+
+mt.sin(1.0)
+mt.sqrt(25.0)
 
 # =========================================
 # MODULES & IMPORTS
@@ -1228,6 +1284,26 @@ use FFI
 import math_tools
 
 math_tools.sin(0.5)
+
+# =========================================
+# IMPORT ALIASES
+# =========================================
+
+# Imports can be renamed using 'as'.
+# This creates a shorter namespace alias.
+
+import math_tools as mt
+
+mt.sin(0.5)
+
+
+# The original namespace still exists.
+
+math_tools.sin(0.5)
+
+
+# Alias names only affect access.
+# They do not copy or duplicate the module.
 
 # =========================================
 # MAIN ENTRY POINT
