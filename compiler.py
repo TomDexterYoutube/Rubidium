@@ -316,13 +316,26 @@ void dict_set(Box* dct, Box* k, Box* v) {
 // Single-arg .add(): dispatches based on the collection's runtime type.
 // list.add(val)    -> append val to the list.
 // dict.add(new_key) -> create a new top-level key with value Null (per spec).
+// null sentinel.add(val) -> auto-promote null to a list, append val in-place.
 void collection_add1(Box* col_box, Box* arg) {
+    // Null sentinel: auto-promote to a list and append in-place.
+    // The box is heap-allocated and parent collections hold a pointer to it,
+    // so mutating type+p is visible through all references.
+    if (col_box && col_box->type == 0 && col_box->i == -2147483648LL) {
+        RList* l = malloc(sizeof(RList));
+        l->magic = 1; l->count = 0; l->cap = 8;
+        l->items = malloc(8 * sizeof(Box*));
+        col_box->type = 3;
+        col_box->p = l;
+        list_append(col_box, arg);
+        return;
+    }
     if (!col_box || col_box->type != 3 || !col_box->p) return;
     int magic = *(int*)col_box->p;
     if (magic == 1) {
         list_append(col_box, arg);
     } else if (magic == 2) {
-        Box* null_val = box_i(-2147483648LL);  // Rubidium Null sentinel (BUG-017)
+        Box* null_val = box_i(-2147483648LL);  // Rubidium Null sentinel
         dict_set(col_box, arg, null_val);
     }
 }
@@ -359,6 +372,16 @@ Box* collection_get(Box* col_box, Box* key) {
 }
 
 void collection_set(Box* col_box, Box* key, Box* val) {
+    // Null sentinel: auto-promote to a dict and set the key in-place.
+    if (col_box && col_box->type == 0 && col_box->i == -2147483648LL) {
+        RDict* d = malloc(sizeof(RDict));
+        d->magic = 2; d->count = 0; d->cap = 8;
+        d->keys = malloc(8 * sizeof(Box*)); d->vals = malloc(8 * sizeof(Box*));
+        col_box->type = 3;
+        col_box->p = d;
+        dict_set(col_box, key, val);
+        return;
+    }
     if (!col_box || col_box->type != 3) return;
     void* col = col_box->p;
     if(!col) return;

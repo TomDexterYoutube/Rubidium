@@ -1359,6 +1359,20 @@ fn main() {
 #       * file  -> lines
 #   - Collections use deep copy on assignment
 #   - You can force collection types: let x: list: i32 = [0, 10, 32]
+#   - .set() and .add() completely replace Null values
+#   - If a target contains Null, the Null value is destroyed
+#     and the new value takes its place
+#   - Null is never preserved after replacement
+#   - For lists and dict value collections, .add() appends normally
+#     and does not remove existing values
+#   - The exception is when a collection contains only a single Null value
+#   - In that case, .add() replaces the Null instead of appending
+#
+#     [Null].add(5)
+#     # Result: [5]
+#
+#     [1, Null].add(5)
+#     # Result: [1, Null, 5]
 
 # Collection Equality:
 #   - Collection equality compares contents
