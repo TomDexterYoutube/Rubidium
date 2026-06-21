@@ -48,8 +48,8 @@ declare %Box* @box_copy(%Box*)
 declare i1 @collection_has(%Box*, %Box*)
 declare i32 @_rub_str_hash(i8*)
 declare i64 @time(i64*)
-declare i32 @rand()
-declare void @srand(i32)
+declare i64 @random()
+declare void @srandom(i32)
 declare i32 @usleep(i32)
 declare i32 @sleep(i32)
 declare void @time_timer_start(i64, double)
@@ -355,7 +355,7 @@ class CodeGen:
             "define void @_rubidium_init_rng() {",
             "  %t_seed = call i64 @time(i64* null)",
             "  %t_seed_i32 = trunc i64 %t_seed to i32",
-            "  call void @srand(i32 %t_seed_i32)",
+            "  call void @srandom(i32 %t_seed_i32)",
             "  ret void", "}", ""
         ]
         
@@ -2159,9 +2159,9 @@ class CodeGen:
                 r_raw = self.new_tmp(); r_f = self.new_tmp()
                 rmax_f = self.new_tmp(); ratio = self.new_tmp()
                 range_v = self.new_tmp(); result = self.new_tmp()
-                self.emit(f"  {r_raw} = call i32 @rand()")
-                self.emit(f"  {r_f} = sitofp i32 {r_raw} to double")
-                self.emit(f"  {rmax_f} = sitofp i32 2147483647 to double")
+                self.emit(f"  {r_raw} = call i64 @random()")
+                self.emit(f"  {r_f} = sitofp i64 {r_raw} to double")
+                self.emit(f"  {rmax_f} = sitofp i64 2147483648 to double")  # RAND_MAX+1 for [min,max)
                 self.emit(f"  {ratio} = fdiv double {r_f}, {rmax_f}")
                 mn = self.coerce(min_v, min_t, "double")
                 mx = self.coerce(max_v, max_t, "double")
@@ -2174,11 +2174,11 @@ class CodeGen:
                 # rand() % (max - min + 1) + min
                 mn = self.coerce(min_v, min_t, "i64")
                 mx = self.coerce(max_v, max_t, "i64")
-                r_raw = self.new_tmp(); r_i64 = self.new_tmp()
+                r_raw = self.new_tmp()
                 range_v = self.new_tmp(); range1 = self.new_tmp()
                 rem = self.new_tmp(); result = self.new_tmp()
-                self.emit(f"  {r_raw} = call i32 @rand()")
-                self.emit(f"  {r_i64} = sext i32 {r_raw} to i64")
+                self.emit(f"  {r_raw} = call i64 @random()")
+                r_i64 = r_raw  # random() already returns i64
                 self.emit(f"  {range_v} = sub i64 {mx}, {mn}")
                 self.emit(f"  {range1} = add i64 {range_v}, 1")
                 self.emit(f"  {rem} = srem i64 {r_i64}, {range1}")
@@ -2546,13 +2546,11 @@ class CodeGen:
                 lo_v = self.coerce(lo_v, lo_t, "i64")
                 hi_v = self.coerce(hi_v, hi_t, "i64")
                 r_raw, span, r_mod, result = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
-                self.emit(f"  {r_raw} = call i32 @rand()")
-                r_64 = self.new_tmp()
-                self.emit(f"  {r_64} = zext i32 {r_raw} to i64")
+                self.emit(f"  {r_raw} = call i64 @random()")
                 self.emit(f"  {span} = sub i64 {hi_v}, {lo_v}")
                 span1 = self.new_tmp()
                 self.emit(f"  {span1} = add i64 {span}, 1")
-                self.emit(f"  {r_mod} = srem i64 {r_64}, {span1}")
+                self.emit(f"  {r_mod} = srem i64 {r_raw}, {span1}")
                 self.emit(f"  {result} = add i64 {r_mod}, {lo_v}")
                 return result, "i64"
 
@@ -2564,9 +2562,9 @@ class CodeGen:
                 hi_v = self.coerce(hi_v, hi_t, "double")
                 r_raw = self.new_tmp(); r_d = self.new_tmp(); rand_max = self.new_tmp()
                 scaled = self.new_tmp(); span = self.new_tmp(); mul = self.new_tmp(); result = self.new_tmp()
-                self.emit(f"  {r_raw} = call i32 @rand()")
-                self.emit(f"  {r_d} = sitofp i32 {r_raw} to double")
-                self.emit(f"  {rand_max} = sitofp i32 2147483647 to double")
+                self.emit(f"  {r_raw} = call i64 @random()")
+                self.emit(f"  {r_d} = sitofp i64 {r_raw} to double")
+                self.emit(f"  {rand_max} = sitofp i64 2147483648 to double")  # RAND_MAX+1 for [min,max)
                 self.emit(f"  {scaled} = fdiv double {r_d}, {rand_max}")
                 self.emit(f"  {span} = fsub double {hi_v}, {lo_v}")
                 self.emit(f"  {mul} = fmul double {scaled}, {span}")
@@ -2589,10 +2587,13 @@ class CodeGen:
                 self.emit(f"  {cond} = icmp slt i32 {cur_i}, {len_v}")
                 self.emit(f"  br i1 {cond}, label %{body_l}, label %{end_l}\n{body_l}:")
                 # pick random j in [i, len)
-                range_v, r_raw, j_v, j_add = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
+                range_v, j_v, j_add = self.new_tmp(), self.new_tmp(), self.new_tmp()
                 self.emit(f"  {range_v} = sub i32 {len_v}, {cur_i}")
-                self.emit(f"  {r_raw} = call i32 @rand()")
-                self.emit(f"  {j_v} = srem i32 {r_raw}, {range_v}")
+                r_raw_64 = self.new_tmp()
+                self.emit(f"  {r_raw_64} = call i64 @random()")
+                r_raw_32 = self.new_tmp()
+                self.emit(f"  {r_raw_32} = trunc i64 {r_raw_64} to i32")
+                self.emit(f"  {j_v} = srem i32 {r_raw_32}, {range_v}")
                 self.emit(f"  {j_add} = add i32 {j_v}, {cur_i}")
                 # Safe swap using list_swap (no ownership issues)
                 self.emit(f"  call void @list_swap(%Box* {col_b}, i32 {cur_i}, i32 {j_add})")
@@ -2607,12 +2608,12 @@ class CodeGen:
                 if seed_t == "i8*":
                     seed_hash = self.new_tmp()
                     self.emit(f"  {seed_hash} = call i32 @_rub_str_hash(i8* {seed_v})")
-                    self.emit(f"  call void @srand(i32 {seed_hash})")
+                    self.emit(f"  call void @srandom(i32 {seed_hash})")
                 else:
                     seed_i = self.coerce(seed_v, seed_t, "i64")
                     seed_i32 = self.new_tmp()
                     self.emit(f"  {seed_i32} = trunc i64 {seed_i} to i32")
-                    self.emit(f"  call void @srand(i32 {seed_i32})")
+                    self.emit(f"  call void @srandom(i32 {seed_i32})")
                 return "0", "i64"
 
             if node.method == "choice":
@@ -2627,8 +2628,11 @@ class CodeGen:
                 self.emit(f"  {cmp_v} = icmp sgt i32 {len_v}, 0")
                 self.emit(f"  br i1 {cmp_v}, label %{safe_l}, label %{zero_l}\n{safe_l}:")
                 r_raw, r_idx = self.new_tmp(), self.new_tmp()
-                self.emit(f"  {r_raw} = call i32 @rand()")
-                self.emit(f"  {r_idx} = srem i32 {r_raw}, {len_v}")
+                r_raw_64 = self.new_tmp()
+                self.emit(f"  {r_raw_64} = call i64 @random()")
+                r_raw_32 = self.new_tmp()
+                self.emit(f"  {r_raw_32} = trunc i64 {r_raw_64} to i32")
+                self.emit(f"  {r_idx} = srem i32 {r_raw_32}, {len_v}")
                 result_safe = self.new_tmp()
                 self.emit(f"  {result_safe} = call %Box* @collection_get_at(%Box* {col_b}, i32 {r_idx})")
                 result_copy = self.new_tmp()
