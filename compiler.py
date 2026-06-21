@@ -504,47 +504,13 @@ double time_timer_read(int tid) {
     return result;
 }
 
+char* box_to_cstr(Box* b);  // forward declaration
 void print_boxed(Box* b) {
+    // Delegate entirely to box_to_cstr so nested collections print recursively.
     if(!b) { printf("null\n"); fflush(stdout); return; }
-    if(b->type==0) printf("%lld\n", b->i);
-    else if(b->type==1) printf("%g\n", b->f);
-    else if(b->type==2) printf("%s\n", b->s);
-    else {
-        int* magic = (int*)(b->p);
-        if(magic && *magic==1) {
-            RList* l = (RList*)b->p;
-            printf("[");
-            for(int i=0; i<l->count; i++) {
-                if(i>0) printf(", ");
-                Box* item = l->items[i];
-                if(!item) printf("null");
-                else if(item->type==0) printf("%lld", item->i);
-                else if(item->type==1) printf("%g", item->f);
-                else if(item->type==2) printf("%s", item->s);
-                else printf("...");
-            }
-            printf("]\n");
-        } else if(magic && *magic==2) {
-            RDict* d = (RDict*)b->p;
-            printf("{");
-            for(int i=0; i<d->count; i++) {
-                if(i>0) printf(", ");
-                Box* k = d->keys[i];
-                Box* v = d->vals[i];
-                if(!k) printf("null");
-                else if(k->type==0) printf("%lld", k->i);
-                else if(k->type==1) printf("%g", k->f);
-                else if(k->type==2) printf("\"%s\"", k->s);
-                printf(": ");
-                if(!v) printf("null");
-                else if(v->type==0) printf("%lld", v->i);
-                else if(v->type==1) printf("%g", v->f);
-                else if(v->type==2) printf("%s", v->s);
-                else printf("...");
-            }
-            printf("}\n");
-        } else printf("<object>\n");
-    }
+    char* s = box_to_cstr(b);
+    printf("%s\n", s);
+    free(s);
     fflush(stdout);
 }
 
@@ -553,7 +519,10 @@ void print_boxed(Box* b) {
 char* box_to_cstr(Box* b) {
     if(!b) { char* r = malloc(5); strcpy(r,"null"); return r; }
     char* buf = malloc(64);
-    if(b->type==0)      { snprintf(buf, 64, "%lld", b->i); }
+    if(b->type==0) {
+        if(b->i == -2147483648LL) { snprintf(buf, 64, "Null"); }  // sentinel
+        else { snprintf(buf, 64, "%lld", b->i); }
+    }
     else if(b->type==1) { snprintf(buf, 64, "%g",   b->f); }
     else if(b->type==2) { free(buf); return strdup(b->s ? b->s : ""); }
     else if(b->type==3 && b->p) {
