@@ -259,7 +259,7 @@ class Analyzer:
                 if node.name not in self.classes:
                     fields = {}
                     for f in node.fields:
-                        fields[f.name] = {'mutable': f.mutable, 'vtype': f.vtype}
+                        fields[f.name] = {'mutable': f.mutable, 'vtype': f.vtype, 'used': False}
                     methods = {}
                     for m in node.methods:
                         methods[m.name] = m
@@ -418,8 +418,22 @@ class Analyzer:
                 self._expr(part, scope)
         elif t is ast.TypeCast:
             self._expr(node.expr, scope)
+
         elif t is ast.FieldAccess:
             self._expr(node.obj, scope)
+
+            if isinstance(node.obj, ast.Var):
+                obj_info = scope.lookup(node.obj.name)
+
+                if obj_info:
+                    obj_type = obj_info.get('vtype')
+
+                    if obj_type in self.classes:
+                        fields = self.classes[obj_type]['fields']
+
+                        if node.field in fields:
+                            fields[node.field]['used'] = True
+
         elif t is ast.ClassInstantiate:
             if node.class_name not in self.classes:
                 suggestion = _closest_name(node.class_name, list(self.classes))
@@ -607,6 +621,15 @@ class Analyzer:
                 })
             for stmt in (method.body or []):
                 self._node(stmt, method_scope, in_loop=False)
+
+        for fname, finfo in self.classes[node.name]['fields'].items():
+            if not finfo.get('used'):
+                self._emit(
+                    'INFO',
+                    self._ln('class', node.name),
+                    'Unused Field',
+                    f"Unused field: {node.name}.{fname}"
+            )
 
     def _drop(self, node: ast.Drop, scope: Scope):
         info = scope.lookup(node.name)
