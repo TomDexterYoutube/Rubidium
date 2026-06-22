@@ -653,7 +653,7 @@ while count < 5 {
 # RANGE LOOP
 # -----------------------------------------
 
-# range(start, end) — end is exclusive.
+# range(start, end) — end is inclusive.
 #
 # The loop variable is local to the loop only.
 # It can be named anything and is automatically
@@ -677,6 +677,8 @@ for value in range(1, 10) {
 for banana in range(1, 10) {
     print(banana)
 }
+
+# Loop indexing starts at 0
 
 # -----------------------------------------
 # COLLECTION ITERATION
