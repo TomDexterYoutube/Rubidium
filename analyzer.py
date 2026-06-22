@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-Rubidium Static Analyzer
-Usage:  python analyzer.py check <file.rub> [--strict]
-"""
-
 import sys
 import os
 import argparse
@@ -31,7 +25,7 @@ def _edit_distance(a: str, b: str) -> int:
             prev = temp
     return dp[lb]
 
-def _closest_name(word: str, candidates, max_dist: int = 2) -> str | None:
+def _closest_name(word: str, candidates, max_dist: int = 1) -> str | None:
     best, best_d = None, max_dist + 1
     for c in candidates:
         d = _edit_distance(word.lower(), c.lower())
@@ -102,9 +96,6 @@ class Scope:
         self.parent = parent
         self.vars: dict = {}
 
-    # VarInfo keys: mutable, vtype, dropped, used, is_heap, line, drop_line,
-    #               possibly_null
-
     def declare(self, name: str, info: dict):
         self.vars[name] = info
 
@@ -139,64 +130,61 @@ class Analyzer:
 
     def __init__(self):
         self.issues: list = []
-
-        # Global symbol tables (populated before main walk)
-        self.functions: dict  = {}   # name → {params, ret_type, used, line}
-        self.classes:   dict  = {}   # name → {fields, methods, used, line}
+        self.functions: dict  = {}   
+        self.classes:   dict  = {}   
         self.namespaces: set  = set()
         self.imports:    set  = set()
-
-        # Thread / race analysis
-        self.thread_fns:  set  = set()   # fn names launched via thread()
-        self.global_muts: dict = {}      # global mut var_name → info
-
-        # Memory accounting
-        self.heap_var_names: list = []   # names of globally heap-allocated vars
+        self.thread_fns:  set  = set()   
+        self.global_muts: dict = {}      
+        self.heap_var_names: list = []   
         self.global_allocs:  int  = 0
-
-        # Line-number map: ('fn'|'var'|'class', name) → line
         self._lmap: dict = {}
-
-        # Collected leak vars (filled after analysis)
         self._leak_vars: list = []
-
-    # ── Emit ──────────────────────────────────────────────────────────────────
 
     def _emit(self, severity: str, line, category: str,
               message: str, suggestion: str = ''):
         self.issues.append(Issue(severity, line, category, message, suggestion))
 
-    # ── Line map ──────────────────────────────────────────────────────────────
-
     def _build_line_map(self, tokens: list):
         i = 0
         n = len(tokens)
         while i < n:
-            kind, val, line = tokens[i][0], tokens[i][1], tokens[i][2]
+            tok = tokens[i]
+            kind = getattr(tok, 'kind', tok[0] if isinstance(tok, (tuple, list)) else '')
+            val = getattr(tok, 'value', tok[1] if isinstance(tok, (tuple, list)) else '')
+            line = getattr(tok, 'line', tok[2] if isinstance(tok, (tuple, list)) else 0)
+            
             if kind == 'LET':
                 j = i + 1
-                if j < n and tokens[j][0] == 'MUT':
-                    j += 1
-                if j < n and tokens[j][0] in ('IDENT', 'TYPE'):
-                    self._lmap[('var', tokens[j][1])] = line
+                if j < n:
+                    j_kind = getattr(tokens[j], 'kind', tokens[j][0] if isinstance(tokens[j], (tuple, list)) else '')
+                    if j_kind == 'MUT':
+                        j += 1
+                if j < n:
+                    j_kind = getattr(tokens[j], 'kind', tokens[j][0] if isinstance(tokens[j], (tuple, list)) else '')
+                    j_val = getattr(tokens[j], 'value', tokens[j][1] if isinstance(tokens[j], (tuple, list)) else '')
+                    if j_kind in ('IDENT', 'TYPE'):
+                        self._lmap[('var', j_val)] = line
             elif kind == 'FN':
                 j = i + 1
-                if j < n and tokens[j][0] in ('IDENT', 'TYPE'):
-                    self._lmap[('fn', tokens[j][1])] = line
+                if j < n:
+                    j_kind = getattr(tokens[j], 'kind', tokens[j][0] if isinstance(tokens[j], (tuple, list)) else '')
+                    j_val = getattr(tokens[j], 'value', tokens[j][1] if isinstance(tokens[j], (tuple, list)) else '')
+                    if j_kind in ('IDENT', 'TYPE'):
+                        self._lmap[('fn', j_val)] = line
             elif kind == 'CLASS':
                 j = i + 1
-                if j < n and tokens[j][0] == 'IDENT':
-                    self._lmap[('class', tokens[j][1])] = line
+                if j < n:
+                    j_kind = getattr(tokens[j], 'kind', tokens[j][0] if isinstance(tokens[j], (tuple, list)) else '')
+                    j_val = getattr(tokens[j], 'value', tokens[j][1] if isinstance(tokens[j], (tuple, list)) else '')
+                    if j_kind == 'IDENT':
+                        self._lmap[('class', j_val)] = line
             i += 1
 
     def _ln(self, kind: str, name: str):
-        """Return the declared line for a symbol, or None."""
         return self._lmap.get((kind, name))
 
-    # ── Type helpers ──────────────────────────────────────────────────────────
-
     def _infer(self, node, scope: Scope):
-        """Return a type string for node, or None if unknown."""
         if node is None:
             return None
         if isinstance(node, ast.Number):
@@ -252,15 +240,11 @@ class Analyzer:
             return True
         if 'Null' in (expected, received):
             return True
-        # Numerics: widening allowed
         if expected in NUMERIC_TYPES and received in NUMERIC_TYPES:
             return True
         return False
 
-    # ── Top-level pre-pass ────────────────────────────────────────────────────
-
     def _pre_pass(self, nodes: list):
-        """Collect fn/class/namespace/thread symbols before the main walk."""
         for node in nodes:
             if isinstance(node, ast.FnDef):
                 if node.name not in self.functions:
@@ -270,7 +254,6 @@ class Analyzer:
                         'used':     False,
                         'line':     self._ln('fn', node.name),
                     }
-                # Don't emit duplicate here — handled in main walk
             elif isinstance(node, ast.ClassDef):
                 if node.name not in self.classes:
                     fields = {}
@@ -290,39 +273,30 @@ class Analyzer:
             elif isinstance(node, ast.Import):
                 self.imports.add(node.module_name)
 
-        # Second micro-pass: find thread(fn, id) calls to know which fns are threaded
         for node in nodes:
             self._find_thread_fns(node)
 
     def _find_thread_fns(self, node):
-        """Recursively find all thread(fn, id) calls and record fn names."""
         if isinstance(node, ast.ThreadCall):
             fc = node.func_call
             if isinstance(fc, ast.FnCall) and isinstance(fc.name, str):
                 self.thread_fns.add(fc.name)
             elif isinstance(fc, ast.Var):
                 self.thread_fns.add(fc.name)
-        # Recurse into bodies
         for attr in ('body', 'then_body', 'else_body', 'try_body', 'error_body'):
             body = getattr(node, attr, None)
             if body:
                 for child in body:
                     self._find_thread_fns(child)
 
-    # ── Main analysis entry ───────────────────────────────────────────────────
-
     def analyze(self, nodes: list, tokens: list):
         self._build_line_map(tokens)
         self._pre_pass(nodes)
         global_scope = Scope()
-        # Walk top-level nodes
         for node in nodes:
             self._node(node, global_scope, in_loop=False)
-        # Post analysis
         self._check_unused(global_scope)
         self._check_global_leaks(global_scope)
-
-    # ── Node dispatcher ───────────────────────────────────────────────────────
 
     def _node(self, node, scope: Scope, in_loop: bool = False):
         if node is None:
@@ -375,7 +349,7 @@ class Analyzer:
         elif t is ast.FFILoad:
             self._ffi_load(node, scope)
         elif t is ast.FFIBind:
-            pass  # trust caller
+            pass  
         elif t is ast.FileOpen:
             self._expr(node.path_expr, scope)
             for s in node.body:
@@ -403,10 +377,7 @@ class Analyzer:
         elif t in (ast.ThreadWait, ast.ThreadRunning, ast.Break, ast.Continue):
             pass
         else:
-            # Fallback: treat as expression
             self._expr(node, scope)
-
-    # ── Expression visitor ────────────────────────────────────────────────────
 
     def _expr(self, node, scope: Scope):
         if node is None:
@@ -464,12 +435,8 @@ class Analyzer:
             self._ffi_load(node, scope)
         elif t is ast.ThreadRunning:
             pass
-        # Literals: Number, Str, Bool, None_ → no action needed
-
-    # ── VarDecl ───────────────────────────────────────────────────────────────
 
     def _var_decl(self, node: ast.VarDecl, scope: Scope):
-        # Duplicate check (local scope only)
         if node.name in scope.vars:
             self._emit('ERROR', self._ln('var', node.name), 'Duplicate Symbol',
                        f"Variable '{node.name}' already exists.")
@@ -492,15 +459,12 @@ class Analyzer:
         }
         scope.declare(node.name, info)
 
-        # Track global allocations
         if is_heap:
             self.global_allocs += 1
 
-        # Track global mut vars for race-condition analysis
         if node.mutable and not node.is_local and scope.parent is None:
             self.global_muts[node.name] = info
 
-        # Type check: declared type vs inferred type
         if node.vtype and node.value is not None and not possibly_null:
             inferred = self._infer(node.value, scope)
             if inferred and not self._types_compat(node.vtype, inferred):
@@ -511,8 +475,6 @@ class Analyzer:
                 )
 
         self._expr(node.value, scope)
-
-    # ── Assignment ────────────────────────────────────────────────────────────
 
     def _assign(self, node: ast.Assign, scope: Scope):
         name = node.name if isinstance(node.name, str) else None
@@ -536,8 +498,6 @@ class Analyzer:
                     )
         self._expr(node.value, scope)
 
-    # ── Field assignment ──────────────────────────────────────────────────────
-
     def _field_assign(self, node: ast.FieldAssign, scope: Scope):
         if isinstance(node.obj, ast.Var):
             info = scope.lookup(node.obj.name)
@@ -550,7 +510,6 @@ class Analyzer:
                         f"Declare '{node.obj.name}' with 'mut' to modify fields."
                     )
                 else:
-                    # Check field-level mutability in the class definition
                     vtype = info.get('vtype')
                     if vtype and vtype in self.classes:
                         finfo = self.classes[vtype]['fields'].get(node.field)
@@ -561,10 +520,7 @@ class Analyzer:
                             )
         self._expr(node.value, scope)
 
-    # ── Function definition ───────────────────────────────────────────────────
-
     def _fn_def(self, node: ast.FnDef, parent_scope: Scope):
-        # Duplicate
         if node.name in self.functions and self.functions[node.name].get('_seen'):
             self._emit('ERROR', self._ln('fn', node.name), 'Duplicate Symbol',
                        f"Function '{node.name}' already exists.")
@@ -593,11 +549,9 @@ class Analyzer:
                 'possibly_null': False,
             })
 
-        # Race condition: if this fn is launched in a thread, check global writes
         if node.name in self.thread_fns:
             self._scan_race(node.body, node.name)
 
-        # Walk body, detect unreachable code after return
         found_return = False
         for stmt in node.body:
             if found_return:
@@ -607,7 +561,6 @@ class Analyzer:
             self._node(stmt, fn_scope, in_loop=False)
             if isinstance(stmt, ast.Return):
                 found_return = True
-                # Type-check return value
                 if node.ret_type and stmt.value is not None:
                     inferred = self._infer(stmt.value, fn_scope)
                     if inferred and not self._types_compat(node.ret_type, inferred):
@@ -616,7 +569,6 @@ class Analyzer:
                             f"Expected:\n{node.ret_type}\n\nReceived:\n{inferred}"
                         )
 
-        # Unused locals & local heap leaks
         param_names = {p[0] for p in (node.params or [])}
         for vname, vinfo in fn_scope.vars.items():
             if vname in param_names:
@@ -631,8 +583,6 @@ class Analyzer:
                     f"Call {vname}.drop() before leaving scope."
                 )
 
-    # ── Class definition ──────────────────────────────────────────────────────
-
     def _class_def(self, node: ast.ClassDef, scope: Scope):
         if node.name in self.classes and self.classes[node.name].get('_seen'):
             self._emit('ERROR', self._ln('class', node.name), 'Duplicate Symbol',
@@ -641,12 +591,8 @@ class Analyzer:
             if node.name in self.classes:
                 self.classes[node.name]['_seen'] = True
 
-        # Walk every method body so that references to globals inside methods
-        # are recorded (prevents false-positive "Unused Variable" for globals
-        # that are only referenced within class methods).
         for method in node.methods:
             method_scope = Scope(parent=scope)
-            # Bind 'self' and method parameters into the local scope
             method_scope.declare('self', {
                 'mutable': True, 'vtype': node.name, 'dropped': False,
                 'used': True, 'is_heap': False, 'line': None,
@@ -661,8 +607,6 @@ class Analyzer:
             for stmt in (method.body or []):
                 self._node(stmt, method_scope, in_loop=False)
 
-    # ── Drop ──────────────────────────────────────────────────────────────────
-
     def _drop(self, node: ast.Drop, scope: Scope):
         info = scope.lookup(node.name)
         if info is None:
@@ -675,16 +619,11 @@ class Analyzer:
                 f"Variable '{node.name}' was already dropped."
             )
         else:
-            # Approximate drop line from token scan
             scope.mark_dropped(node.name, info.get('line'))
-
-    # ── Thread call ───────────────────────────────────────────────────────────
 
     def _thread_call(self, node: ast.ThreadCall, scope: Scope):
         self._expr(node.func_call, scope)
         self._expr(node.thread_id, scope)
-
-    # ── While loop ────────────────────────────────────────────────────────────
 
     def _while(self, node: ast.While, scope: Scope):
         is_const_true  = (isinstance(node.cond, ast.Bool) and
@@ -715,8 +654,6 @@ class Analyzer:
                     return True
         return False
 
-    # ── For loop ──────────────────────────────────────────────────────────────
-
     def _for(self, node: ast.For, scope: Scope):
         loop_scope = Scope(parent=scope)
         loop_scope.declare(node.var, {
@@ -728,8 +665,6 @@ class Analyzer:
         for stmt in node.body:
             self._node(stmt, loop_scope, in_loop=True)
 
-    # ── If ────────────────────────────────────────────────────────────────────
-
     def _if(self, node: ast.If, scope: Scope):
         if isinstance(node.cond, ast.Compare):
             self._null_compare(node.cond, scope)
@@ -739,8 +674,6 @@ class Analyzer:
         for stmt in (node.else_body or []):
             self._node(stmt, scope)
 
-    # ── Function call ─────────────────────────────────────────────────────────
-
     def _fn_call(self, node: ast.FnCall, scope: Scope):
         name = node.name if isinstance(node.name, str) else None
         if name is None:
@@ -748,7 +681,6 @@ class Analyzer:
                 self._expr(a, scope)
             return
 
-        # Namespace check: e.g. math.sin(x) → need 'use math'
         if '.' in name:
             ns = name.split('.')[0]
             if ns not in self.namespaces:
@@ -763,9 +695,6 @@ class Analyzer:
                 self._expr(a, scope)
             return
 
-        # Unknown function (class names are valid constructor calls)
-        # Also allow bare module-name calls when the module is active via 'use'
-        # (e.g. `use random` makes `random(...)` a valid direct invocation).
         if name not in self.functions and name not in BUILTIN_FNS \
                 and name not in self.classes \
                 and name not in self.namespaces:
@@ -801,8 +730,6 @@ class Analyzer:
         for a in node.args:
             self._expr(a, scope)
 
-    # ── Variable usage ────────────────────────────────────────────────────────
-
     def _var_usage(self, node: ast.Var, scope: Scope):
         name = node.name
         if '.' in name:
@@ -816,7 +743,6 @@ class Analyzer:
         if info is None:
             if (name not in self.functions and name not in self.classes
                     and name not in BUILTIN_FNS):
-                # Collect all known names for a fuzzy suggestion
                 known = (list(self.functions) + list(self.classes) +
                          list(BUILTIN_FNS) + list(scope.vars.keys()))
                 suggestion = _closest_name(name, known)
@@ -837,8 +763,6 @@ class Analyzer:
             self._emit('WARNING', info.get('line'), 'Possible Null Usage',
                        f"Variable '{name}' may contain Null.")
 
-    # ── Collection method call ────────────────────────────────────────────────
-
     def _collection_method(self, node: ast.CollectionMethodCall, scope: Scope):
         self._expr(node.obj, scope)
         if isinstance(node.obj, ast.Var) and node.method in MUTATING_METHODS:
@@ -852,8 +776,6 @@ class Analyzer:
         for a in node.args:
             self._expr(a, scope)
 
-    # ── FFI load ──────────────────────────────────────────────────────────────
-
     def _ffi_load(self, node: ast.FFILoad, scope: Scope):
         if isinstance(node.path_expr, ast.Str):
             path = node.path_expr.value.strip('"')
@@ -861,24 +783,17 @@ class Analyzer:
                 self._emit('WARNING', None, 'Library Not Found',
                            f"Library not found: {path}")
 
-    # ── Null arithmetic ───────────────────────────────────────────────────────
-
     def _null_arith(self, node, scope: Scope):
-        # Only flag literal Null here; Var null-checks are handled in _var_usage
         if self._is_null_node(node):
             self._emit('WARNING', None, 'Possible Null Usage',
                        "Expression uses Null in arithmetic.",
                        "Null in arithmetic evaluates to 0 or False.")
-
-    # ── Null comparison ───────────────────────────────────────────────────────
 
     def _null_compare(self, node: ast.Compare, scope: Scope):
         if self._is_null_node(node.left) or self._is_null_node(node.right):
             self._emit('INFO', None, 'Condition Always False',
                        "Condition always evaluates to False.",
                        f"Comparison with Null is always False.")
-
-    # ── Race condition scan ───────────────────────────────────────────────────
 
     def _scan_race(self, body: list, fn_name: str):
         for stmt in body:
@@ -895,11 +810,8 @@ class Analyzer:
                 if sub:
                     self._scan_race(sub, fn_name)
 
-    # ── Unused symbols ────────────────────────────────────────────────────────
-
     def _check_unused(self, global_scope: Scope):
         for fname, finfo in self.functions.items():
-            # 'main' is the implicit program entry point — never flag it unused
             if fname == 'main':
                 continue
             if not finfo.get('used'):
@@ -909,8 +821,6 @@ class Analyzer:
             if not vinfo.get('used'):
                 self._emit('INFO', vinfo.get('line'), 'Unused Variable',
                            f"Unused variable: {vname}")
-
-    # ── Global heap leak check ────────────────────────────────────────────────
 
     def _check_global_leaks(self, global_scope: Scope):
         leaks = []
@@ -922,8 +832,6 @@ class Analyzer:
                     f"Variable '{vname}' was never dropped."
                 )
         self._leak_vars = leaks
-
-    # ── Report ────────────────────────────────────────────────────────────────
 
     def report(self, filepath: str, strict: bool = False) -> bool:
         errors   = [i for i in self.issues if i.severity == 'ERROR']
@@ -958,7 +866,6 @@ class Analyzer:
                 print(f"{ANSI['DIM']}{'─' * 44}{ANSI['RESET']}")
                 print()
 
-        # Memory summary
         leaks = self._leak_vars
         print(f"{ANSI['DIM']}{'─' * 44}{ANSI['RESET']}")
         print("Analysis Complete")
@@ -1003,8 +910,10 @@ def check_file(filepath: str, strict: bool = False) -> bool:
     with open(filepath, 'r') as f:
         source = f.read()
 
+    source_lines = source.split('\n')
+
     try:
-        tokens   = tokenize(source)
+        tokens = tokenize(source)
 
         # ── Pre-parsing Keyword & Typo Pass ──
         KEYWORD_MAPPING = {
@@ -1018,26 +927,48 @@ def check_file(filepath: str, strict: bool = False) -> bool:
             'for', 'if', 'else', 'return', 'print', 'println', 'use', 'import'
         ]
 
+        has_typo_errors = False
         for tok in tokens:
-            kind, val, line = tok[0], tok[1], tok[2]
+            kind = getattr(tok, 'kind', tok[0] if isinstance(tok, (tuple, list)) else '')
+            val = getattr(tok, 'value', tok[1] if isinstance(tok, (tuple, list)) else '')
+            line = getattr(tok, 'line', tok[2] if isinstance(tok, (tuple, list)) else 0)
+            col_offset = getattr(tok, 'col', 0)
+
             if kind == 'IDENT':
-                # Check for keywords from foreign languages
+                # Skip entirely capitalized words (like class names or constants: NN)
+                if val.isupper():
+                    continue
+
                 if val in KEYWORD_MAPPING:
                     correct = KEYWORD_MAPPING[val]
-                    print(f"\n\033[1;31mERROR\033[0m:")
-                    print(f"Line {line}: Invalid Keyword")
-                    print(f"Found '{val}', but Rubidium uses '{correct}'.")
-                    print(f"\nSuggestion:\n  Use '{correct}' instead of '{val}'.\n")
-                    sys.exit(1)
+                    error_line_str = source_lines[line - 1] if 0 < line <= len(source_lines) else ""
+                    padding = " " * col_offset
+                    underline = "^" * len(val)
 
-                # Check for misspelled keywords using fuzzy edit distance
+                    print(f"\n\033[1;31mERROR[Syntax]\033[0m on Line {line}: Invalid Keyword")
+                    print(f"Found '{val}', but Rubidium uses '{correct}'.")
+                    print(f" \033[1;36m-->\033[0m line {line}")
+                    print(f" \033[1;36m{line:3} |\033[0m {error_line_str}")
+                    print(f"     | \033[1;31m{padding}{underline}\033[0m")
+                    print(f"\nSuggestion:\n  Use '{correct}' instead of '{val}'.\n")
+                    has_typo_errors = True
+
                 suggestion = _closest_name(val, RUBIDIUM_KEYWORDS, max_dist=1)
                 if suggestion and val not in RUBIDIUM_KEYWORDS:
-                    print(f"\n\033[1;31mERROR\033[0m:")
-                    print(f"Line {line}: Misspelled Keyword")
+                    error_line_str = source_lines[line - 1] if 0 < line <= len(source_lines) else ""
+                    padding = " " * col_offset
+                    underline = "^" * len(val)
+
+                    print(f"\n\033[1;31mERROR[Syntax]\033[0m on Line {line}: Misspelled Keyword")
                     print(f"Found '{val}'. Did you mean '{suggestion}'?")
+                    print(f" \033[1;36m-->\033[0m line {line}")
+                    print(f" \033[1;36m{line:3} |\033[0m {error_line_str}")
+                    print(f"     | \033[1;31m{padding}{underline}\033[0m")
                     print(f"\nSuggestion:\n  Change '{val}' to '{suggestion}'.\n")
-                    sys.exit(1)
+                    has_typo_errors = True
+
+        if has_typo_errors:
+            sys.exit(1)
 
         ast_tree = Parser(tokens).parse()
     except SyntaxError as e:
