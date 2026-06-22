@@ -534,7 +534,7 @@ class Parser:
                     k = self.expr(); self.match("COLON"); v = self.expr()
                     pairs.append((k, v))
                 self.match("RBRACKET")
-                return DictExpr(pairs)
+                return DictExpr(pairs, is_index=True)
             else:
                 elements = [first_expr]
                 while self.peek() and self.peek()[0] == "COMMA":

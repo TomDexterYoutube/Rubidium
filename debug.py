@@ -138,11 +138,6 @@ class Debugger:
 
         self.line = getattr(node, "line", "?")
 
-        print(
-            f"[DEBUG] Line {self.line}: {type(node).__name__}"
-        )
-
-
         # -----------------------------
         # Variable Declaration
         # -----------------------------
@@ -585,7 +580,7 @@ class Analyzer:
         if isinstance(node, ast.ListExpr):
             return 'list'
         if isinstance(node, ast.DictExpr):
-            return 'dict'
+            return 'index' if getattr(node, 'is_index', False) else 'dict'
         if isinstance(node, ast.ClassInstantiate):
             return node.class_name
         if isinstance(node, ast.BinOp):
@@ -707,10 +702,17 @@ class Analyzer:
         elif t is ast.If:
             self._if(node, scope)
         elif t is ast.Try:
+            try_scope = Scope(parent=scope)
             for s in node.try_body:
-                self._node(s, scope, in_loop)
+                self._node(s, try_scope, in_loop)
+            error_scope = Scope(parent=scope)
+            error_scope.declare('error', {
+                'mutable': False, 'vtype': 'str', 'dropped': False,
+                'used': True, 'is_heap': False, 'line': None,
+                'drop_line': None, 'possibly_null': False,
+            })
             for s in node.error_body:
-                self._node(s, scope, in_loop)
+                self._node(s, error_scope, in_loop)
         elif t is ast.Return:
             self._expr(node.value, scope)
         elif t is ast.Print:
@@ -900,6 +902,12 @@ class Analyzer:
             info = scope.lookup(node.obj.name)
             if info:
                 scope.mark_used(node.obj.name)
+                vtype = info.get('vtype')
+                # Mark field as used in class map
+                if vtype and vtype in self.classes:
+                    finfo = self.classes[vtype]['fields'].get(node.field)
+                    if finfo:
+                        finfo['used'] = True
                 if not info.get('mutable'):
                     self._emit(
                         'ERROR', info.get('line'), 'Mutability Violation',
@@ -907,7 +915,6 @@ class Analyzer:
                         f"Declare '{node.obj.name}' with 'mut' to modify fields."
                     )
                 else:
-                    vtype = info.get('vtype')
                     if vtype and vtype in self.classes:
                         finfo = self.classes[vtype]['fields'].get(node.field)
                         if finfo and not finfo.get('mutable'):
@@ -995,6 +1002,18 @@ class Analyzer:
                 'used': True, 'is_heap': False, 'line': None,
                 'drop_line': None, 'possibly_null': False,
             })
+            # Add class fields to method scope so they can be referenced directly
+            for fname, finfo in self.classes[node.name]['fields'].items():
+                method_scope.declare(fname, {
+                    'mutable': finfo.get('mutable', True),
+                    'vtype': finfo.get('vtype'),
+                    'dropped': False,
+                    'used': True,  # pre-mark used to avoid spurious warnings inside methods
+                    'is_heap': finfo.get('vtype') in HEAP_TYPES if finfo.get('vtype') else False,
+                    'line': None,
+                    'drop_line': None,
+                    'possibly_null': False,
+                })
             for pname, ptype in (method.params or []):
                 method_scope.declare(pname, {
                     'mutable': True, 'vtype': ptype, 'dropped': False,
@@ -1148,6 +1167,10 @@ class Analyzer:
         
         # Intercept native types passed as configuration/function args
         if name in ALL_TYPES:
+            return
+
+        # Allow module/namespace names
+        if name in self.namespaces or name in KNOWN_MODULES:
             return
 
         if '.' in name:
@@ -1377,20 +1400,6 @@ def check_file(filepath: str, strict: bool = False) -> bool:
                     print(f" \033[1;36m{line:3} |\033[0m {error_line_str}")
                     print(f"     | \033[1;31m{padding}{underline}\033[0m")
                     print(f"\nSuggestion:\n  Use '{correct}' instead of '{val}'.\n")
-                    has_typo_errors = True
-
-                suggestion = _closest_name(val, RUBIDIUM_KEYWORDS, max_dist=1)
-                if suggestion and val not in RUBIDIUM_KEYWORDS:
-                    error_line_str = source_lines[line - 1] if 0 < line <= len(source_lines) else ""
-                    padding = " " * col_offset
-                    underline = "^" * len(val)
-
-                    print(f"\n\033[1;31mERROR[Syntax]\033[0m on Line {line}: Misspelled Keyword")
-                    print(f"Found '{val}'. Did you mean '{suggestion}'?")
-                    print(f" \033[1;36m-->\033[0m line {line}")
-                    print(f" \033[1;36m{line:3} |\033[0m {error_line_str}")
-                    print(f"     | \033[1;31m{padding}{underline}\033[0m")
-                    print(f"\nSuggestion:\n  Change '{val}' to '{suggestion}'.\n")
                     has_typo_errors = True
 
         if has_typo_errors:

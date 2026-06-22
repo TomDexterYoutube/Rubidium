@@ -28,8 +28,9 @@ class ListExpr:
         self.elements = elements
 
 class DictExpr:
-    def __init__(self, pairs):
+    def __init__(self, pairs, is_index: bool = False):
         self.pairs = pairs
+        self.is_index = is_index  # True for [key: val] index literals, False for {key = val} dict literals
 
 class BinOp:
     def __init__(self, left, op, right):
