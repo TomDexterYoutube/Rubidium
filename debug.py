@@ -998,19 +998,24 @@ def check_file(filepath: str, strict: bool = False) -> bool:
 def main():
     ap = argparse.ArgumentParser(
         description='Rubidium Static Analyzer & Debugger',
-        usage='%(prog)s check <file.rub> [--strict]'
+        usage='%(prog)s <file.rub> [--strict]'
     )
-    ap.add_argument('command', choices=['check'],
-                    help="'check' to analyze a source file")
-    ap.add_argument('file',
-                    help='Rubidium source file (.rub)')
-    ap.add_argument('--strict', action='store_true',
-                    help='Strict mode: warnings become errors')
+
+    ap.add_argument(
+        'file',
+        help='Rubidium source file (.rub)'
+    )
+
+    ap.add_argument(
+        '--strict',
+        action='store_true',
+        help='Strict mode: warnings become errors'
+    )
+
     args = ap.parse_args()
 
     ok = check_file(args.file, strict=args.strict)
     sys.exit(0 if ok else 1)
-
 
 if __name__ == '__main__':
     main()
