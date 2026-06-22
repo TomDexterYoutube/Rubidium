@@ -17,6 +17,29 @@ from parser import Parser
 import rub_ast as ast
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Fuzzy-match helper (for "did you mean?" suggestions)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _edit_distance(a: str, b: str) -> int:
+    la, lb = len(a), len(b)
+    dp = list(range(lb + 1))
+    for i in range(1, la + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, lb + 1):
+            temp = dp[j]
+            dp[j] = prev if a[i-1] == b[j-1] else 1 + min(prev, dp[j], dp[j-1])
+            prev = temp
+    return dp[lb]
+
+def _closest_name(word: str, candidates, max_dist: int = 2) -> str | None:
+    best, best_d = None, max_dist + 1
+    for c in candidates:
+        d = _edit_distance(word.lower(), c.lower())
+        if d < best_d:
+            best, best_d = c, d
+    return best if best_d <= max_dist else None
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -427,8 +450,11 @@ class Analyzer:
             self._expr(node.obj, scope)
         elif t is ast.ClassInstantiate:
             if node.class_name not in self.classes:
-                self._emit('ERROR', None, 'Unknown Class',
-                           f"Unknown class: {node.class_name}")
+                suggestion = _closest_name(node.class_name, list(self.classes))
+                msg = f"Unknown class: {node.class_name}"
+                if suggestion:
+                    msg += f"\n\nDid you mean: {suggestion}?"
+                self._emit('ERROR', None, 'Unknown Class', msg)
             else:
                 self.classes[node.class_name]['used'] = True
         elif t is ast.Input:
@@ -615,6 +641,26 @@ class Analyzer:
             if node.name in self.classes:
                 self.classes[node.name]['_seen'] = True
 
+        # Walk every method body so that references to globals inside methods
+        # are recorded (prevents false-positive "Unused Variable" for globals
+        # that are only referenced within class methods).
+        for method in node.methods:
+            method_scope = Scope(parent=scope)
+            # Bind 'self' and method parameters into the local scope
+            method_scope.declare('self', {
+                'mutable': True, 'vtype': node.name, 'dropped': False,
+                'used': True, 'is_heap': False, 'line': None,
+                'drop_line': None, 'possibly_null': False,
+            })
+            for pname, ptype in (method.params or []):
+                method_scope.declare(pname, {
+                    'mutable': True, 'vtype': ptype, 'dropped': False,
+                    'used': True, 'is_heap': ptype in HEAP_TYPES if ptype else False,
+                    'line': None, 'drop_line': None, 'possibly_null': False,
+                })
+            for stmt in (method.body or []):
+                self._node(stmt, method_scope, in_loop=False)
+
     # ── Drop ──────────────────────────────────────────────────────────────────
 
     def _drop(self, node: ast.Drop, scope: Scope):
@@ -717,10 +763,18 @@ class Analyzer:
                 self._expr(a, scope)
             return
 
-        # Unknown function
-        if name not in self.functions and name not in BUILTIN_FNS:
-            self._emit('ERROR', None, 'Unknown Function',
-                       f"Unknown function: {name}()")
+        # Unknown function (class names are valid constructor calls)
+        # Also allow bare module-name calls when the module is active via 'use'
+        # (e.g. `use random` makes `random(...)` a valid direct invocation).
+        if name not in self.functions and name not in BUILTIN_FNS \
+                and name not in self.classes \
+                and name not in self.namespaces:
+            all_fns = list(self.functions) + list(BUILTIN_FNS) + list(self.classes)
+            suggestion = _closest_name(name, all_fns)
+            msg = f"Unknown function: {name}()"
+            if suggestion:
+                msg += f"\n\nDid you mean: {suggestion}()?"
+            self._emit('ERROR', None, 'Unknown Function', msg)
             for a in node.args:
                 self._expr(a, scope)
             return
@@ -762,8 +816,14 @@ class Analyzer:
         if info is None:
             if (name not in self.functions and name not in self.classes
                     and name not in BUILTIN_FNS):
-                self._emit('ERROR', None, 'Unknown Variable',
-                           f"Unknown variable: {name}")
+                # Collect all known names for a fuzzy suggestion
+                known = (list(self.functions) + list(self.classes) +
+                         list(BUILTIN_FNS) + list(scope.vars.keys()))
+                suggestion = _closest_name(name, known)
+                msg = f"Unknown variable: {name}"
+                if suggestion:
+                    msg += f"\n\nDid you mean: {suggestion}?"
+                self._emit('ERROR', None, 'Unknown Variable', msg)
             return
 
         scope.mark_used(name)
@@ -839,6 +899,9 @@ class Analyzer:
 
     def _check_unused(self, global_scope: Scope):
         for fname, finfo in self.functions.items():
+            # 'main' is the implicit program entry point — never flag it unused
+            if fname == 'main':
+                continue
             if not finfo.get('used'):
                 self._emit('INFO', finfo.get('line'), 'Unused Function',
                            f"Unused function: {fname}()")

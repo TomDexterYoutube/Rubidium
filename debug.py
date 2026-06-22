@@ -243,6 +243,84 @@ class OsDrop(ASTNode):
 # ==========================================
 class ParseError(Exception): pass
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Keyword typo detection
+# ──────────────────────────────────────────────────────────────────────────────
+
+_KEYWORDS = [
+    'fn', 'let', 'class', 'if', 'else', 'while', 'for', 'in',
+    'return', 'break', 'continue', 'use', 'import', 'try', 'error',
+    'open', 'print', 'println', 'input', 'thread', 'mut', 'local',
+    'as', 'and', 'or', 'not',
+]
+
+def _edit_distance(a: str, b: str) -> int:
+    la, lb = len(a), len(b)
+    dp = list(range(lb + 1))
+    for i in range(1, la + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, lb + 1):
+            temp = dp[j]
+            dp[j] = prev if a[i-1] == b[j-1] else 1 + min(prev, dp[j], dp[j-1])
+            prev = temp
+    return dp[lb]
+
+def _closest_keyword(word: str, max_dist: int = 2) -> Optional[str]:
+    word_l = word.lower()
+    best, best_d = None, max_dist + 1
+    for kw in _KEYWORDS:
+        d = _edit_distance(word_l, kw)
+        if d < best_d:
+            best, best_d = kw, d
+    return best if best_d <= max_dist else None
+
+_CONSTRUCT_HINTS = {
+    'fn':      lambda rest: (
+        # IDENT followed by LPAREN  → function definition (e.g. `def foo(`)
+        # OR IDENT followed by LPAREN after optional TYPE  → covers `def add(a: i32`
+        any(
+            rest[i].kind == 'IDENT' and
+            any(t.kind == 'LPAREN' for t in rest[i:i+4])
+            for i in range(min(3, len(rest)))
+        )
+    ),
+    'class':   lambda rest: any(t.kind == 'IDENT' for t in rest[:3]) and not any(t.kind == 'LPAREN' for t in rest[:2]),
+    'let':     lambda rest: any(t.kind in ('IDENT', 'MUT') for t in rest[:3]) and not any(t.kind == 'LPAREN' for t in rest[:3]),
+    'if':      lambda rest: len(rest) > 0 and rest[0].kind not in ('LPAREN',),
+    'while':   lambda rest: len(rest) > 0,
+    'for':     lambda rest: any(t.kind == 'IN' for t in rest[:6]),
+    'return':  lambda rest: len(rest) > 0,
+    'import':  lambda rest: any(t.kind == 'IDENT' for t in rest[:2]),
+    'use':     lambda rest: any(t.kind == 'IDENT' for t in rest[:2]),
+    'try':     lambda rest: any(t.kind == 'LBRACE' for t in rest[:2]),
+    'print':   lambda rest: any(t.kind == 'LPAREN' for t in rest[:2]),
+    'println': lambda rest: any(t.kind == 'LPAREN' for t in rest[:2]),
+}
+
+def _guess_construct(word: str, rest_tokens: list) -> Optional[str]:
+    """Return the most likely intended keyword given the misspelled word and the tokens that follow."""
+    # Common aliases from other languages that are too far for edit-distance alone
+    _ALIASES = {
+        'def': 'fn', 'func': 'fn', 'function': 'fn', 'fun': 'fn', 'proc': 'fn',
+        'var': 'let', 'val': 'let', 'const': 'let',
+        'elif': 'else if',
+        'do': 'while',
+        'foreach': 'for',
+    }
+    wl = word.lower()
+    if wl in _ALIASES:
+        return _ALIASES[wl]
+
+    candidate = _closest_keyword(word)
+    if candidate is None:
+        return None
+    # Refine using structural hints from the following tokens
+    for kw, hint_fn in _CONSTRUCT_HINTS.items():
+        if _edit_distance(wl, kw) <= 2 and hint_fn(rest_tokens):
+            return kw
+    return candidate
+
+
 class Parser:
     def __init__(self, tokens: List[Token]):
         self.tokens = tokens
@@ -292,6 +370,23 @@ class Parser:
         if tok.kind == 'OPEN': return self.parse_open_block()
         if tok.kind in ('PRINT', 'PRINTLN', 'INPUT', 'FILE_READ', 'FILE_WRITE', 'FILE', 'RANGE', 'THREAD', 'OS'):
             return self.parse_call_or_print(tok)
+
+        # Typo / misspelled keyword detection.
+        # If we have a bare IDENT at statement position, check whether it looks
+        # like a misspelled keyword before falling through to expression parsing.
+        if tok.kind == 'IDENT':
+            rest = self.tokens[self.pos + 1:]
+            suggestion = _guess_construct(tok.value, rest)
+            if suggestion:
+                R, B, DIM = '\033[0m', '\033[1;31m', '\033[2m'
+                Y = '\033[1;33m'
+                print(
+                    f"{B}error[P100]{R}: Unknown keyword `{tok.value}` at line {tok.line}\n"
+                    f" {DIM}hint:{R} did you mean `{Y}{suggestion}{R}`?\n"
+                    f"      Replace `{tok.value}` with `{suggestion}`\n"
+                )
+                self.errors += 1
+                raise ParseError()
 
         expr = self.parse_expression()
         
@@ -1233,7 +1328,12 @@ class StaticAnalyzer:
                 # Sibling method call (e.g. heal(40) inside use_potion — no 'self' keyword per spec)
                 for arg in expr.args: self.check_expr(arg, current_line)
             elif target_name not in self.global_functions and target_name not in self.builtins and target_name not in self.classes:
-                self.report_error("E003", f"Cannot find function or class `{target_name}`", expr.line)
+                candidates = list(self.global_functions) + list(self.builtins) + list(self.classes)
+                suggestion = _closest_name(target_name, candidates)
+                msg = f"Cannot find function or class `{target_name}`"
+                if suggestion:
+                    msg += f" — did you mean `{suggestion}`?"
+                self.report_error("E003", msg, expr.line)
             else:
                 f_def = self.global_functions.get(target_name)
                 if f_def:
