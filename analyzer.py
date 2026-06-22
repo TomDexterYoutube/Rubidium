@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+Rubidium Static Analyzer
+Usage:  python analyzer.py check <file.rub> [--strict]
+"""
+
 import sys
 import os
 import argparse
@@ -681,6 +687,13 @@ class Analyzer:
                 self._expr(a, scope)
             return
 
+        # Intercept valid collection call syntax (e.g. layer_var().add())
+        if scope.lookup(name) is not None:
+            scope.mark_used(name)
+            for a in node.args:
+                self._expr(a, scope)
+            return
+
         if '.' in name:
             ns = name.split('.')[0]
             if ns not in self.namespaces:
@@ -702,7 +715,7 @@ class Analyzer:
             suggestion = _closest_name(name, all_fns)
             msg = f"Unknown function: {name}()"
             if suggestion:
-                msg += f"\n\nDid you mean: {suggestion}()?"
+                msg += f"\n\nDid you mean: {suggestion}?"
             self._emit('ERROR', None, 'Unknown Function', msg)
             for a in node.args:
                 self._expr(a, scope)
@@ -732,6 +745,11 @@ class Analyzer:
 
     def _var_usage(self, node: ast.Var, scope: Scope):
         name = node.name
+        
+        # Intercept native types passed as configuration/function args
+        if name in ALL_TYPES:
+            return
+
         if '.' in name:
             ns = name.split('.')[0]
             if ns not in self.namespaces and ns in KNOWN_MODULES:
@@ -935,7 +953,6 @@ def check_file(filepath: str, strict: bool = False) -> bool:
             col_offset = getattr(tok, 'col', 0)
 
             if kind == 'IDENT':
-                # Skip entirely capitalized words (like class names or constants: NN)
                 if val.isupper():
                     continue
 
