@@ -2,7 +2,6 @@ import sys
 import os
 import argparse
 
-# Ensure local imports work if parts are separate, though everything is combined here
 _dir = os.path.dirname(os.path.abspath(__file__))
 if _dir not in sys.path:
     sys.path.insert(0, _dir)
@@ -10,10 +9,6 @@ if _dir not in sys.path:
 from lexer import tokenize
 from parser import Parser
 import rub_ast as ast
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Fuzzy-match helper (for "did you mean?" suggestions)
-# ──────────────────────────────────────────────────────────────────────────────
 
 def _edit_distance(a: str, b: str) -> int:
     la, lb = len(a), len(b)
@@ -33,10 +28,6 @@ def _closest_name(word: str, candidates, max_dist: int = 1) -> str | None:
         if d < best_d:
             best, best_d = c, d
     return best if best_d <= max_dist else None
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Constants
-# ──────────────────────────────────────────────────────────────────────────────
 
 KNOWN_MODULES = {
     'random', 'math', 'time', 'json', 'os', 'FFI', 'net', 'crypto', 'io',
