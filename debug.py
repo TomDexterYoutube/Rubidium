@@ -113,10 +113,401 @@ class Scope:
         info = self.lookup(name)
         return bool(info and info.get('dropped'))
 
+class Debugger:
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Analyzer
-# ──────────────────────────────────────────────────────────────────────────────
+    def __init__(self):
+        self.scope = Scope()
+        self.line = 0
+        self.errors = []
+        self.output = []
+
+
+    def run(self, nodes):
+
+        for node in nodes:
+            self.execute(node)
+
+        return len(self.errors) == 0
+
+
+
+    def execute(self, node):
+
+        if node is None:
+            return
+
+        self.line = getattr(node, "line", "?")
+
+        print(
+            f"[DEBUG] Line {self.line}: {type(node).__name__}"
+        )
+
+
+        # -----------------------------
+        # Variable Declaration
+        # -----------------------------
+
+        if isinstance(node, ast.VarDecl):
+
+            value = self.evaluate(node.value)
+
+            self.scope.declare(
+                node.name,
+                {
+                    "value": value,
+                    "type": self.rub_type(value),
+                    "dropped": False,
+                    "line": self.line
+                }
+            )
+
+
+        # -----------------------------
+        # Assignment
+        # -----------------------------
+
+        elif isinstance(node, ast.Assign):
+
+            info = self.scope.lookup(node.name)
+
+            if info is None:
+                self.error(
+                    f"Unknown variable '{node.name}'"
+                )
+                return
+
+
+            if info.get("dropped"):
+                self.error(
+                    f"Variable '{node.name}' was dropped"
+                )
+                return
+
+
+            info["value"] = self.evaluate(node.value)
+            info["type"] = self.rub_type(info["value"])
+
+
+
+        # -----------------------------
+        # Drop
+        # -----------------------------
+
+        elif isinstance(node, ast.Drop):
+
+            info = self.scope.lookup(node.name)
+
+            if info is None:
+
+                self.error(
+                    f"Cannot drop unknown variable '{node.name}'"
+                )
+
+            elif info.get("dropped"):
+
+                self.error(
+                    f"Variable '{node.name}' already dropped"
+                )
+
+            else:
+
+                info["dropped"] = True
+                info["value"] = None
+
+
+
+        # -----------------------------
+        # Print
+        # -----------------------------
+
+        elif isinstance(node, ast.Print):
+
+            value = self.evaluate(node.value)
+
+            print(value)
+
+            self.output.append(value)
+
+
+
+        elif isinstance(node, ast.Println):
+
+            value = self.evaluate(node.value)
+
+            print(value)
+
+            self.output.append(value)
+
+
+
+        # -----------------------------
+        # If
+        # -----------------------------
+
+        elif isinstance(node, ast.If):
+
+            condition = self.evaluate(node.cond)
+
+
+            if condition:
+
+                for stmt in node.then_body:
+                    self.execute(stmt)
+
+            else:
+
+                for stmt in (node.else_body or []):
+                    self.execute(stmt)
+
+
+
+        # -----------------------------
+        # While
+        # -----------------------------
+
+        elif isinstance(node, ast.While):
+
+            count = 0
+
+            while self.evaluate(node.cond):
+
+                for stmt in node.body:
+                    self.execute(stmt)
+
+
+                count += 1
+
+
+                # emergency brake
+                # because infinite loops are
+                # the compiler equivalent of a toddler with scissors
+
+                if count > 100000:
+
+                    self.error(
+                        "Possible infinite loop"
+                    )
+
+                    break
+
+
+
+        # -----------------------------
+        # Function Call
+        # -----------------------------
+
+        elif isinstance(node, ast.FnCall):
+
+            for arg in node.args:
+                self.evaluate(arg)
+
+
+
+        else:
+
+            # fallback expression
+            self.evaluate(node)
+
+
+
+
+    def evaluate(self,node):
+
+        if node is None:
+            return None
+
+
+
+        # Numbers
+
+        if isinstance(node, ast.Number):
+
+            return node.value
+
+
+
+        # Strings
+
+        if isinstance(node, ast.Str):
+
+            return node.value
+
+
+
+        # Bool
+
+        if isinstance(node, ast.Bool):
+
+            value = str(node.value).lower()
+
+            if value == "true":
+                return True
+
+            if value == "false":
+                return False
+
+            if value in ("null","none"):
+                return None
+
+            return value
+
+
+
+        # Variables
+
+        if isinstance(node, ast.Var):
+
+            info = self.scope.lookup(node.name)
+
+
+            if info is None:
+
+                self.error(
+                    f"Variable '{node.name}' does not exist"
+                )
+
+                return None
+
+
+
+            if info.get("dropped"):
+
+                self.error(
+                    f"Variable '{node.name}' used after drop"
+                )
+
+                return None
+
+
+
+            return info["value"]
+
+
+
+
+        # Binary Operations
+
+        if isinstance(node, ast.BinOp):
+
+            left = self.evaluate(node.left)
+            right = self.evaluate(node.right)
+
+
+            try:
+
+                if node.op == "+":
+                    return left + right
+
+                if node.op == "-":
+                    return left - right
+
+                if node.op == "*":
+                    return left * right
+
+                if node.op == "/":
+                    return left / right
+
+
+            except Exception as e:
+
+                self.error(
+                    f"Operation failed: {e}"
+                )
+
+                return None
+
+
+
+
+        # Comparisons
+
+        if isinstance(node, ast.Compare):
+
+            left = self.evaluate(node.left)
+            right = self.evaluate(node.right)
+
+
+            try:
+
+                if node.op == "==":
+                    return left == right
+
+                if node.op == "!=":
+                    return left != right
+
+                if node.op == ">":
+                    return left > right
+
+                if node.op == "<":
+                    return left < right
+
+
+            except Exception as e:
+
+                self.error(
+                    f"Comparison failed: {e}"
+                )
+
+                return False
+
+
+
+        # Lists
+
+        if isinstance(node, ast.ListExpr):
+
+            return [
+                self.evaluate(x)
+                for x in node.elements
+            ]
+
+
+
+        return None
+
+
+
+
+    def rub_type(self,value):
+
+        if isinstance(value,bool):
+            return "bool"
+
+        if isinstance(value,int):
+            return "i32"
+
+        if isinstance(value,float):
+            return "f64"
+
+        if isinstance(value,str):
+            return "str"
+
+        if isinstance(value,list):
+            return "list"
+
+        if value is None:
+            return "Null"
+
+
+        return "Any"
+
+
+
+
+    def error(self,msg):
+
+        issue = {
+            "line": self.line,
+            "message": msg
+        }
+
+        self.errors.append(issue)
+
+
+        print(
+            f"\033[1;31mDEBUG ERROR\033[0m "
+            f"line {self.line}: {msg}"
+        )
 
 class Analyzer:
 
@@ -851,13 +1242,22 @@ class Analyzer:
 
     def _check_global_leaks(self, global_scope: Scope):
         leaks = []
+
         for vname, vinfo in global_scope.vars.items():
+
+            # Only warn heap allocations
             if vinfo.get('is_heap') and not vinfo.get('dropped'):
+
                 leaks.append(vname)
+
                 self._emit(
-                    'WARNING', vinfo.get('line'), 'Possible Memory Leak',
-                    f"Variable '{vname}' was never dropped."
+                    'WARNING',
+                    vinfo.get('line'),
+                    'Possible Memory Leak',
+                    f"Variable '{vname}' was never dropped.",
+                    f"Call drop {vname} before leaving scope."
                 )
+
         self._leak_vars = leaks
 
     def report(self, filepath: str, strict: bool = False) -> bool:
@@ -997,6 +1397,10 @@ def check_file(filepath: str, strict: bool = False) -> bool:
             sys.exit(1)
 
         ast_tree = Parser(tokens).parse()
+
+        debugger = Debugger()
+        debugger.run(ast_tree)
+        
     except SyntaxError as e:
         print(f"✖ Syntax Error: {e}")
         sys.exit(1)
@@ -1029,6 +1433,7 @@ def main():
     args = ap.parse_args()
 
     ok = check_file(args.file, strict=args.strict)
+
     sys.exit(0 if ok else 1)
 
 if __name__ == '__main__':
