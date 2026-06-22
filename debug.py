@@ -1474,6 +1474,30 @@ def main():
 
     start_time = time.time()
     tokens = tokenize(code)
+    
+    # ──────────────────────────────────────────────────────────────────────────
+    # PRE-PARSING KEYWORD / TYPO INTERCEPTOR
+    # ──────────────────────────────────────────────────────────────────────────
+    has_typo_errors = False
+    for i, tok in enumerate(tokens):
+        if tok.kind == 'IDENT':
+            rest = tokens[i + 1:]
+            suggestion = _guess_construct(tok.value, rest)
+            if suggestion:
+                R, B, DIM = '\033[0m', '\033[1;31m', '\033[2m'
+                Y = '\033[1;33m'
+                print(
+                    f"{B}error[P100]{R}: Unknown keyword `{tok.value}` at line {tok.line}\n"
+                    f" {DIM}hint:{R} did you mean `{Y}{suggestion}{R}`?\n"
+                    f"      Replace `{tok.value}` with `{suggestion}`\n"
+                )
+                has_typo_errors = True
+                
+    if has_typo_errors:
+        print(f"\n\033[1;31merror\033[0m: aborting due to syntax error(s)")
+        sys.exit(1)
+
+    # Now proceed to the main parser safely
     parser = Parser(tokens)
     ast = parser.parse()
 

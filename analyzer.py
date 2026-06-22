@@ -1005,6 +1005,40 @@ def check_file(filepath: str, strict: bool = False) -> bool:
 
     try:
         tokens   = tokenize(source)
+
+        # ── Pre-parsing Keyword & Typo Pass ──
+        KEYWORD_MAPPING = {
+            'def': 'fn', 'function': 'fn', 'func': 'fn',
+            'var': 'let', 'const': 'let',
+            'elif': 'else if', 'elseif': 'else if',
+            'nil': 'Null', 'none': 'Null', 'null': 'Null',
+        }
+        RUBIDIUM_KEYWORDS = [
+            'let', 'mut', 'fn', 'class', 'drop', 'thread', 'while', 
+            'for', 'if', 'else', 'return', 'print', 'println', 'use', 'import'
+        ]
+
+        for tok in tokens:
+            kind, val, line = tok[0], tok[1], tok[2]
+            if kind == 'IDENT':
+                # Check for keywords from foreign languages
+                if val in KEYWORD_MAPPING:
+                    correct = KEYWORD_MAPPING[val]
+                    print(f"\n\033[1;31mERROR\033[0m:")
+                    print(f"Line {line}: Invalid Keyword")
+                    print(f"Found '{val}', but Rubidium uses '{correct}'.")
+                    print(f"\nSuggestion:\n  Use '{correct}' instead of '{val}'.\n")
+                    sys.exit(1)
+
+                # Check for misspelled keywords using fuzzy edit distance
+                suggestion = _closest_name(val, RUBIDIUM_KEYWORDS, max_dist=1)
+                if suggestion and val not in RUBIDIUM_KEYWORDS:
+                    print(f"\n\033[1;31mERROR\033[0m:")
+                    print(f"Line {line}: Misspelled Keyword")
+                    print(f"Found '{val}'. Did you mean '{suggestion}'?")
+                    print(f"\nSuggestion:\n  Change '{val}' to '{suggestion}'.\n")
+                    sys.exit(1)
+
         ast_tree = Parser(tokens).parse()
     except SyntaxError as e:
         print(f"✖ Syntax Error: {e}")
