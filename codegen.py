@@ -75,7 +75,7 @@ class RubidiumTypeError(Exception): pass
 class RubidiumNameError(Exception): pass
 
 class CodeGen:
-    def __init__(self):
+    def __init__(self, import_aliases=None):
         self.fn_lines    = []
         self.global_decls = []
         self.str_count   = 0
@@ -97,6 +97,8 @@ class CodeGen:
         self._pending_trampolines = []  # trampoline fn_lines to emit after current function
         self._file_slot_counter = 0     # unique slot number for each open() block
         self._file_handle_vars = {}     # var_name -> slot_int while inside an open() block
+        # import alias map: alias_name -> module_prefix (e.g. "mt" -> "math_tools")
+        self.import_aliases = import_aliases or {}
 
     def is_class_field(self, name):
         if not self.cur_class: return False
@@ -417,8 +419,10 @@ class CodeGen:
             obj_name = node.obj.name if hasattr(node.obj, 'name') else str(node.obj)
             
             # Check for module function call (e.g., math_tools.sin -> math_tools_sin)
-            if isinstance(node.obj, Var) and f"{obj_name}_{node.method}" in self.functions:
-                fn = self.functions[f"{obj_name}_{node.method}"]
+            # Also resolves import aliases (e.g. 'mt' -> 'math_tools' -> math_tools_sin)
+            resolved_obj = self.import_aliases.get(obj_name, obj_name)
+            if isinstance(node.obj, Var) and f"{resolved_obj}_{node.method}" in self.functions:
+                fn = self.functions[f"{resolved_obj}_{node.method}"]
                 return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
 
             # FFI bindings: c_lib.my_c_func -> method name alone is the bound symbol
@@ -553,8 +557,10 @@ class CodeGen:
                 self.declare_global(node.name, ir_t)
             if node.mutable: self.mutable_vars.add(node.name)
         elif isinstance(node, FFIBind):
-            # Pre-register the bound symbol so calls resolve in collect pass
-            self.functions[node.symbol_name] = FnDef(node.symbol_name, node.params, node.ret_type, [])
+            # Pre-register the bound symbol so calls resolve in collect pass.
+            # Use the 'as' alias when provided (e.g. fn lib rb_sin(...) -> f64 as sin  → "sin")
+            fn_name = node.alias if node.alias else node.symbol_name
+            self.functions[fn_name] = FnDef(fn_name, node.params, node.ret_type, [])
         elif isinstance(node, If):
             for s in node.then_body: self._collect_global(s)
             for s in (node.else_body or []): self._collect_global(s)
@@ -1856,7 +1862,8 @@ class CodeGen:
         param_ir_types = [self._ffi_type_to_ir(pt) for _, pt in node.params]
         ret_ir = self._ffi_type_to_ir(node.ret_type) if node.ret_type else "i64"
         fn_ptr_t = f"{ret_ir} ({', '.join(param_ir_types)})*" if param_ir_types else f"{ret_ir} ()*"
-        fn_name = node.symbol_name
+        # Rubidium-callable name: use 'as' alias when provided, else fall back to C symbol name
+        fn_name = node.alias if node.alias else node.symbol_name
         params_ir = ", ".join(f"{pt} %p{i}" for i, pt in enumerate(param_ir_types))
 
         # Register immediately so calls in the same scope resolve
@@ -2733,7 +2740,9 @@ class CodeGen:
         # 4. Fallback: String method OR module function call (e.g. math.add -> math_add)
         # Check for module-namespaced function call before evaluating the object
         if isinstance(node.obj, Var):
-            target_name = f"{obj_name}_{node.method}"
+            # Resolve import alias (e.g. 'mt' -> 'math_tools') before building target name
+            resolved_name = self.import_aliases.get(obj_name, obj_name)
+            target_name = f"{resolved_name}_{node.method}"
             if target_name in self.functions:
                 args_ir = []
                 for a in node.args:

@@ -155,8 +155,9 @@ class ThreadRunning:
         self.thread_id = thread_id
 
 class Import:
-    def __init__(self, module_name):
+    def __init__(self, module_name, alias=None):
         self.module_name = module_name
+        self.alias = alias          # e.g.  import math_tools as mt  →  alias="mt"
 
 class Use:
     def __init__(self, module_name):
@@ -200,12 +201,13 @@ class FFILoad:
         self.path_expr = path_expr
 
 class FFIBind:
-    """fn lib symbol(params) -> ret — binds a symbol from a loaded FFI handle"""
-    def __init__(self, handle_name, symbol_name, params, ret_type):
+    """fn lib symbol(params) -> ret as alias — binds a symbol from a loaded FFI handle"""
+    def __init__(self, handle_name, symbol_name, params, ret_type, alias=None):
         self.handle_name = handle_name
         self.symbol_name = symbol_name
-        self.params = params
-        self.ret_type = ret_type
+        self.params      = params
+        self.ret_type    = ret_type
+        self.alias       = alias    # Rubidium-side callable name; falls back to symbol_name
 
 # File handle nodes
 class FileOpen:

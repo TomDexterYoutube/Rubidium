@@ -113,395 +113,659 @@ class Scope:
         info = self.lookup(name)
         return bool(info and info.get('dropped'))
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Control-flow sentinels  (not real errors — just signals through the call stack)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _Return(Exception):
+    def __init__(self, value=None): self.value = value
+
+class _Break(Exception):    pass
+class _Continue(Exception): pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Debugger  –  lightweight interpreter / runtime-crash detector
+# ──────────────────────────────────────────────────────────────────────────────
+
 class Debugger:
 
-    def __init__(self):
-        self.scope = Scope()
-        self.line = 0
-        self.errors = []
-        self.output = []
+    def __init__(self, source_lines=None, tokens=None):
+        self.scope          = Scope()
+        self.line           = "?"
+        self.errors         = []
+        self.output         = []
+        self._fn_defs       = {}      # name  -> ast.FnDef
+        self._class_defs    = {}      # name  -> ast.ClassDef
+        self._source_lines  = source_lines or []
+        self._lmap          = {}      # ('var'|'fn'|'class'|'for', name) -> line
+        if tokens:
+            self._build_lmap(tokens)
 
+
+    # ── Token → line map  (lets us show real line numbers despite no AST locs) ─
+
+    def _build_lmap(self, tokens):
+        n = len(tokens)
+        i = 0
+        while i < n:
+            kind, val, line = tokens[i][0], tokens[i][1], tokens[i][2]
+            if kind == 'LET':
+                j = i + 1
+                if j < n and tokens[j][0] == 'MUT': j += 1
+                if j < n and tokens[j][0] in ('IDENT', 'TYPE'):
+                    self._lmap[('var', tokens[j][1])] = line
+            elif kind == 'FN':
+                j = i + 1
+                if j < n and tokens[j][0] in ('IDENT', 'TYPE'):
+                    self._lmap[('fn', tokens[j][1])] = line
+            elif kind == 'CLASS':
+                j = i + 1
+                if j < n and tokens[j][0] == 'IDENT':
+                    self._lmap[('class', tokens[j][1])] = line
+            elif kind == 'FOR':
+                j = i + 1
+                if j < n and tokens[j][0] in ('IDENT', 'TYPE'):
+                    self._lmap[('for', tokens[j][1])] = line
+            i += 1
+
+
+    # ── Entry point ───────────────────────────────────────────────────────────
 
     def run(self, nodes):
-
+        """Execute all top-level nodes; stop & report on first unhandled crash."""
         for node in nodes:
-            self.execute(node)
-
+            try:
+                self.execute(node)
+            except _Return:
+                pass   # top-level return is fine
+            except _Break:
+                self.error("'break' used outside of a loop")
+            except _Continue:
+                self.error("'continue' used outside of a loop")
+            except RecursionError:
+                self.error("Maximum recursion depth exceeded — possible infinite recursion")
+                break
+            except Exception as e:
+                self.error(f"Unhandled runtime crash: {type(e).__name__}: {e}")
+                break
         return len(self.errors) == 0
 
 
+    # ── Call a user-defined function ──────────────────────────────────────────
+
+    def _call_fn(self, fn_def, arg_values):
+        fn_scope = Scope(parent=self.scope)
+        for i, (pname, ptype) in enumerate(fn_def.params):
+            fn_scope.declare(pname, {
+                "value":   arg_values[i] if i < len(arg_values) else None,
+                "type":    ptype or "Any",
+                "dropped": False,
+                "mutable": True,
+            })
+        saved, self.scope = self.scope, fn_scope
+        result = None
+        try:
+            for stmt in fn_def.body:
+                self.execute(stmt)
+        except _Return as r:
+            result = r.value
+        finally:
+            self.scope = saved
+        return result
+
+
+    # ── Statement executor ────────────────────────────────────────────────────
 
     def execute(self, node):
-
         if node is None:
             return
 
-        self.line = getattr(node, "line", "?")
-
-        # -----------------------------
-        # Variable Declaration
-        # -----------------------------
-
+        # ── Variable Declaration ──────────────────────────────────────────────
         if isinstance(node, ast.VarDecl):
-
+            self.line = self._lmap.get(('var', node.name), "?")
             value = self.evaluate(node.value)
+            self.scope.declare(node.name, {
+                "value":   value,
+                "type":    node.vtype or self.rub_type(value),
+                "mutable": node.mutable,
+                "dropped": False,
+                "line":    self.line,
+            })
 
-            self.scope.declare(
-                node.name,
-                {
-                    "value": value,
-                    "type": self.rub_type(value),
-                    "dropped": False,
-                    "line": self.line
-                }
-            )
-
-
-        # -----------------------------
-        # Assignment
-        # -----------------------------
-
+        # ── Assignment ────────────────────────────────────────────────────────
         elif isinstance(node, ast.Assign):
-
             info = self.scope.lookup(node.name)
-
             if info is None:
-                self.error(
-                    f"Unknown variable '{node.name}'"
-                )
+                self.error(f"Assignment to undeclared variable '{node.name}'")
                 return
-
-
             if info.get("dropped"):
-                self.error(
-                    f"Variable '{node.name}' was dropped"
-                )
+                self.error(f"Use of dropped variable '{node.name}'")
                 return
-
-
+            if not info.get("mutable", True):
+                self.error(f"Assignment to immutable variable '{node.name}' (declare with 'mut')")
+                return
             info["value"] = self.evaluate(node.value)
-            info["type"] = self.rub_type(info["value"])
+            info["type"]  = self.rub_type(info["value"])
 
+        # ── Field Assignment ──────────────────────────────────────────────────
+        elif isinstance(node, ast.FieldAssign):
+            obj = self.evaluate(node.obj) if hasattr(node, 'obj') else None
+            if isinstance(obj, dict):
+                obj[node.field] = self.evaluate(node.value)
 
-
-        # -----------------------------
-        # Drop
-        # -----------------------------
-
+        # ── Drop ──────────────────────────────────────────────────────────────
         elif isinstance(node, ast.Drop):
-
             info = self.scope.lookup(node.name)
-
             if info is None:
-
-                self.error(
-                    f"Cannot drop unknown variable '{node.name}'"
-                )
-
+                self.error(f"Cannot drop undeclared variable '{node.name}'")
             elif info.get("dropped"):
-
-                self.error(
-                    f"Variable '{node.name}' already dropped"
-                )
-
+                self.error(f"Variable '{node.name}' is already dropped")
             else:
-
                 info["dropped"] = True
-                info["value"] = None
+                info["value"]   = None
 
-
-
-        # -----------------------------
-        # Print
-        # -----------------------------
-
+        # ── Print ─────────────────────────────────────────────────────────────
         elif isinstance(node, ast.Print):
-
             value = self.evaluate(node.value)
-
-            print(value)
-
-            self.output.append(value)
-
-
+            out   = "[Null]" if value is None else value
+            print(out)
+            self.output.append(out)
 
         elif isinstance(node, ast.Println):
-
             value = self.evaluate(node.value)
+            out   = "[Null]" if value is None else value
+            print(f"\r{out}", end="")
+            self.output.append(out)
 
-            print(value)
-
-            self.output.append(value)
-
-
-
-        # -----------------------------
-        # If
-        # -----------------------------
-
+        # ── If ────────────────────────────────────────────────────────────────
         elif isinstance(node, ast.If):
+            cond = self.evaluate(node.cond)
+            body = node.then_body if cond else (node.else_body or [])
+            for stmt in body:
+                self.execute(stmt)
 
-            condition = self.evaluate(node.cond)
-
-
-            if condition:
-
-                for stmt in node.then_body:
-                    self.execute(stmt)
-
-            else:
-
-                for stmt in (node.else_body or []):
-                    self.execute(stmt)
-
-
-
-        # -----------------------------
-        # While
-        # -----------------------------
-
+        # ── While ─────────────────────────────────────────────────────────────
         elif isinstance(node, ast.While):
-
             count = 0
-
             while self.evaluate(node.cond):
-
-                for stmt in node.body:
-                    self.execute(stmt)
-
-
+                try:
+                    for stmt in node.body:
+                        self.execute(stmt)
+                except _Break:
+                    break
+                except _Continue:
+                    pass
                 count += 1
-
-
-                # emergency brake
-                # because infinite loops are
-                # the compiler equivalent of a toddler with scissors
-
-                if count > 100000:
-
-                    self.error(
-                        "Possible infinite loop"
-                    )
-
+                if count > 100_000:
+                    self.error("Possible infinite loop (exceeded 100 000 iterations)")
                     break
 
+        # ── For ───────────────────────────────────────────────────────────────
+        elif isinstance(node, ast.For):
+            self.line = self._lmap.get(('for', node.var), "?")
+            self._exec_for(node)
 
+        # ── Return / Break / Continue ─────────────────────────────────────────
+        elif isinstance(node, ast.Return):
+            raise _Return(self.evaluate(node.value))
 
-        # -----------------------------
-        # Function Call
-        # -----------------------------
+        elif isinstance(node, ast.Break):
+            raise _Break()
 
-        elif isinstance(node, ast.FnCall):
+        elif isinstance(node, ast.Continue):
+            raise _Continue()
 
-            for arg in node.args:
-                self.evaluate(arg)
+        # ── Try / Error ───────────────────────────────────────────────────────
+        elif isinstance(node, ast.Try):
+            try:
+                for stmt in node.try_body:
+                    self.execute(stmt)
+            except (_Return, _Break, _Continue):
+                raise   # let control-flow signals pass through
+            except Exception as exc:
+                err_scope = Scope(parent=self.scope)
+                err_scope.declare("error", {
+                    "value": str(exc), "type": "str",
+                    "dropped": False,  "mutable": False,
+                })
+                saved, self.scope = self.scope, err_scope
+                try:
+                    for stmt in node.error_body:
+                        self.execute(stmt)
+                finally:
+                    self.scope = saved
 
+        # ── Function Definition ───────────────────────────────────────────────
+        elif isinstance(node, ast.FnDef):
+            self.line = self._lmap.get(('fn', node.name), "?")
+            self._fn_defs[node.name] = node
 
+        # ── Class Definition ──────────────────────────────────────────────────
+        elif isinstance(node, ast.ClassDef):
+            self.line = self._lmap.get(('class', node.name), "?")
+            self._class_defs[node.name] = node
+
+        # ── Expression statements ─────────────────────────────────────────────
+        elif isinstance(node, (ast.FnCall, ast.MethodCall, ast.CollectionMethodCall)):
+            self.evaluate(node)
+
+        # ── Use / Import — declare a stub module object so method calls don't cascade ──
+        elif isinstance(node, (ast.Use, ast.Import)):
+            mod = node.module_name
+            self.scope.declare(mod, {
+                "value":   {"__module__": mod},
+                "type":    "module",
+                "mutable": False,
+                "dropped": False,
+            })
+
+        # ── Stubs: OS / FFI / Threads / File I/O ─────────────────────────────
+        elif isinstance(node, (
+            ast.FFILoad, ast.FFIBind,
+            ast.ThreadCall, ast.ThreadWait, ast.ThreadRunning,
+            ast.OsStart, ast.OsRun, ast.OsDrop,
+            ast.FileOpen, ast.FileNew, ast.FileHandleStmt,
+            ast.FileExists, ast.FileDelete, ast.FileRename, ast.FileCopy,
+        )):
+            pass   # not executed in debug mode
 
         else:
-
-            # fallback expression
             self.evaluate(node)
 
 
+    # ── For-loop helper ───────────────────────────────────────────────────────
+
+    def _exec_for(self, node):
+        if node.iterable is not None:
+            # for x in <collection>
+            iterable = self.evaluate(node.iterable)
+            if iterable is None:
+                self.error(
+                    f"'for {node.var} in ...' — iterable resolved to None.\n"
+                    f"         Check the variable exists and has not been dropped."
+                )
+                return
+            if not hasattr(iterable, '__iter__'):
+                self.error(
+                    f"'for {node.var} in ...' — value of type "
+                    f"'{self.rub_type(iterable)}' is not iterable"
+                )
+                return
+            for item in iterable:
+                self.scope.declare(node.var, {
+                    "value": item, "type": self.rub_type(item),
+                    "dropped": False, "mutable": False,
+                })
+                try:
+                    for stmt in node.body:
+                        self.execute(stmt)
+                except _Break:
+                    return
+                except _Continue:
+                    continue
+        else:
+            # for x in start..end
+            start = self.evaluate(node.start)
+            end   = self.evaluate(node.end)
+            if start is None:
+                self.error(f"'for {node.var}' — range start resolved to None")
+                return
+            if end is None:
+                self.error(f"'for {node.var}' — range end resolved to None")
+                return
+            try:
+                start, end = int(start), int(end)
+            except (TypeError, ValueError):
+                self.error(f"'for {node.var}' — range values must be integers, got '{start}' and '{end}'")
+                return
+            step = 1 if start <= end else -1
+            for i in range(start, end, step):
+                self.scope.declare(node.var, {
+                    "value": i, "type": "i64",
+                    "dropped": False, "mutable": False,
+                })
+                try:
+                    for stmt in node.body:
+                        self.execute(stmt)
+                except _Break:
+                    return
+                except _Continue:
+                    continue
 
 
-    def evaluate(self,node):
+    # ── Expression evaluator ──────────────────────────────────────────────────
 
+    def evaluate(self, node):
         if node is None:
             return None
 
-
-
-        # Numbers
-
         if isinstance(node, ast.Number):
-
             return node.value
-
-
-
-        # Strings
 
         if isinstance(node, ast.Str):
-
             return node.value
 
-
-
-        # Bool
-
         if isinstance(node, ast.Bool):
+            v = str(node.value).lower()
+            return True if v == "true" else (False if v == "false" else None)
 
-            value = str(node.value).lower()
+        if isinstance(node, ast.None_):
+            return None
 
-            if value == "true":
-                return True
-
-            if value == "false":
-                return False
-
-            if value in ("null","none"):
-                return None
-
-            return value
-
-
-
-        # Variables
+        if isinstance(node, ast.InterpolatedStr):
+            parts = []
+            for part in node.parts:
+                val = self.evaluate(part)
+                parts.append(str(val) if val is not None else "")
+            return "".join(parts)
 
         if isinstance(node, ast.Var):
-
+            # Type names used as arguments (e.g. random(0, 10, i32)) are not variables
+            if node.name in ALL_TYPES:
+                return node.name
             info = self.scope.lookup(node.name)
-
-
             if info is None:
-
-                self.error(
-                    f"Variable '{node.name}' does not exist"
-                )
-
+                self.error(f"Variable '{node.name}' used before declaration")
                 return None
-
-
-
             if info.get("dropped"):
-
-                self.error(
-                    f"Variable '{node.name}' used after drop"
-                )
-
+                self.error(f"Variable '{node.name}' used after drop")
                 return None
-
-
-
             return info["value"]
 
-
-
-
-        # Binary Operations
+        if isinstance(node, ast.UnaryOp):
+            val = self.evaluate(node.value)
+            if node.op == "-":   return -val if val is not None else None
+            if node.op == "not": return not val
+            if node.op == "*/":
+                import math; return math.sqrt(val) if val is not None else None
+            return val
 
         if isinstance(node, ast.BinOp):
-
-            left = self.evaluate(node.left)
+            left  = self.evaluate(node.left)
             right = self.evaluate(node.right)
-
-
             try:
-
                 if node.op == "+":
+                    if isinstance(left, str) or isinstance(right, str):
+                        return str(left or "") + str(right or "")
                     return left + right
-
-                if node.op == "-":
-                    return left - right
-
-                if node.op == "*":
-                    return left * right
-
+                if node.op == "-":   return left - right
+                if node.op == "*":   return left * right
                 if node.op == "/":
+                    if right == 0: self.error("Division by zero"); return None
                     return left / right
-
-
+                if node.op == "**":  return left ** right
+                if node.op == "%":   return left % right
+                if node.op == "and": return bool(left) and bool(right)
+                if node.op == "or":  return bool(left) or bool(right)
             except Exception as e:
-
-                self.error(
-                    f"Operation failed: {e}"
-                )
-
-                return None
-
-
-
-
-        # Comparisons
+                self.error(f"Operation '{node.op}' failed: {e}")
+            return None
 
         if isinstance(node, ast.Compare):
-
-            left = self.evaluate(node.left)
+            left  = self.evaluate(node.left)
             right = self.evaluate(node.right)
-
-
             try:
-
-                if node.op == "==":
-                    return left == right
-
-                if node.op == "!=":
-                    return left != right
-
-                if node.op == ">":
-                    return left > right
-
-                if node.op == "<":
-                    return left < right
-
-
+                if node.op == "==":  return left == right
+                if node.op == "!=":  return left != right
+                if node.op == ">":   return left > right
+                if node.op == "<":   return left < right
+                if node.op == ">=":  return left >= right
+                if node.op == "<=":  return left <= right
             except Exception as e:
+                self.error(f"Comparison '{node.op}' failed: {e}")
+            return False
 
-                self.error(
-                    f"Comparison failed: {e}"
-                )
-
-                return False
-
-
-
-        # Lists
+        if isinstance(node, ast.TypeCast):
+            val = self.evaluate(node.expr)
+            t   = node.target_type
+            try:
+                if t in ("i32","i64","i128"): return int(val)
+                if t in ("f32","f64","f128"): return float(val)
+                if t == "str":   return str(val)
+                if t == "bool":  return bool(val)
+            except Exception as e:
+                self.error(f"Type cast to '{t}' failed: {e}")
+            return val
 
         if isinstance(node, ast.ListExpr):
+            return [self.evaluate(x) for x in node.elements]
 
-            return [
-                self.evaluate(x)
-                for x in node.elements
-            ]
+        if isinstance(node, ast.DictExpr):
+            result = {}
+            for k, v in node.pairs:
+                result[self.evaluate(k)] = self.evaluate(v)
+            return result
 
+        if isinstance(node, ast.FieldAccess):
+            obj = self.evaluate(node.obj)
+            if isinstance(obj, dict):
+                return obj.get(node.field)
+            return None
 
+        if isinstance(node, ast.Input):
+            return ""   # can't do real input in debug mode
+
+        if isinstance(node, ast.FnCall):
+            return self._eval_fn_call(node)
+
+        if isinstance(node, (ast.MethodCall, ast.CollectionMethodCall)):
+            return self._eval_method_call(node)
+
+        if isinstance(node, ast.ClassInstantiate):
+            cls = self._class_defs.get(node.class_name)
+            if cls:
+                instance = {"__class__": node.class_name}
+                for f in (cls.fields or []):
+                    instance[f.name] = self.evaluate(f.value) if hasattr(f, 'value') else None
+                return instance
+            return None
 
         return None
 
 
+    # ── FnCall evaluator ──────────────────────────────────────────────────────
+
+    def _eval_fn_call(self, node):
+        fname = node.name if isinstance(node.name, str) else None
+        args  = [self.evaluate(a) for a in node.args]
+
+        # Built-ins
+        if fname == "print":
+            if args: print(args[0])
+            return None
+        if fname == "println":
+            if args: print(f"\r{args[0]}", end="")
+            return None
+        if fname == "input":
+            return ""
+        if fname == "len":
+            return len(args[0]) if args and hasattr(args[0], '__len__') else None
+        if fname == "abs":
+            return abs(args[0]) if args else None
+        if fname == "min":
+            return min(*args) if len(args) > 1 else (min(args[0]) if args else None)
+        if fname == "max":
+            return max(*args) if len(args) > 1 else (max(args[0]) if args else None)
+        if fname == "round":
+            return round(args[0], args[1] if len(args) > 1 else 0) if args else None
+
+        # User-defined function
+        if fname and fname in self._fn_defs:
+            return self._call_fn(self._fn_defs[fname], args)
+
+        # Class instantiation
+        if fname and fname in self._class_defs:
+            cls = self._class_defs[fname]
+            instance = {"__class__": fname}
+            for f in (cls.fields or []):
+                instance[f.name] = self.evaluate(f.value) if hasattr(f, 'value') else None
+            return instance
+
+        # Collection index access: name is a declared variable  e.g. my_list(0)
+        if fname:
+            info = self.scope.lookup(fname)
+            if info is not None:
+                col = info["value"]
+                for arg in args:
+                    if isinstance(col, list):
+                        try:
+                            col = col[int(arg)]
+                        except (IndexError, TypeError) as e:
+                            self.error(f"Index error on '{fname}': {e}")
+                            return None
+                    elif isinstance(col, dict):
+                        col = col.get(arg)
+                    else:
+                        return None
+                return col
+
+        return None
 
 
-    def rub_type(self,value):
+    # ── MethodCall evaluator ──────────────────────────────────────────────────
 
-        if isinstance(value,bool):
-            return "bool"
+    def _eval_method_call(self, node):
+        obj    = self.evaluate(node.obj)
+        method = node.method
+        args   = [self.evaluate(a) for a in node.args]
 
-        if isinstance(value,int):
-            return "i32"
+        if obj is None:
+            self.error(f"Method '.{method}()' called on None — object may be undefined or dropped")
+            return None
 
-        if isinstance(value,float):
-            return "f64"
+        try:
+            return self._dispatch_method(obj, method, args)
+        except (IndexError, TypeError, ValueError) as e:
+            self.error(f"Method '.{method}({", ".join(repr(a) for a in args)})' failed: {e}")
+            return None
 
-        if isinstance(value,str):
-            return "str"
+    def _dispatch_method(self, obj, method, args):
 
-        if isinstance(value,list):
-            return "list"
+        # ── Module stub — methods are no-ops in debug mode ───────────────────
+        if isinstance(obj, dict) and "__module__" in obj:
+            return None   # module calls silently return None; no error spam
 
-        if value is None:
-            return "Null"
+        # ── Class instance method dispatch ────────────────────────────────────
+        if isinstance(obj, dict) and "__class__" in obj:
+            cls = self._class_defs.get(obj["__class__"])
+            if cls:
+                for m in (cls.methods or []):
+                    if m.name == method:
+                        fn_scope = Scope(parent=self.scope)
+                        for fname, fval in obj.items():
+                            if fname != "__class__":
+                                fn_scope.declare(fname, {
+                                    "value": fval, "type": self.rub_type(fval),
+                                    "dropped": False, "mutable": True,
+                                })
+                        for i, (pname, ptype) in enumerate(m.params):
+                            fn_scope.declare(pname, {
+                                "value": args[i] if i < len(args) else None,
+                                "type": ptype or "Any", "dropped": False, "mutable": True,
+                            })
+                        saved, self.scope = self.scope, fn_scope
+                        result = None
+                        try:
+                            for stmt in m.body:
+                                self.execute(stmt)
+                        except _Return as r:
+                            result = r.value
+                        finally:
+                            self.scope = saved
+                        return result
+            return obj.get(method)   # field access fallback
+
+        # ── str methods ───────────────────────────────────────────────────────
+        if isinstance(obj, str):
+            if method == "len":      return len(obj)
+            if method == "char":
+                idx = int(args[0]) if args else 0
+                return obj[idx] if 0 <= idx < len(obj) else ""
+            if method == "slice":    return list(obj)
+            if method == "has":      return args[0] in obj if args else False
+            if method == "replace":  return obj.replace(str(args[0]), str(args[1])) if len(args) >= 2 else obj
+            if method == "split":    return obj.split(str(args[0])) if args else list(obj)
+            if method == "combine":  return obj
+            if method == "insert":
+                idx = int(args[0])
+                return obj[:idx] + str(args[1]) + obj[idx:] if len(args) >= 2 else obj
+            if method == "set":
+                idx = int(args[0])
+                return obj[:idx] + str(args[1])[0] + obj[idx+1:] if len(args) >= 2 else obj
+            if method == "to":
+                t = str(args[0]) if args else ""
+                try:
+                    if t in ("i32","i64","i128"): return int(obj)
+                    if t in ("f32","f64","f128"): return float(obj)
+                except Exception: pass
+                return obj
+            return None
+
+        # ── list methods ──────────────────────────────────────────────────────
+        if isinstance(obj, list):
+            if method == "len":     return len(obj)
+            if method == "has":     return args[0] in obj if args else False
+            if method == "combine": return "".join(str(x) for x in obj)
+            if method == "add":     obj.append(args[0]) if args else None; return None
+            if method == "set":
+                if len(args) >= 2:
+                    try: obj[int(args[0])] = args[1]
+                    except IndexError: self.error("List index out of bounds in .set()")
+                return None
+            if method == "slice":
+                return obj[int(args[0]):int(args[1])] if len(args) >= 2 else obj[:]
+            if method == "drop":    return None
+            return None
+
+        # ── dict / index methods ──────────────────────────────────────────────
+        if isinstance(obj, dict):
+            if method == "len":  return len(obj)
+            if method == "has":  return args[0] in obj if args else False
+            if method in ("add", "set"):
+                if len(args) >= 2: obj[args[0]] = args[1]
+                return None
+            if method == "drop": return None
+            return None
+
+        # ── numeric methods ───────────────────────────────────────────────────
+        if isinstance(obj, (int, float)):
+            if method == "abs":   return abs(obj)
+            if method == "floor": import math; return math.floor(obj)
+            if method == "ceil":  import math; return math.ceil(obj)
+            if method == "sqrt":  import math; return math.sqrt(obj)
+            return None
+
+        return None
 
 
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def rub_type(self, value):
+        if isinstance(value, bool):  return "bool"
+        if isinstance(value, int):   return "i64"
+        if isinstance(value, float): return "f64"
+        if isinstance(value, str):   return "str"
+        if isinstance(value, list):  return "list"
+        if isinstance(value, dict):  return "index"
+        if value is None:            return "Null"
         return "Any"
 
+    def error(self, msg):
+        self.errors.append({"line": self.line, "message": msg})
+        line_str = f"line {self.line}" if self.line != "?" else "unknown line"
 
-
-
-    def error(self,msg):
-
-        issue = {
-            "line": self.line,
-            "message": msg
-        }
-
-        self.errors.append(issue)
-
+        ctx = ""
+        if self._source_lines and isinstance(self.line, int) and self.line > 0:
+            try:
+                src = self._source_lines[self.line - 1].rstrip()
+                ctx = f"\n  {ANSI['DIM']}→  {src}{ANSI['RESET']}"
+            except IndexError:
+                pass
 
         print(
-            f"\033[1;31mDEBUG ERROR\033[0m "
-            f"line {self.line}: {msg}"
+            f"{ANSI['ERROR']}DEBUG ERROR{ANSI['RESET']} "
+            f"({line_str}): {msg}{ctx}"
         )
 
 class Analyzer:
@@ -1407,9 +1671,22 @@ def check_file(filepath: str, strict: bool = False) -> bool:
 
         ast_tree = Parser(tokens).parse()
 
-        debugger = Debugger()
+        debugger = Debugger(source_lines=source_lines, tokens=tokens)
+
+        print(f"\n{ANSI['BOLD']}Rubidium Debug Run{ANSI['RESET']}")
+        print(f"{ANSI['DIM']}Running: {filepath}{ANSI['RESET']}\n")
+
         debugger.run(ast_tree)
-        
+
+        print()
+        print(f"{ANSI['DIM']}{'─' * 44}{ANSI['RESET']}")
+        if debugger.errors:
+            n = len(debugger.errors)
+            print(f"{ANSI['ERROR']}✖  Debug run found {n} error{'s' if n != 1 else ''}{ANSI['RESET']}")
+        else:
+            print(f"\033[1;32m✔  Debug run completed — no runtime errors\033[0m")
+        print(f"{ANSI['DIM']}{'─' * 44}{ANSI['RESET']}\n")
+
     except SyntaxError as e:
         print(f"✖ Syntax Error: {e}")
         sys.exit(1)

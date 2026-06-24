@@ -1128,7 +1128,11 @@ def compile_files(source_files, output=None):
         for i, source_file in enumerate(source_files):
             parse_file(source_file, parsed_files, combined_ast, is_main=(i == 0))
 
-        gen = CodeGen()
+        gen = CodeGen(import_aliases={
+            node.alias: os.path.splitext(os.path.basename(node.module_name.replace(".", os.sep)))[0]
+            for node in combined_ast
+            if isinstance(node, Import) and getattr(node, 'alias', None)
+        })
         ir_code = gen.gen(combined_ast)
 
         if output: output_bin = output

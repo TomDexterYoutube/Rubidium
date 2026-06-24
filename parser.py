@@ -91,7 +91,11 @@ class Parser:
         while self.peek() and self.peek()[0] == "DOT":
             self.match("DOT")
             name += "." + self.match("IDENT")
-        return Import(name)
+        alias = None
+        if self.peek() and self.peek()[0] == "AS":
+            self.match("AS")
+            alias = self.match("IDENT")
+        return Import(name, alias=alias)
 
     def use_stmt(self):
         self.match("USE")
@@ -131,7 +135,11 @@ class Parser:
             if self.peek() and self.peek()[1] == "->":
                 self.match("OP")
                 ret_type = self.match("TYPE")
-            return FFIBind(name, symbol_name, params, ret_type)
+            alias = None
+            if self.peek() and self.peek()[0] == "AS":
+                self.match("AS")
+                alias = self.match("IDENT")
+            return FFIBind(name, symbol_name, params, ret_type, alias=alias)
         # Normal function
         self.match("LPAREN")
         params = []
