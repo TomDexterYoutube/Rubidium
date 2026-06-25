@@ -939,6 +939,96 @@ class Analyzer:
             self._node(node, global_scope, in_loop=False)
         self._check_unused(global_scope)
         self._check_global_leaks(global_scope)
+        self._ast_syntax_check(nodes)
+
+    # ── AST-level structural syntax checks ────────────────────────────────────
+
+    def _ast_syntax_check(self, nodes: list):
+        """Walk the AST for structural issues the parser silently accepts."""
+        self._stx_stmts(nodes, in_loop=False, in_fn=None)
+
+    def _stx_stmts(self, stmts: list, in_loop: bool, in_fn):
+        """Recursively check a statement list for structural issues."""
+        for i, node in enumerate(stmts):
+
+            # Dead code: statements after a return in the same block
+            if isinstance(node, ast.Return):
+                remaining = len(stmts) - i - 1
+                if remaining > 0:
+                    self._emit('WARNING', self._ln('fn', in_fn) if in_fn else None,
+                               'Dead Code',
+                               f"{remaining} unreachable statement{'s' if remaining != 1 else ''} "
+                               f"after 'return'"
+                               + (f" in '{in_fn}'" if in_fn else "") + ".",
+                               "Remove or move the code before the 'return'.")
+                break  # no point checking the dead statements
+
+            elif isinstance(node, ast.Break):
+                if not in_loop:
+                    self._emit('ERROR', None, 'Break Outside Loop',
+                               "'break' is used outside of any loop.",
+                               "Move 'break' inside a 'while' or 'for' loop.")
+
+            elif isinstance(node, ast.Continue):
+                if not in_loop:
+                    self._emit('ERROR', None, 'Continue Outside Loop',
+                               "'continue' is used outside of any loop.",
+                               "Move 'continue' inside a 'while' or 'for' loop.")
+
+            elif isinstance(node, ast.FnDef):
+                ln = self._ln('fn', node.name)
+                if not node.body:
+                    self._emit('WARNING', ln, 'Empty Function Body',
+                               f"Function '{node.name}' has an empty body.",
+                               f"Add statements inside 'fn {node.name}()' or remove it.")
+                else:
+                    if node.ret_type and not self._any_path_returns(node.body):
+                        self._emit('ERROR', ln, 'Missing Return Statement',
+                                   f"Function '{node.name}' declares return type "
+                                   f"'{node.ret_type}' but may not return on all paths.",
+                                   f"Add 'return <{node.ret_type} value>' before the "
+                                   f"end of '{node.name}'.")
+                    self._stx_stmts(node.body, in_loop=False, in_fn=node.name)
+
+            elif isinstance(node, ast.ClassDef):
+                for method in (node.methods or []):
+                    ln = self._ln('class', node.name)
+                    if not method.body:
+                        self._emit('WARNING', ln, 'Empty Method Body',
+                                   f"Method '{node.name}.{method.name}' has an empty body.",
+                                   f"Add statements or remove the method.")
+                    else:
+                        self._stx_stmts(method.body, in_loop=False, in_fn=method.name)
+
+            elif isinstance(node, ast.If):
+                self._stx_stmts(node.then_body or [], in_loop, in_fn)
+                if node.else_body:
+                    self._stx_stmts(node.else_body, in_loop, in_fn)
+
+            elif isinstance(node, (ast.While, ast.For)):
+                self._stx_stmts(node.body, in_loop=True, in_fn=in_fn)
+
+            elif isinstance(node, ast.Try):
+                self._stx_stmts(node.try_body, in_loop, in_fn)
+                self._stx_stmts(node.error_body, in_loop, in_fn)
+
+    def _any_path_returns(self, body: list) -> bool:
+        """Return True if every execution path through body has a return."""
+        if not body:
+            return False
+        last = body[-1]
+        if isinstance(last, ast.Return):
+            return True
+        if isinstance(last, ast.If):
+            # Both branches must return, and an else branch must exist
+            return bool(last.else_body) and \
+                   self._any_path_returns(last.then_body or []) and \
+                   self._any_path_returns(last.else_body)
+        if isinstance(last, ast.Try):
+            return (self._any_path_returns(last.try_body) and
+                    self._any_path_returns(last.error_body))
+        # Return may appear earlier in the body (dead code case handled separately)
+        return any(isinstance(s, ast.Return) for s in body)
 
     def _node(self, node, scope: Scope, in_loop: bool = False):
         if node is None:
@@ -1526,6 +1616,12 @@ class Analyzer:
             if not vinfo.get('used'):
                 self._emit('INFO', vinfo.get('line'), 'Unused Variable',
                            f"Unused variable: {vname}")
+        # Unused class definitions
+        for cname, cinfo in self.classes.items():
+            if not cinfo.get('used'):
+                self._emit('INFO', cinfo.get('line'), 'Unused Class',
+                           f"Class '{cname}' is defined but never instantiated.",
+                           f"Instantiate it somewhere or remove the definition.")
 
     def _check_global_leaks(self, global_scope: Scope):
         leaks = []
@@ -1613,6 +1709,169 @@ class Analyzer:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Token-level structural syntax checker
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _token_syntax_check(tokens: list, source_lines: list) -> list:
+    """
+    Scan the raw token stream for structural syntax errors the parser
+    silently swallows (mismatched braces, missing 'in', missing names, etc.).
+    Returns a list of Issue objects.
+    """
+    issues = []
+    n = len(tokens)
+
+    def src(line):
+        return source_lines[line - 1].rstrip() if 0 < line <= len(source_lines) else ""
+
+    def emit(line, category, msg, suggestion=""):
+        issues.append(Issue('ERROR', line, category, msg, suggestion))
+
+    def emit_w(line, category, msg, suggestion=""):
+        issues.append(Issue('WARNING', line, category, msg, suggestion))
+
+    # ── 1. Brace / bracket / paren matching ───────────────────────────────────
+    OPEN  = {'LPAREN': '(', 'LBRACE': '{', 'LBRACKET': '['}
+    CLOSE = {'RPAREN': ')', 'RBRACE': '}', 'RBRACKET': ']'}
+    PAIR  = {')': '(', '}': '{', ']': '['}
+    NEED  = {'(': ')', '{': '}', '[': ']'}
+    stack = []  # list of (char, line)
+
+    for tok in tokens:
+        kind, line = tok[0], tok[2]
+        if kind in OPEN:
+            stack.append((OPEN[kind], line))
+        elif kind in CLOSE:
+            ch = CLOSE[kind]
+            if not stack:
+                emit(line, 'Mismatched Bracket',
+                     f"Unexpected '{ch}' — no matching opening bracket",
+                     f"Remove the extra '{ch}' or add the missing opening '{PAIR[ch]}'")
+            else:
+                top, top_line = stack[-1]
+                if top == PAIR[ch]:
+                    stack.pop()
+                else:
+                    emit(line, 'Mismatched Bracket',
+                         f"Closing '{ch}' does not match the '{top}' opened on line {top_line}\n"
+                         f"  {ANSI['DIM']}→  {src(top_line)}{ANSI['RESET']}",
+                         f"Add '{NEED[top]}' to close the '{top}' on line {top_line}")
+
+    for char, line in stack:
+        emit(line, 'Unclosed Bracket',
+             f"'{char}' on line {line} is never closed — missing '{NEED[char]}'\n"
+             f"  {ANSI['DIM']}→  {src(line)}{ANSI['RESET']}",
+             f"Add a closing '{NEED[char]}'")
+
+    # ── 2. 'for' loop missing 'in' ────────────────────────────────────────────
+    for i, tok in enumerate(tokens):
+        if tok[0] == 'FOR':
+            line = tok[2]
+            j = i + 1
+            if j < n and tokens[j][0] in ('IDENT', 'TYPE'):
+                var_name = tokens[j][1]
+                j += 1
+                if j < n and tokens[j][0] != 'IN':
+                    found = tokens[j][1] if j < n else '?'
+                    emit(line, 'Missing \'in\' Keyword',
+                         f"'for' loop is missing the 'in' keyword\n\n"
+                         f"  Found:    for {var_name} {found} ...\n"
+                         f"  Expected: for {var_name} in ...",
+                         f"for {var_name} in <list or range(0, n)> {{ ... }}")
+
+    # ── 3. 'fn' missing a name ────────────────────────────────────────────────
+    for i, tok in enumerate(tokens):
+        if tok[0] == 'FN':
+            j = i + 1
+            if j < n and tokens[j][0] == 'LPAREN':
+                emit(tok[2], 'Missing Function Name',
+                     "Function definition is missing a name",
+                     "fn my_function(param: type) -> return_type { ... }")
+
+    # ── 4. 'fn' missing parameter list ───────────────────────────────────────
+    for i, tok in enumerate(tokens):
+        if tok[0] == 'FN':
+            j = i + 1
+            # Skip optional second IDENT (FFI handle name)
+            if j < n and tokens[j][0] in ('IDENT', 'TYPE'):
+                name = tokens[j][1]
+                j += 1
+                # FFI: fn handle symbol(...) — two idents before LPAREN is valid
+                if j < n and tokens[j][0] in ('IDENT', 'TYPE'):
+                    j += 1  # skip FFI symbol name
+                if j < n and tokens[j][0] not in ('LPAREN', 'LBRACE'):
+                    pass  # parser will handle this, avoid false positives
+
+    # ── 5. 'class' missing name or missing '()' ──────────────────────────────
+    for i, tok in enumerate(tokens):
+        if tok[0] == 'CLASS':
+            j = i + 1
+            if j >= n:
+                continue
+            if tokens[j][0] not in ('IDENT', 'TYPE'):
+                emit(tok[2], 'Missing Class Name',
+                     "Class declaration is missing a name",
+                     "class MyClass() { ... }")
+            elif j + 1 < n and tokens[j + 1][0] not in ('LPAREN',):
+                emit(tok[2], 'Missing Class Parentheses',
+                     f"Class '{tokens[j][1]}' is missing '()' after the name",
+                     f"class {tokens[j][1]}() {{ ... }}")
+
+    # ── 6. 'let' / 'let mut' missing variable name ───────────────────────────
+    for i, tok in enumerate(tokens):
+        if tok[0] == 'LET':
+            j = i + 1
+            if j < n and tokens[j][0] == 'MUT':   j += 1
+            if j < n and tokens[j][0] == 'LOCAL':  j += 1
+            if j < n and tokens[j][0] not in ('IDENT', 'TYPE', 'FILE'):
+                found = tokens[j][1] if j < n else '?'
+                emit(tok[2], 'Missing Variable Name',
+                     f"Variable declaration is missing a name — found '{found}' instead",
+                     "let my_variable: type = value")
+
+    # ── 7. 'if' / 'while' / 'for' body missing '{' ───────────────────────────
+    # Track which tokens are condition-enders so we can spot missing braces.
+    # Strategy: after a FOR/WHILE/IF we expect LBRACE eventually at the same
+    # depth — we detect the common mistake of writing a single statement without
+    # braces by seeing IF/WHILE/FOR followed eventually by a non-LBRACE token
+    # at depth 0 after consuming the condition.
+    # This is approximate but catches the most common case.
+    depth = 0
+    i = 0
+    while i < n:
+        kind, line = tokens[i][0], tokens[i][2]
+        if kind in ('LPAREN', 'LBRACKET', 'LBRACE'):
+            depth += 1
+        elif kind in ('RPAREN', 'RBRACKET', 'RBRACE'):
+            depth -= 1
+        elif kind in ('IF', 'WHILE') and depth == 0:
+            # Scan forward past the condition (depth inside parens handled naturally),
+            # then check if LBRACE follows.
+            j = i + 1
+            cond_depth = 0
+            while j < n:
+                kk = tokens[j][0]
+                if kk in ('LPAREN', 'LBRACKET'): cond_depth += 1
+                elif kk in ('RPAREN', 'RBRACKET'):
+                    if cond_depth == 0: break
+                    cond_depth -= 1
+                elif kk == 'LBRACE' and cond_depth == 0:
+                    break
+                elif kk in ('LET','FN','CLASS','IF','WHILE','FOR','PRINT','PRINTLN','RETURN') and cond_depth == 0:
+                    # Hit a statement keyword before a brace — brace is missing
+                    kw = tokens[i][1]
+                    emit(line, f"Missing '{{' After '{kw}'",
+                         f"The '{kw}' block is missing its opening '{{'\n"
+                         f"  {ANSI['DIM']}→  {src(line)}{ANSI['RESET']}",
+                         f"{kw} <condition> {{ ... }}")
+                    break
+                j += 1
+        i += 1
+
+    return issues
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # CLI entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1628,6 +1887,32 @@ def check_file(filepath: str, strict: bool = False) -> bool:
 
     try:
         tokens = tokenize(source)
+
+        # ── Token-level Structural Syntax Check ──────────────────────────────
+        syntax_issues = _token_syntax_check(tokens, source_lines)
+        if syntax_issues:
+            print(f"\n{ANSI['BOLD']}Rubidium Syntax Check{ANSI['RESET']}")
+            print(f"{ANSI['DIM']}Checking: {filepath}{ANSI['RESET']}\n")
+            for issue in syntax_issues:
+                color = ANSI.get(issue.severity, '')
+                print(f"{color}{issue.severity}{ANSI['RESET']}:")
+                print()
+                if issue.line:
+                    print(f"Line {issue.line}:")
+                print(issue.category)
+                print()
+                print(issue.message)
+                if issue.suggestion:
+                    print()
+                    print("Suggestion:")
+                    print(f"  {issue.suggestion}")
+                print()
+                print(f"{ANSI['DIM']}{'─' * 44}{ANSI['RESET']}")
+                print()
+            errs = [i for i in syntax_issues if i.severity == 'ERROR']
+            if errs:
+                print(f"{ANSI['ERROR']}✖  {len(errs)} syntax error{'s' if len(errs) != 1 else ''} "
+                      f"— analysis may be unreliable{ANSI['RESET']}\n")
 
         # ── Pre-parsing Keyword & Typo Pass ──
         KEYWORD_MAPPING = {
