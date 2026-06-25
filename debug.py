@@ -44,7 +44,7 @@ NUMERIC_TYPES = {
     'f32', 'f64', 'f128', 'f256', 'f512', 'f1024', 'f2048',
 }
 
-HEAP_TYPES = {'list', 'index', 'dict'}
+HEAP_TYPES = {'list', 'index', 'dict', 'str'}
 
 ALL_TYPES = NUMERIC_TYPES | {'str', 'bool', 'list', 'index', 'dict', 'Any', 'Null'}
 
@@ -167,6 +167,18 @@ class Debugger:
                 j = i + 1
                 if j < n and tokens[j][0] in ('IDENT', 'TYPE'):
                     self._lmap[('for', tokens[j][1])] = line
+            elif kind == 'IMPORT':
+                j = i + 1
+                if j < n and tokens[j][0] == 'IDENT':
+                    self._lmap[('import', tokens[j][1])] = line
+                    # Scan for 'as alias'
+                    j2 = j + 1
+                    while j2 < n and tokens[j2][0] == 'DOT':
+                        j2 += 2   # skip dot and next ident
+                    if j2 < n and tokens[j2][0] == 'AS':
+                        j2 += 1
+                        if j2 < n and tokens[j2][0] == 'IDENT':
+                            self._lmap[('import', tokens[j2][1])] = line
             i += 1
 
 
@@ -353,12 +365,16 @@ class Debugger:
         # ── Use / Import — declare a stub module object so method calls don't cascade ──
         elif isinstance(node, (ast.Use, ast.Import)):
             mod = node.module_name
-            self.scope.declare(mod, {
-                "value":   {"__module__": mod},
-                "type":    "module",
-                "mutable": False,
-                "dropped": False,
-            })
+            self.line = self._lmap.get(('import', mod), self.line)
+            stub = {"value": {"__module__": mod}, "type": "module",
+                    "mutable": False, "dropped": False}
+            self.scope.declare(mod, stub)
+            # Also register the alias (import tokeniser as tk → declare 'tk' too)
+            alias = getattr(node, 'alias', None)
+            if alias:
+                self.line = self._lmap.get(('import', alias), self.line)
+                self.scope.declare(alias, {"value": {"__module__": mod}, "type": "module",
+                                           "mutable": False, "dropped": False})
 
         # ── Stubs: OS / FFI / Threads / File I/O ─────────────────────────────
         elif isinstance(node, (
@@ -868,7 +884,8 @@ class Analyzer:
         return None
 
     def _is_heap_node(self, node) -> bool:
-        return isinstance(node, (ast.ListExpr, ast.DictExpr, ast.ClassInstantiate))
+        return isinstance(node, (ast.ListExpr, ast.DictExpr, ast.ClassInstantiate,
+                                  ast.Str, ast.InterpolatedStr))
 
     def _is_null_node(self, node) -> bool:
         if isinstance(node, ast.Bool) and str(node.value).lower() in ('null', 'none'):
@@ -914,6 +931,11 @@ class Analyzer:
                 self.namespaces.add(node.module_name)
             elif isinstance(node, ast.Import):
                 self.imports.add(node.module_name)
+                self.namespaces.add(node.module_name)   # treat imported files as namespaces
+                alias = getattr(node, 'alias', None)
+                if alias:
+                    self.imports.add(alias)
+                    self.namespaces.add(alias)          # alias is also a valid namespace
 
         for node in nodes:
             self._find_thread_fns(node)
@@ -1085,6 +1107,11 @@ class Analyzer:
             self.namespaces.add(node.module_name)
         elif t is ast.Import:
             self.imports.add(node.module_name)
+            self.namespaces.add(node.module_name)
+            alias = getattr(node, 'alias', None)
+            if alias:
+                self.imports.add(alias)
+                self.namespaces.add(alias)
         elif t is ast.FFILoad:
             self._ffi_load(node, scope)
         elif t is ast.FFIBind:
@@ -1157,6 +1184,15 @@ class Analyzer:
         elif t is ast.TypeCast:
             self._expr(node.expr, scope)
 
+        elif t in (ast.FileExists, ast.FileNew, ast.FileDelete):
+            self._expr(node.path_expr, scope)
+        elif t is ast.FileRename:
+            self._expr(node.old_path, scope)
+            self._expr(node.new_path, scope)
+        elif t is ast.FileCopy:
+            self._expr(node.src_path, scope)
+            self._expr(node.dst_path, scope)
+
         elif t is ast.FieldAccess:
             self._expr(node.obj, scope)
 
@@ -1196,7 +1232,7 @@ class Analyzer:
             self._expr(node.value, scope)
             return
 
-        is_heap = self._is_heap_node(node.value)
+        is_heap = self._is_heap_node(node.value) or (node.vtype in HEAP_TYPES)
         possibly_null = self._is_null_node(node.value)
         inferred_type = self._infer(node.value, scope) if node.value else node.vtype
 
@@ -1513,6 +1549,10 @@ class Analyzer:
                                 f"Parameter '{pname}'\n\nExpected:\n{ptype}\n\nReceived:\n{atype}"
                             )
 
+        # Class instantiation called as a function: let x = MyClass()
+        if name in self.classes:
+            self.classes[name]['used'] = True
+
         for a in node.args:
             self._expr(a, scope)
 
@@ -1523,7 +1563,21 @@ class Analyzer:
         if name in ALL_TYPES:
             return
 
-        # Allow module/namespace names
+        # Check scope first — a declared variable shadows a namespace with the same name.
+        # This matches Rubidium's shadowing rule: local/global scope beats namespace.
+        info = scope.lookup(name)
+        if info is not None:
+            if info.get('dropped'):
+                self._emit('ERROR', info.get('drop_line'), 'Use After Drop',
+                           f"Variable '{name}' was dropped and cannot be used.",
+                           f"Remove the drop, or recreate the variable before using it.")
+            else:
+                scope.mark_used(name)
+                if info.get('possibly_null'):
+                    pass   # null propagation tracked elsewhere
+            return
+
+        # Allow module/namespace names (only when NOT shadowed by a variable above)
         if name in self.namespaces or name in KNOWN_MODULES:
             return
 
@@ -1534,29 +1588,16 @@ class Analyzer:
                            f"Module not enabled: {ns}", f"use {ns}")
             return
 
-        info = scope.lookup(name)
-        if info is None:
-            if (name not in self.functions and name not in self.classes
-                    and name not in BUILTIN_FNS):
-                known = (list(self.functions) + list(self.classes) +
-                         list(BUILTIN_FNS) + list(scope.vars.keys()))
-                suggestion = _closest_name(name, known)
-                msg = f"Unknown variable: {name}"
-                if suggestion:
-                    msg += f"\n\nDid you mean: {suggestion}?"
-                self._emit('ERROR', None, 'Unknown Variable', msg)
-            return
-
-        scope.mark_used(name)
-
-        if info.get('dropped'):
-            self._emit(
-                'ERROR', info.get('line'), 'Use After Drop',
-                f"Variable '{name}' was dropped on line {info.get('drop_line', '?')}."
-            )
-        if info.get('possibly_null'):
-            self._emit('WARNING', info.get('line'), 'Possible Null Usage',
-                       f"Variable '{name}' may contain Null.")
+        # Variable not in scope and not a namespace — unknown symbol
+        if (name not in self.functions and name not in self.classes
+                and name not in BUILTIN_FNS):
+            known = (list(self.functions) + list(self.classes) +
+                     list(BUILTIN_FNS) + list(scope.vars.keys()))
+            suggestion = _closest_name(name, known)
+            msg = f"Unknown variable: {name}"
+            if suggestion:
+                msg += f"\n\nDid you mean: {suggestion}?"
+            self._emit('ERROR', None, 'Unknown Variable', msg)
 
     def _collection_method(self, node: ast.CollectionMethodCall, scope: Scope):
         self._expr(node.obj, scope)
