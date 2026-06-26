@@ -653,8 +653,8 @@ while count < 5 {
 # RANGE LOOP
 # -----------------------------------------
 
-# range(start, end) — end is inclusive.
-#
+# range(start, end) — end is exclusive.
+
 # The loop variable is local to the loop only.
 # It can be named anything and is automatically
 # dropped when the loop ends.
