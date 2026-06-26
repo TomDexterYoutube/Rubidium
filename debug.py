@@ -132,6 +132,7 @@ class Debugger:
 
     def __init__(self, source_lines=None, tokens=None):
         self.scope          = Scope()
+        self._root_scope    = self.scope  # global pool — non-local 'let' lands here
         self.line           = "?"
         self.errors         = []
         self.output         = []
@@ -237,7 +238,9 @@ class Debugger:
         if isinstance(node, ast.VarDecl):
             self.line = self._lmap.get(('var', node.name), "?")
             value = self.evaluate(node.value)
-            self.scope.declare(node.name, {
+            # Per spec: 'let' without 'local' enters the global memory pool.
+            target = self.scope if node.is_local else self._root_scope
+            target.declare(node.name, {
                 "value":   value,
                 "type":    node.vtype or self.rub_type(value),
                 "mutable": node.mutable,
@@ -798,6 +801,7 @@ class Analyzer:
         self.global_allocs:  int  = 0
         self._lmap: dict = {}
         self._leak_vars: list = []
+        self._global_scope: Scope | None = None   # set in analyze(); used by _var_decl
 
     def _emit(self, severity: str, line, category: str,
               message: str, suggestion: str = ''):
@@ -957,6 +961,7 @@ class Analyzer:
         self._build_line_map(tokens)
         self._pre_pass(nodes)
         global_scope = Scope()
+        self._global_scope = global_scope   # non-local 'let' inside functions targets this
         for node in nodes:
             self._node(node, global_scope, in_loop=False)
         self._check_unused(global_scope)
@@ -1226,12 +1231,6 @@ class Analyzer:
             pass
 
     def _var_decl(self, node: ast.VarDecl, scope: Scope):
-        if node.name in scope.vars:
-            self._emit('ERROR', self._ln('var', node.name), 'Duplicate Symbol',
-                       f"Variable '{node.name}' already exists.")
-            self._expr(node.value, scope)
-            return
-
         is_heap = self._is_heap_node(node.value) or (node.vtype in HEAP_TYPES)
         possibly_null = self._is_null_node(node.value)
         inferred_type = self._infer(node.value, scope) if node.value else node.vtype
@@ -1246,12 +1245,28 @@ class Analyzer:
             'drop_line':     None,
             'possibly_null': possibly_null,
         }
-        scope.declare(node.name, info)
+        # Per spec: 'let' without 'local' enters the global memory pool,
+        # even when declared inside a function or class method body.
+        # Only 'let local' and function parameters stay function-scoped.
+        target_scope = scope if node.is_local else (self._global_scope or scope)
+
+        if node.name in target_scope.vars:
+            existing_line = target_scope.vars[node.name].get('line', '?')
+            self._emit(
+                'ERROR', self._ln('var', node.name), 'Duplicate Symbol',
+                f"Variable '{node.name}' was already declared "
+                f"(first seen at line {existing_line}).",
+                f"Rename one of the '{node.name}' declarations, "
+                f"or use assignment (=) to update the existing variable."
+            )
+            return
+
+        target_scope.declare(node.name, info)
 
         if is_heap:
             self.global_allocs += 1
 
-        if node.mutable and not node.is_local and scope.parent is None:
+        if node.mutable and not node.is_local and target_scope.parent is None:
             self.global_muts[node.name] = info
 
         if node.vtype and node.value is not None and not possibly_null:
