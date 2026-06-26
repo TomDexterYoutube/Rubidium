@@ -425,6 +425,12 @@ class CodeGen:
                 fn = self.functions[f"{resolved_obj}_{node.method}"]
                 return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
 
+            # Object is a known import alias but the method isn't registered yet
+            # (e.g. imported .rub file wasn't found, or will be linked separately).
+            # Return a sensible default so infer_type doesn't raise.
+            if isinstance(node.obj, Var) and obj_name in self.import_aliases:
+                return "i64"
+
             # FFI bindings: c_lib.my_c_func -> method name alone is the bound symbol
             # (also covers chained namespace access, e.g. wrap.glfw.glfwInit())
             if node.method in self.functions and obj_name not in self.instances:
@@ -2785,6 +2791,25 @@ class CodeGen:
                     ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else "i64"
                     self.emit(f"  {tmp} = call {ret_ir} @{target}({', '.join(args_ir)})")
                     return tmp, ret_ir
+
+        # 4b. Object is a known import alias but the prefixed function wasn't registered
+        #     (tokeniser.rub not found, or it will be linked separately).
+        #     Emit an extern forward-declaration and call rather than crashing.
+        if isinstance(node.obj, Var) and obj_name in self.import_aliases:
+            resolved = self.import_aliases.get(obj_name, obj_name)
+            ext_name = f"{resolved}_{node.method}"
+            args_ir, arg_types = [], []
+            for a in node.args:
+                v, t = self.emit_expr(a)
+                args_ir.append(f"{t} {v}")
+                arg_types.append(t)
+            params_str = ", ".join(arg_types)
+            decl = f"declare i64 @{ext_name}({params_str})"
+            if decl not in self.global_decls:
+                self.global_decls.append(decl)
+            tmp = self.new_tmp()
+            self.emit(f"  {tmp} = call i64 @{ext_name}({', '.join(args_ir)})")
+            return tmp, "i64"
 
         obj_val, obj_t = self.emit_expr(node.obj)
         
