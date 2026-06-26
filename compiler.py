@@ -1114,7 +1114,12 @@ def parse_file(filepath, parsed_files, combined_ast, is_main=False):
             mod_file = node.module_name.replace(".", os.sep) + ".rub"
             base_dir = os.path.dirname(filepath)
             mod_path = os.path.join(base_dir, mod_file) if base_dir else mod_file
-            parse_file(mod_path, parsed_files, combined_ast)
+            if os.path.exists(mod_path):
+                parse_file(mod_path, parsed_files, combined_ast)
+            else:
+                alias_note = f" (alias: {node.alias})" if getattr(node, 'alias', None) else ""
+                print(f"\033[1;33mWARNING\033[0m: Import '{node.module_name}'{alias_note} "
+                      f"not found at '{mod_path}' — calls to this module will be no-ops.")
         elif isinstance(node, Use):
             continue
     

@@ -2805,9 +2805,10 @@ class CodeGen:
                     self.emit(f"  {tmp} = call {ret_ir} @{target}({', '.join(args_ir)})")
                     return tmp, ret_ir
 
-        # 4b. Object is a known import alias but the prefixed function wasn't registered
-        #     (tokeniser.rub not found, or it will be linked separately).
-        #     Emit an extern forward-declaration and call rather than crashing.
+        # 4b. Object is a known import alias but the prefixed function wasn't registered.
+        #     Emit a 'weak' stub definition instead of an extern declaration.
+        #     Weak linkage means: if the real module is compiled in later, it wins;
+        #     if not, the stub (returns a safe default) is used and the program still links.
         if isinstance(node.obj, Var) and obj_name in self.import_aliases:
             resolved = self.import_aliases.get(obj_name, obj_name)
             ext_name = f"{resolved}_{node.method}"
@@ -2816,10 +2817,15 @@ class CodeGen:
                 v, t = self.emit_expr(a)
                 args_ir.append(f"{t} {v}")
                 arg_types.append(t)
-            params_str = ", ".join(arg_types)
-            decl = f"declare i64 @{ext_name}({params_str})"
-            if decl not in self.global_decls:
-                self.global_decls.append(decl)
+            params_def = ", ".join(f"{t} %a{i}" for i, t in enumerate(arg_types))
+            stub_key = f"define weak i64 @{ext_name}"
+            if not any(stub_key in d for d in self.global_decls):
+                self.global_decls.append(
+                    f"define weak i64 @{ext_name}({params_def}) {{\n"
+                    f"entry:\n"
+                    f"  ret i64 0\n"
+                    f"}}\n"
+                )
             tmp = self.new_tmp()
             self.emit(f"  {tmp} = call i64 @{ext_name}({', '.join(args_ir)})")
             return tmp, "i64"
