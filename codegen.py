@@ -99,6 +99,9 @@ class CodeGen:
         self._file_handle_vars = {}     # var_name -> slot_int while inside an open() block
         # import alias map: alias_name -> module_prefix (e.g. "mt" -> "math_tools")
         self.import_aliases = import_aliases or {}
+        # Tracks the IR return type of the function currently being emitted;
+        # used by the Return handler to avoid type mismatches when ret_type is None.
+        self._cur_fn_ret_ir: str = "i64"
 
     def is_class_field(self, name):
         if not self.cur_class: return False
@@ -601,6 +604,7 @@ class CodeGen:
         self._alloca_emitted = set()  # track which local names have had alloca emitted
         
         ret_ir = "i32" if node.name == "main" else (self.rubi_type_to_ir(node.ret_type) if node.ret_type else "i64")
+        self._cur_fn_ret_ir = ret_ir   # Return handler uses this when fn has no declared ret type
         param_ir = ", ".join(f"{self.rubi_type_to_ir(pt)} %param_{pn}" for pn, pt in node.params)
         self.emit(f"define {ret_ir} @{node.name}({param_ir}) {{")
         self.emit("entry:")
@@ -643,6 +647,7 @@ class CodeGen:
         self._alloca_emitted = set()
         
         struct_t, ret_ir = self.class_ir_type(class_name), (self.rubi_type_to_ir(mfn.ret_type) if mfn.ret_type else "i64")
+        self._cur_fn_ret_ir = ret_ir   # Return handler uses this when method has no declared ret type
         param_str = ", ".join([f"{struct_t}* %param___self"] + [f"{self.rubi_type_to_ir(pt)} %param_{pn}" for pn, pt in mfn.params[1:]])
         self.emit(f"define {ret_ir} @{mfn.name}({param_str}) {{"  )
         self.emit("entry:")
@@ -826,7 +831,15 @@ class CodeGen:
         elif isinstance(node, For): self.emit_for(node)
         elif isinstance(node, Return):
             val, val_t = self.emit_expr(node.value)
-            expected = (self.rubi_type_to_ir(self.functions[self.cur_fn].ret_type) if self.cur_fn in self.functions and self.functions[self.cur_fn].ret_type else val_t)
+            # Determine the expected return type:
+            # 1. Use the registered function's declared return type if available
+            # 2. Fall back to the current function's IR return type (_cur_fn_ret_ir)
+            # 3. Only use the expression's type (val_t) as a last resort
+            # This prevents `ret %Box* %t75` inside a function declared as `i64`.
+            if self.cur_fn in self.functions and self.functions[self.cur_fn].ret_type:
+                expected = self.rubi_type_to_ir(self.functions[self.cur_fn].ret_type)
+            else:
+                expected = getattr(self, '_cur_fn_ret_ir', val_t)
             val = self.coerce(val, val_t, expected)
             self.emit(f"  ret {expected} {val}")
             return True
