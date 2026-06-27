@@ -202,6 +202,18 @@ class Debugger:
             except Exception as e:
                 self.error(f"Unhandled runtime crash: {type(e).__name__}: {e}")
                 break
+
+        # ── Phase 2: auto-call main() per Rubidium execution model ───────────
+        if 'main' in self._fn_defs:
+            try:
+                self._call_fn(self._fn_defs['main'], [])
+            except _Return:
+                pass
+            except RecursionError:
+                self.error("Maximum recursion depth exceeded in main()")
+            except Exception as e:
+                self.error(f"Unhandled runtime crash in main(): {type(e).__name__}: {e}")
+
         return len(self.errors) == 0
 
 
@@ -511,7 +523,7 @@ class Debugger:
                 if node.op == "-":   return left - right
                 if node.op == "*":   return left * right
                 if node.op == "/":
-                    if right == 0: self.error("Division by zero"); return None
+                    if right == 0: self.error("Division by zero", highlight="/"); return None
                     return left / right
                 if node.op == "**":  return left ** right
                 if node.op == "%":   return left % right
@@ -741,7 +753,17 @@ class Debugger:
         if isinstance(obj, dict):
             if method == "len":  return len(obj)
             if method == "has":  return args[0] in obj if args else False
-            if method in ("add", "set"):
+            if method == "add":
+                if len(args) == 1:
+                    # dict().add("key") — creates a new top-level key.
+                    # Per spec the key's value starts as Null (empty collection).
+                    # We use [] so subsequent dict(key).add(val) calls work
+                    # (list is mutable in-place; None is not).
+                    obj[args[0]] = []
+                elif len(args) >= 2:
+                    obj[args[0]] = args[1]
+                return None
+            if method == "set":
                 if len(args) >= 2: obj[args[0]] = args[1]
                 return None
             if method == "drop": return None
@@ -770,7 +792,8 @@ class Debugger:
         if value is None:            return "Null"
         return "Any"
 
-    def error(self, msg):
+    def error(self, msg, highlight=None):
+        import re
         self.errors.append({"line": self.line, "message": msg})
         line_str = f"line {self.line}" if self.line != "?" else "unknown line"
 
@@ -779,6 +802,25 @@ class Debugger:
             try:
                 src = self._source_lines[self.line - 1].rstrip()
                 ctx = f"\n  {ANSI['DIM']}→  {src}{ANSI['RESET']}"
+
+                # Determine what term to underline
+                term = highlight
+                if term is None:
+                    # Auto-extract first single-quoted token from the error message
+                    m = re.search(r"'([^']+)'", msg)
+                    if m:
+                        term = m.group(1)
+
+                if term is not None:
+                    # Strip leading dot for method names so we still find the word
+                    search_term = term.lstrip('.')
+                    # Remove trailing () if present so we match the name in source
+                    search_term = re.sub(r'\(\)$', '', search_term)
+                    col = src.find(search_term) if search_term else -1
+                    if col >= 0:
+                        # "  →  " prefix = 5 visual chars; replicate with spaces for alignment
+                        underline = ' ' * col + '^' * max(len(search_term), 1)
+                        ctx += f"\n     {ANSI['ERROR']}{underline}{ANSI['RESET']}"
             except IndexError:
                 pass
 
@@ -957,11 +999,43 @@ class Analyzer:
                 for child in body:
                     self._find_thread_fns(child)
 
+    def _pre_declare_fn_globals(self, nodes: list, global_scope: Scope):
+        """Scan function bodies for non-local 'let' declarations and stub them
+        into global_scope early.  This prevents false 'unknown variable' errors
+        when a function defined textually before main() uses a variable that
+        main() (or any later function) will place into the global pool at runtime."""
+        def _scan_body(stmts):
+            for stmt in (stmts or []):
+                if isinstance(stmt, ast.VarDecl) and not stmt.is_local:
+                    if stmt.name not in global_scope.vars:
+                        global_scope.declare(stmt.name, {
+                            'mutable':       stmt.mutable,
+                            'vtype':         stmt.vtype or 'Any',
+                            'dropped':       False,
+                            'used':          True,   # pre-mark so no spurious warnings
+                            'is_heap':       stmt.vtype in HEAP_TYPES if stmt.vtype else False,
+                            'line':          self._ln('var', stmt.name),
+                            'drop_line':     None,
+                            'possibly_null': False,
+                            '__stub':        True,   # flag so _var_decl updates, not errors
+                        })
+                # Recurse into nested bodies
+                for attr in ('body', 'then_body', 'else_body', 'try_body', 'error_body'):
+                    _scan_body(getattr(stmt, attr, None))
+
+        for node in nodes:
+            if isinstance(node, ast.FnDef):
+                _scan_body(node.body)
+
     def analyze(self, nodes: list, tokens: list):
         self._build_line_map(tokens)
         self._pre_pass(nodes)
         global_scope = Scope()
         self._global_scope = global_scope   # non-local 'let' inside functions targets this
+        # Pre-scan function bodies for non-local 'let' that go into the global pool.
+        # Without this, a function defined before main() would falsely report variables
+        # declared in main() (without 'local') as unknown.
+        self._pre_declare_fn_globals(nodes, global_scope)
         for node in nodes:
             self._node(node, global_scope, in_loop=False)
         self._check_unused(global_scope)
@@ -1251,7 +1325,20 @@ class Analyzer:
         target_scope = scope if node.is_local else (self._global_scope or scope)
 
         if node.name in target_scope.vars:
-            existing_line = target_scope.vars[node.name].get('line', '?')
+            existing = target_scope.vars[node.name]
+            if existing.get('__stub'):
+                # Pre-declared stub — replace with real declaration info
+                existing.update({
+                    'mutable':       node.mutable,
+                    'vtype':         node.vtype or inferred_type,
+                    'is_heap':       is_heap,
+                    'possibly_null': possibly_null,
+                    'line':          self._ln('var', node.name),
+                    '__stub':        False,
+                })
+                self._expr(node.value, scope)
+                return
+            existing_line = existing.get('line', '?')
             self._emit(
                 'ERROR', self._ln('var', node.name), 'Duplicate Symbol',
                 f"Variable '{node.name}' was already declared "
