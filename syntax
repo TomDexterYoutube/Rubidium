@@ -173,6 +173,26 @@ counter = 5
 let a = 10
 a = 20   # ERROR: a is not mutable
 
+
+# -----------------------------------------
+# VARIABLES OVERWRITE RULE
+# ----------------------------------------- 
+
+# If you declare a varable
+let mut x: i32 = 10
+
+# Then you can edit it since its mut
+
+x = 15
+
+# But you dont use let to change it
+# IF you use let
+
+let x = "Hi"
+
+# And a varable with that name already exits then it drops it and recreates it
+
+
 # =========================================
 # DATA TYPES
 # =========================================
@@ -622,6 +642,11 @@ val.drop()
 let mut items: list = [1, 2, 3]
 items.drop()
 
+# You can remove a spesific varble in a collection 
+# It removes it and shifts the structer it DOES NOT replace it with Null
+
+items(1).drop()
+
 # =========================================
 # CONDITIONALS
 # =========================================
@@ -803,6 +828,25 @@ let result = add(2, 3)   # 5
 fn log(msg: str) {
     print(i"[LOG] {msg}")
 }
+
+# -----------------------------------------
+# The Link Rule
+# -----------------------------------------
+
+# Say you have a varable that is a local val and it is large
+# And you want another function to use it but you dont want to deep copy the large value
+# Then use link
+
+fn stuff(val: Any) -> Any {
+    val.add(7)
+
+fn main() {
+    let local large_list: list = ["Lots of Data"]
+    stuff(link large_list)
+}
+
+# This would let the function stuff access the local varable without a deep copy
+# Both functions are now using the same varable both have full access if it is mut both can edit it
 
 # =========================================
 # ERROR HANDLING

@@ -140,6 +140,7 @@ class Debugger:
         self._class_defs    = {}      # name  -> ast.ClassDef
         self._source_lines  = source_lines or []
         self._lmap          = {}      # ('var'|'fn'|'class'|'for', name) -> line
+        self._try_depth     = 0       # >0 means inside a try block; errors raise instead of print
         if tokens:
             self._build_lmap(tokens)
 
@@ -345,15 +346,23 @@ class Debugger:
 
         # ── Try / Error ───────────────────────────────────────────────────────
         elif isinstance(node, ast.Try):
+            self._try_depth += 1
+            caught_exc = None
             try:
                 for stmt in node.try_body:
                     self.execute(stmt)
             except (_Return, _Break, _Continue):
+                self._try_depth -= 1
                 raise   # let control-flow signals pass through
             except Exception as exc:
+                caught_exc = exc
+            # Decrement BEFORE running the error handler so that any
+            # errors inside the handler are still reported normally.
+            self._try_depth -= 1
+            if caught_exc is not None:
                 err_scope = Scope(parent=self.scope)
                 err_scope.declare("error", {
-                    "value": str(exc), "type": "str",
+                    "value": str(caught_exc), "type": "str",
                     "dropped": False,  "mutable": False,
                 })
                 saved, self.scope = self.scope, err_scope
@@ -657,10 +666,40 @@ class Debugger:
     # ── MethodCall evaluator ──────────────────────────────────────────────────
 
     def _eval_method_call(self, node):
-        obj    = self.evaluate(node.obj)
         method = node.method
         args   = [self.evaluate(a) for a in node.args]
 
+        # ── Special case: mutating method on a collection-element access ─────
+        # e.g. my_list(0).set("val")   →  my_list[0] = "val"
+        #      my_index("k").set("v")  →  my_index["k"] = "v"
+        #      my_dict("key", 1).set(x) → my_dict["key"][1] = x
+        if method == "set" and isinstance(node.obj, ast.FnCall):
+            fname = node.obj.name if isinstance(node.obj.name, str) else None
+            if fname:
+                info = self.scope.lookup(fname)
+                if info is not None:
+                    col      = info["value"]
+                    idx_args = [self.evaluate(a) for a in node.obj.args]
+                    new_val  = args[0] if args else None
+                    if isinstance(col, list) and len(idx_args) == 1:
+                        try:
+                            col[int(idx_args[0])] = new_val
+                        except (IndexError, TypeError, ValueError) as e:
+                            self.error(f"'.set()' index error on '{fname}': {e}")
+                        return None
+                    elif isinstance(col, dict) and len(idx_args) == 1:
+                        col[idx_args[0]] = new_val
+                        return None
+                    elif isinstance(col, dict) and len(idx_args) == 2:
+                        sub = col.get(idx_args[0])
+                        if isinstance(sub, list):
+                            try:
+                                sub[int(idx_args[1])] = new_val
+                            except (IndexError, TypeError) as e:
+                                self.error(f"'.set()' index error on '{fname}': {e}")
+                        return None
+
+        obj    = self.evaluate(node.obj)
         if obj is None:
             self.error(f"Method '.{method}()' called on None — object may be undefined or dropped")
             return None
@@ -794,6 +833,10 @@ class Debugger:
 
     def error(self, msg, highlight=None):
         import re
+        # If we are inside a try block, raise so the try/error handler can catch it.
+        # This prevents caught exceptions from also being logged as debug errors.
+        if self._try_depth > 0:
+            raise RuntimeError(msg)
         self.errors.append({"line": self.line, "message": msg})
         line_str = f"line {self.line}" if self.line != "?" else "unknown line"
 
@@ -844,6 +887,8 @@ class Analyzer:
         self._lmap: dict = {}
         self._leak_vars: list = []
         self._global_scope: Scope | None = None   # set in analyze(); used by _var_decl
+        self._try_depth: int = 0    # >0: inside a try block; vars scoped locally, not globally
+        self._fn_depth:  int = 0    # >0: inside a fn/method; allow re-decl of existing globals
 
     def _emit(self, severity: str, line, category: str,
               message: str, suggestion: str = ''):
@@ -1158,8 +1203,10 @@ class Analyzer:
             self._if(node, scope)
         elif t is ast.Try:
             try_scope = Scope(parent=scope)
+            self._try_depth += 1
             for s in node.try_body:
                 self._node(s, try_scope, in_loop)
+            self._try_depth -= 1
             error_scope = Scope(parent=scope)
             error_scope.declare('error', {
                 'mutable': False, 'vtype': 'str', 'dropped': False,
@@ -1322,7 +1369,14 @@ class Analyzer:
         # Per spec: 'let' without 'local' enters the global memory pool,
         # even when declared inside a function or class method body.
         # Only 'let local' and function parameters stay function-scoped.
-        target_scope = scope if node.is_local else (self._global_scope or scope)
+        # Exception 1: inside a try block, declarations are try-local to
+        #   prevent false duplicate errors across separate try blocks.
+        # Exception 2: inside a function body, re-declaring an existing
+        #   global is treated as an update (not a duplicate).
+        if node.is_local or self._try_depth > 0:
+            target_scope = scope
+        else:
+            target_scope = self._global_scope or scope
 
         if node.name in target_scope.vars:
             existing = target_scope.vars[node.name]
@@ -1335,6 +1389,17 @@ class Analyzer:
                     'possibly_null': possibly_null,
                     'line':          self._ln('var', node.name),
                     '__stub':        False,
+                })
+                self._expr(node.value, scope)
+                return
+            # Inside a function/method, re-declaring an existing global variable
+            # is a valid update of that global — not a duplicate symbol error.
+            if self._fn_depth > 0 and target_scope is self._global_scope:
+                existing.update({
+                    'mutable':       node.mutable,
+                    'vtype':         node.vtype or inferred_type,
+                    'is_heap':       is_heap,
+                    'possibly_null': possibly_null,
                 })
                 self._expr(node.value, scope)
                 return
@@ -1449,6 +1514,7 @@ class Analyzer:
             self._scan_race(node.body, node.name)
 
         found_return = False
+        self._fn_depth += 1
         for stmt in node.body:
             if found_return:
                 self._emit('WARNING', None, 'Unreachable Code',
@@ -1466,6 +1532,7 @@ class Analyzer:
                         )
 
         param_names = {p[0] for p in (node.params or [])}
+        self._fn_depth -= 1
         for vname, vinfo in fn_scope.vars.items():
             if vname in param_names:
                 continue
@@ -1512,8 +1579,10 @@ class Analyzer:
                     'used': True, 'is_heap': ptype in HEAP_TYPES if ptype else False,
                     'line': None, 'drop_line': None, 'possibly_null': False,
                 })
+            self._fn_depth += 1
             for stmt in (method.body or []):
                 self._node(stmt, method_scope, in_loop=False)
+            self._fn_depth -= 1
 
         for fname, finfo in self.classes[node.name]['fields'].items():
             if not finfo.get('used'):
