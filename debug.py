@@ -546,6 +546,16 @@ class Debugger:
             left  = self.evaluate(node.left)
             right = self.evaluate(node.right)
             try:
+                # Spec: Null (None) is smaller than every non-null value.
+                # Null == Null is True; Null compared to non-null follows inequality rules.
+                if left is None or right is None:
+                    if node.op == "==": return (left is None) and (right is None)
+                    if node.op == "!=": return not ((left is None) and (right is None))
+                    if node.op == "<":  return (left is None) and (right is not None)
+                    if node.op == ">":  return (right is None) and (left is not None)
+                    if node.op == "<=": return left is None          # Null <= anything
+                    if node.op == ">=": return right is None         # anything >= Null
+                    return False
                 if node.op == "==":  return left == right
                 if node.op == "!=":  return left != right
                 if node.op == ">":   return left > right
@@ -555,6 +565,11 @@ class Debugger:
             except Exception as e:
                 self.error(f"Comparison '{node.op}' failed: {e}")
             return False
+
+        if isinstance(node, ast.FileExists):
+            import os as _os
+            path = self.evaluate(node.path_expr)
+            return _os.path.exists(str(path)) if path is not None else False
 
         if isinstance(node, ast.TypeCast):
             val = self.evaluate(node.expr)
@@ -703,12 +718,23 @@ class Debugger:
         if obj is None:
             self.error(f"Method '.{method}()' called on None — object may be undefined or dropped")
             return None
-
         try:
-            return self._dispatch_method(obj, method, args)
+            result = self._dispatch_method(obj, method, args)
         except (IndexError, TypeError, ValueError) as e:
-            self.error(f"Method '.{method}({", ".join(repr(a) for a in args)})' failed: {e}")
+            self.error(f"Method '.{method}({', '.join(repr(a) for a in args)})' failed: {e}")
             return None
+
+        # String-mutating methods return a new string; write it back to the source variable.
+        # e.g. my_str.set(0, "J")  →  my_str = "Jello"
+        if (result is not None
+                and isinstance(result, str)
+                and method in ("set", "insert", "replace")
+                and isinstance(node.obj, ast.Var)):
+            info = self.scope.lookup(node.obj.name)
+            if info is not None and isinstance(info.get("value"), str):
+                info["value"] = result
+
+        return result
 
     def _dispatch_method(self, obj, method, args):
 
@@ -1797,7 +1823,39 @@ class Analyzer:
                        "Null in arithmetic evaluates to 0 or False.")
 
     def _null_compare(self, node: ast.Compare, scope: Scope):
-        if self._is_null_node(node.left) or self._is_null_node(node.right):
+        # Per spec: Null is smaller than every non-null value.
+        # - Null == Null  → True
+        # - Null < n      → True  (for any non-null n)
+        # - Null > n      → False
+        # - Null != n     → True  (for any non-null n)
+        # Only flag comparisons that are always False per these rules.
+        l_null = self._is_null_node(node.left)
+        r_null = self._is_null_node(node.right)
+        if not (l_null or r_null):
+            return
+        both_null = l_null and r_null
+        op = node.op
+        # Determine whether this comparison is always False
+        always_false = False
+        if both_null:
+            # Null == Null → True, Null != Null → False, Null < Null → False
+            if op in ("<", ">", "<=", ">="):
+                always_false = op not in ("<=", ">=")   # Null <= Null and >= Null are True
+            elif op == "!=":
+                always_false = True
+        else:
+            # One side is Null, other is a concrete non-null value
+            # Null < x → True  (not always false)
+            # Null > x → False (always false)
+            # Null == x → False (always false)
+            # Null != x → True  (not always false)
+            if (l_null and op == ">") or (r_null and op == "<"):
+                always_false = True
+            elif (l_null and op == "==") or (r_null and op == "=="):
+                always_false = True
+            elif (l_null and op == ">=") or (r_null and op == "<="):
+                always_false = True
+        if always_false:
             self._emit('INFO', None, 'Condition Always False',
                        "Condition always evaluates to False.",
                        f"Comparison with Null is always False.")
