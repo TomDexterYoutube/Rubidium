@@ -304,8 +304,20 @@ class Parser:
         self.match("RBRACE")
         return For(var, start, end, body, iterable)
 
+    # Token kinds that can never start an expression — seeing one of these
+    # right after 'return' means it's a bare `return` with no value, not the
+    # start of an expression that happens to be missing.
+    _STMT_BOUNDARY_TOKENS = {
+        "RBRACE", "IMPORT", "USE", "LET", "PRINT", "PRINTLN", "IF", "WHILE",
+        "FOR", "BREAK", "CONTINUE", "RETURN", "TRY", "FN", "OPEN", "CLASS",
+        "DROP",
+    }
+
     def return_stmt(self):
         self.match("RETURN")
+        nxt = self.peek()
+        if nxt is None or nxt[0] in self._STMT_BOUNDARY_TOKENS:
+            return Return(None)
         return Return(self.expr())
 
     def try_stmt(self):

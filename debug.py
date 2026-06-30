@@ -1004,6 +1004,19 @@ class Analyzer:
         return isinstance(node, (ast.ListExpr, ast.DictExpr, ast.ClassInstantiate,
                                   ast.Str, ast.InterpolatedStr))
 
+    def _literal_key(self, node):
+        """Returns a hashable, comparable representation of a literal key
+        node (Number/Str/Bool) for duplicate-key detection, or None if the
+        key isn't a simple literal (e.g. a variable) and can't be checked
+        statically."""
+        if isinstance(node, ast.Number):
+            return ('num', node.value)
+        if isinstance(node, ast.Str):
+            return ('str', node.value)
+        if isinstance(node, ast.Bool):
+            return ('bool', str(node.value).lower())
+        return None
+
     def _is_null_node(self, node) -> bool:
         if isinstance(node, ast.Bool) and str(node.value).lower() in ('null', 'none'):
             return True
@@ -1034,6 +1047,11 @@ class Analyzer:
                 if node.name not in self.classes:
                     fields = {}
                     for f in node.fields:
+                        if f.name in fields:
+                            self._emit('ERROR', self._ln('class', node.name), 'Duplicate Symbol',
+                                       f"Field '{f.name}' is declared more than once "
+                                       f"in class '{node.name}'.",
+                                       f"Rename one of the '{f.name}' fields.")
                         fields[f.name] = {'mutable': f.mutable, 'vtype': f.vtype, 'used': False}
                     methods = {}
                     for m in node.methods:
@@ -1053,6 +1071,19 @@ class Analyzer:
                 if alias:
                     self.imports.add(alias)
                     self.namespaces.add(alias)          # alias is also a valid namespace
+            elif isinstance(node, ast.FFIBind):
+                # Bug 11: the Rubidium-callable name for an FFI binding
+                # (the `as alias`, or the raw symbol_name when there's no
+                # alias) was never registered, so every legitimate call to
+                # a bound FFI function was falsely reported as unknown.
+                callable_name = node.alias or node.symbol_name
+                if callable_name and callable_name not in self.functions:
+                    self.functions[callable_name] = {
+                        'params':   node.params,
+                        'ret_type': node.ret_type,
+                        'used':     False,
+                        'line':     None,
+                    }
 
         for node in nodes:
             self._find_thread_fns(node)
@@ -1112,6 +1143,7 @@ class Analyzer:
         self._check_unused(global_scope)
         self._check_global_leaks(global_scope)
         self._ast_syntax_check(nodes)
+        self._scan_thread_reuse(nodes)
 
     # ── AST-level structural syntax checks ────────────────────────────────────
 
@@ -1140,12 +1172,28 @@ class Analyzer:
                     self._emit('ERROR', None, 'Break Outside Loop',
                                "'break' is used outside of any loop.",
                                "Move 'break' inside a 'while' or 'for' loop.")
+                else:
+                    remaining = len(stmts) - i - 1
+                    if remaining > 0:
+                        self._emit('WARNING', None, 'Dead Code',
+                                   f"{remaining} unreachable statement"
+                                   f"{'s' if remaining != 1 else ''} after 'break'.",
+                                   "Remove or move the code before the 'break'.")
+                    break
 
             elif isinstance(node, ast.Continue):
                 if not in_loop:
                     self._emit('ERROR', None, 'Continue Outside Loop',
                                "'continue' is used outside of any loop.",
                                "Move 'continue' inside a 'while' or 'for' loop.")
+                else:
+                    remaining = len(stmts) - i - 1
+                    if remaining > 0:
+                        self._emit('WARNING', None, 'Dead Code',
+                                   f"{remaining} unreachable statement"
+                                   f"{'s' if remaining != 1 else ''} after 'continue'.",
+                                   "Remove or move the code before the 'continue'.")
+                    break
 
             elif isinstance(node, ast.FnDef):
                 ln = self._ln('fn', node.name)
@@ -1250,9 +1298,7 @@ class Analyzer:
         elif t is ast.FnCall:
             self._fn_call(node, scope)
         elif t is ast.MethodCall:
-            self._expr(node.obj, scope)
-            for a in node.args:
-                self._expr(a, scope)
+            self._method_call(node, scope)
         elif t is ast.CollectionMethodCall:
             self._collection_method(node, scope)
         elif t is ast.Use:
@@ -1307,9 +1353,7 @@ class Analyzer:
         elif t is ast.FnCall:
             self._fn_call(node, scope)
         elif t is ast.MethodCall:
-            self._expr(node.obj, scope)
-            for a in node.args:
-                self._expr(a, scope)
+            self._method_call(node, scope)
         elif t is ast.CollectionMethodCall:
             self._collection_method(node, scope)
         elif t is ast.BinOp:
@@ -1327,6 +1371,17 @@ class Analyzer:
             for e in node.elements:
                 self._expr(e, scope)
         elif t is ast.DictExpr:
+            if getattr(node, 'is_index', False):
+                seen_keys = set()
+                for k, v in node.pairs:
+                    lit = self._literal_key(k)
+                    if lit is not None:
+                        if lit in seen_keys:
+                            self._emit('ERROR', None, 'Duplicate Key',
+                                       f"Duplicate key {lit[1]!r} in 'index' literal.",
+                                       "Each key in an index must be unique; "
+                                       "remove or rename the duplicate.")
+                        seen_keys.add(lit)
             for k, v in node.pairs:
                 self._expr(k, scope)
                 self._expr(v, scope)
@@ -1478,6 +1533,16 @@ class Analyzer:
                         'ERROR', info.get('line'), 'Use After Drop',
                         f"Variable '{name}' was dropped on line {info.get('drop_line', '?')}."
                     )
+                # Bug 2: reassigning to an incompatible type was never checked.
+                vtype = info.get('vtype')
+                if vtype and node.value is not None and not self._is_null_node(node.value):
+                    new_type = self._infer(node.value, scope)
+                    if new_type and not self._types_compat(vtype, new_type):
+                        self._emit(
+                            'ERROR', info.get('line'), 'Type Error',
+                            f"Expected:\n{vtype}\n\nReceived:\n{new_type}",
+                            f"{name} = <{vtype} value>"
+                        )
         self._expr(node.value, scope)
 
     def _field_assign(self, node: ast.FieldAssign, scope: Scope):
@@ -1524,7 +1589,14 @@ class Analyzer:
             }
 
         fn_scope = Scope(parent=parent_scope)
+        seen_params = set()
         for pname, ptype in (node.params or []):
+            if pname in seen_params:
+                self._emit('ERROR', self._ln('fn', node.name), 'Duplicate Symbol',
+                           f"Parameter '{pname}' is declared more than once "
+                           f"in function '{node.name}'.",
+                           f"Rename one of the '{pname}' parameters.")
+            seen_params.add(pname)
             fn_scope.declare(pname, {
                 'mutable':       True,
                 'vtype':         ptype,
@@ -1538,6 +1610,8 @@ class Analyzer:
 
         if node.name in self.thread_fns:
             self._scan_race(node.body, node.name)
+
+        self._scan_thread_reuse(node.body)
 
         found_return = False
         self._fn_depth += 1
@@ -1556,6 +1630,15 @@ class Analyzer:
                             'ERROR', self._ln('fn', node.name), 'Return Type Error',
                             f"Expected:\n{node.ret_type}\n\nReceived:\n{inferred}"
                         )
+                elif node.ret_type and stmt.value is None:
+                    # Bug 7: a bare `return` was previously ignored by the
+                    # type check entirely instead of being flagged.
+                    self._emit(
+                        'ERROR', self._ln('fn', node.name), 'Return Type Error',
+                        f"Function '{node.name}' declares return type "
+                        f"'{node.ret_type}' but 'return' has no value.",
+                        f"Use 'return <{node.ret_type} value>'."
+                    )
 
         param_names = {p[0] for p in (node.params or [])}
         self._fn_depth -= 1
@@ -1572,6 +1655,37 @@ class Analyzer:
                     f"Call {vname}.drop() before leaving scope."
                 )
 
+    def _scan_thread_reuse(self, body: list, active: set | None = None):
+        """Bug 10: walk a function body sequentially tracking which literal
+        thread IDs are 'in flight' (started via thread(...) but not yet
+        passed to thread.wait(...)). Flags reusing an ID while still active.
+        Best-effort/static: only tracks literal Number IDs, top-down through
+        straight-line code, if/while/for bodies (loops/branches reset to the
+        same active set on entry since execution count is unknown statically)."""
+        if active is None:
+            active = set()
+        for stmt in (body or []):
+            if isinstance(stmt, ast.ThreadCall):
+                tid = stmt.thread_id
+                if isinstance(tid, ast.Number):
+                    if tid.value in active:
+                        self._emit(
+                            'ERROR', None, 'Thread ID Reuse',
+                            f"Thread ID {tid.value} is reused before the "
+                            f"previous thread on that ID has been waited on.",
+                            f"Call thread.wait({tid.value}) before starting "
+                            f"another thread with the same ID."
+                        )
+                    active.add(tid.value)
+            elif isinstance(stmt, ast.ThreadWait):
+                for tid_expr in (stmt.thread_ids or []):
+                    if isinstance(tid_expr, ast.Number):
+                        active.discard(tid_expr.value)
+            for attr in ('then_body', 'else_body', 'body', 'try_body', 'error_body'):
+                sub = getattr(stmt, attr, None)
+                if sub:
+                    self._scan_thread_reuse(sub, active)
+
     def _class_def(self, node: ast.ClassDef, scope: Scope):
         if node.name in self.classes and self.classes[node.name].get('_seen'):
             self._emit('ERROR', self._ln('class', node.name), 'Duplicate Symbol',
@@ -1579,6 +1693,20 @@ class Analyzer:
         else:
             if node.name in self.classes:
                 self.classes[node.name]['_seen'] = True
+
+        # Bug 9: field default values were never type-checked against
+        # their declared vtype (unlike top-level `let`, checked in
+        # Analyzer._var_decl()).
+        for f in (node.fields or []):
+            if f.vtype and f.value is not None and not self._is_null_node(f.value):
+                inferred = self._infer(f.value, scope)
+                if inferred and not self._types_compat(f.vtype, inferred):
+                    self._emit(
+                        'ERROR', self._ln('class', node.name), 'Type Error',
+                        f"Field '{node.name}.{f.name}'\n\n"
+                        f"Expected:\n{f.vtype}\n\nReceived:\n{inferred}",
+                        f"let {f.name}: {f.vtype} = ..."
+                    )
 
         for method in node.methods:
             method_scope = Scope(parent=scope)
@@ -1599,7 +1727,14 @@ class Analyzer:
                     'drop_line': None,
                     'possibly_null': False,
                 })
+            seen_params = set()
             for pname, ptype in (method.params or []):
+                if pname in seen_params:
+                    self._emit('ERROR', self._ln('class', node.name), 'Duplicate Symbol',
+                               f"Parameter '{pname}' is declared more than once "
+                               f"in method '{node.name}.{method.name}'.",
+                               f"Rename one of the '{pname}' parameters.")
+                seen_params.add(pname)
                 method_scope.declare(pname, {
                     'mutable': True, 'vtype': ptype, 'dropped': False,
                     'used': True, 'is_heap': ptype in HEAP_TYPES if ptype else False,
@@ -1795,6 +1930,40 @@ class Analyzer:
             if suggestion:
                 msg += f"\n\nDid you mean: {suggestion}?"
             self._emit('ERROR', None, 'Unknown Variable', msg)
+
+    def _method_call(self, node: ast.MethodCall, scope: Scope):
+        # Handles plain `.method()` calls. The parser never emits
+        # CollectionMethodCall (see bugs.log #1), so collection mutations
+        # like `my_list().add(x)` / `my_list(0).set(x)` arrive here as a
+        # MethodCall whose .obj is a FnCall naming the collection. Detect
+        # and flag mutability violations for those mutating methods.
+        if node.method in MUTATING_METHODS and isinstance(node.obj, ast.FnCall):
+            cname = node.obj.name if isinstance(node.obj.name, str) else None
+            if cname:
+                info = scope.lookup(cname)
+                if info is not None and not info.get('mutable'):
+                    self._emit(
+                        'ERROR', info.get('line'), 'Mutability Violation',
+                        f"Collection '{cname}' is immutable.",
+                        f"Declare '{cname}' with 'let mut' to modify it."
+                    )
+        # Bug 6: string-mutation methods (.set/.insert/.replace) called
+        # directly on a variable (e.g. `text.set(0, "J")`) need the same
+        # mutability check — these reach us with node.obj as a plain Var,
+        # not a FnCall, so the check above doesn't cover them.
+        STRING_MUTATING_METHODS = {'set', 'insert', 'replace'}
+        if node.method in STRING_MUTATING_METHODS and isinstance(node.obj, ast.Var):
+            vname = node.obj.name
+            info = scope.lookup(vname)
+            if info is not None and info.get('vtype') == 'str' and not info.get('mutable'):
+                self._emit(
+                    'ERROR', info.get('line'), 'Mutability Violation',
+                    f"String '{vname}' is immutable.",
+                    f"Declare '{vname}' with 'let mut' to modify it."
+                )
+        self._expr(node.obj, scope)
+        for a in node.args:
+            self._expr(a, scope)
 
     def _collection_method(self, node: ast.CollectionMethodCall, scope: Scope):
         self._expr(node.obj, scope)
