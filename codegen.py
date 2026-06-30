@@ -1314,10 +1314,7 @@ class CodeGen:
             true_ptr = self.new_tmp(); false_ptr = self.new_tmp(); sel_ptr = self.new_tmp()
             self.emit(f"  {true_ptr} = getelementptr [{true_len} x i8], [{true_len} x i8]* {true_lbl}, i64 0, i64 0")
             self.emit(f"  {false_ptr} = getelementptr [{false_len} x i8], [{false_len} x i8]* {false_lbl}, i64 0, i64 0")
-            self.emit(f"  {sel_ptr} = select i1 {val}, i8* {true_ptr}, i8* {false_ptr}")
-            self.emit(f"  call i32 (i8*, ...) @printf(i8* {sel_ptr})")
-            self.emit(f"  call i32 @fflush(i8* null)")
-        elif val_t in ("i32", "i64", "i128", "i256", "i512", "i1024", "i2048"):
+            self.emit(f"  {sel_ptr} = select i1 {val}, i8* {false_ptr}, i8* {true_ptr}")
             cv = self.coerce(val, val_t, "i64")
             fmt, flen = self.intern_str("%lld\n")
             ptr = self.new_tmp()
@@ -1516,7 +1513,7 @@ class CodeGen:
             self.emit(f"  br label %{cond_l}\n{cond_l}:")
             cur, cur_lt, cur_gt, cond = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
             self.emit(f"  {cur} = load i64, i64* {var_ptr}")
-            self.emit(f"  {cur_lt} = icmp slt i64 {cur}, {ev}")
+            self.emit(f"  {cur_lt} = icmp sle i64 {cur}, {ev}")
             self.emit(f"  {cur_gt} = icmp sgt i64 {cur}, {ev}")
             self.emit(f"  {cond} = select i1 {is_up}, i1 {cur_lt}, i1 {cur_gt}")
             self.emit(f"  br i1 {cond}, label %{body_l}, label %{end_l}\n{body_l}:")
@@ -2207,7 +2204,7 @@ class CodeGen:
                 r_i64 = r_raw  # random() already returns i64
                 self.emit(f"  {range_v} = sub i64 {mx}, {mn}")
                 self.emit(f"  {range1} = add i64 {range_v}, 1")
-                self.emit(f"  {rem} = srem i64 {r_i64}, {range1}")
+                self.emit(f"  {rem} = srem i64 {r_i64}, {range_v}")
                 self.emit(f"  {result} = add i64 {rem}, {mn}")
                 return result, "i64"
 
@@ -2922,8 +2919,10 @@ class CodeGen:
             # str.char(1) returns the character at 1-based index
             idx_v, idx_t = self.emit_expr(args[0])
             idx_i = self.coerce(idx_v, idx_t, "i64")
+            off_i = self.new_tmp()
+            self.emit(f"  {off_i} = add i64 {idx_i}, 1")
             char_ptr = self.new_tmp()
-            self.emit(f"  {char_ptr} = getelementptr i8, i8* {obj_val}, i64 {idx_i}")
+            self.emit(f"  {char_ptr} = getelementptr i8, i8* {obj_val}, i64 {off_i}")
             char_val = self.new_tmp()
             self.emit(f"  {char_val} = load i8, i8* {char_ptr}")
             # Return as a single-char string by allocating and storing
@@ -3361,8 +3360,8 @@ class CodeGen:
             if fr == tr: return val
             if fr > tr:  # narrowing → trunc
                 self.emit(f"  {tmp} = trunc {from_t} {val} to {to_t}"); return tmp
-            else:        # widening → sext
-                self.emit(f"  {tmp} = sext {from_t} {val} to {to_t}"); return tmp
+            else:        # widening → zext
+                self.emit(f"  {tmp} = zext {from_t} {val} to {to_t}"); return tmp
 
         # ---- Float ↔ Float ----
         if from_t in self._FLOAT_IR_SET and to_t in self._FLOAT_IR_SET:
