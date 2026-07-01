@@ -1144,6 +1144,7 @@ class Analyzer:
         self._check_global_leaks(global_scope)
         self._ast_syntax_check(nodes)
         self._scan_thread_reuse(nodes)
+        self._scan_os_sessions(nodes)
 
     # ── AST-level structural syntax checks ────────────────────────────────────
 
@@ -1447,6 +1448,15 @@ class Analyzer:
             'drop_line':     None,
             'possibly_null': possibly_null,
         }
+        # Bug 14: remember literal keys from an `index` literal initializer
+        # so later `.add(key, ...)` calls can be checked against them.
+        if isinstance(node.value, ast.DictExpr) and getattr(node.value, 'is_index', False):
+            keys = set()
+            for k, _v in node.value.pairs:
+                lit = self._literal_key(k)
+                if lit is not None:
+                    keys.add(lit)
+            info['index_keys'] = keys
         # Per spec: 'let' without 'local' enters the global memory pool,
         # even when declared inside a function or class method body.
         # Only 'let local' and function parameters stay function-scoped.
@@ -1612,6 +1622,7 @@ class Analyzer:
             self._scan_race(node.body, node.name)
 
         self._scan_thread_reuse(node.body)
+        self._scan_os_sessions(node.body)
 
         found_return = False
         self._fn_depth += 1
@@ -1655,18 +1666,67 @@ class Analyzer:
                     f"Call {vname}.drop() before leaving scope."
                 )
 
-    def _scan_thread_reuse(self, body: list, active: set | None = None):
-        """Bug 10: walk a function body sequentially tracking which literal
-        thread IDs are 'in flight' (started via thread(...) but not yet
-        passed to thread.wait(...)). Flags reusing an ID while still active.
-        Best-effort/static: only tracks literal Number IDs, top-down through
-        straight-line code, if/while/for bodies (loops/branches reset to the
-        same active set on entry since execution count is unknown statically)."""
+    def _scan_os_sessions(self, body: list, active: set | None = None):
+        """Bug 12: walk a function body sequentially tracking which literal
+        OS session IDs are currently open (started via os.start(id) and not
+        yet os(id).drop()'d). Flags os.run()/os(id).drop() on an ID that was
+        never started. Best-effort/static, same straight-line approach as
+        _scan_thread_reuse."""
         if active is None:
             active = set()
         for stmt in (body or []):
-            if isinstance(stmt, ast.ThreadCall):
-                tid = stmt.thread_id
+            # OsRun/OsDrop/OsStart are often used as expressions, e.g.
+            # `let output = os.run(1, "echo hello")` — unwrap one level so
+            # those are still checked, not just bare-statement calls.
+            check = stmt
+            if isinstance(stmt, (ast.VarDecl, ast.Assign, ast.Return, ast.Print, ast.Println)) \
+                    and getattr(stmt, 'value', None) is not None:
+                check = stmt.value
+            if isinstance(check, ast.OsStart):
+                if isinstance(check.id_expr, ast.Number):
+                    active.add(check.id_expr.value)
+            elif isinstance(check, ast.OsRun):
+                if check.id_expr is not None and isinstance(check.id_expr, ast.Number):
+                    if check.id_expr.value not in active:
+                        self._emit(
+                            'ERROR', None, 'OS Session Not Started',
+                            f"os.run() used ID {check.id_expr.value}, but no "
+                            f"os.start({check.id_expr.value}) was seen first.",
+                            f"Call os.start({check.id_expr.value}) before running commands on it."
+                        )
+            elif isinstance(check, ast.OsDrop):
+                if isinstance(check.id_expr, ast.Number):
+                    if check.id_expr.value not in active:
+                        self._emit(
+                            'ERROR', None, 'OS Session Not Started',
+                            f"os({check.id_expr.value}).drop() called, but no "
+                            f"os.start({check.id_expr.value}) was seen first.",
+                            f"Call os.start({check.id_expr.value}) before dropping it."
+                        )
+                    else:
+                        active.discard(check.id_expr.value)
+            for attr in ('then_body', 'else_body', 'body', 'try_body', 'error_body'):
+                sub = getattr(stmt, attr, None)
+                if sub:
+                    self._scan_os_sessions(sub, active)
+
+    def _scan_thread_reuse(self, body: list, active: set | None = None, ever_started: set | None = None):
+        """Bug 10/13: walk a function body tracking thread IDs.
+        `active`      — IDs currently in-flight (ThreadCall → add, ThreadWait → discard)
+        `ever_started`— all IDs ever launched in this scope (never removed)
+        Reuse check uses `active`; wait/running checks use `ever_started` so
+        that thread.running(id) after thread.wait(id) is NOT a false positive."""
+        if active is None:
+            active = set()
+        if ever_started is None:
+            ever_started = set()
+        for stmt in (body or []):
+            check = stmt
+            if isinstance(stmt, (ast.VarDecl, ast.Assign, ast.Return, ast.Print, ast.Println)) \
+                    and getattr(stmt, 'value', None) is not None:
+                check = stmt.value
+            if isinstance(check, ast.ThreadCall):
+                tid = check.thread_id
                 if isinstance(tid, ast.Number):
                     if tid.value in active:
                         self._emit(
@@ -1677,14 +1737,31 @@ class Analyzer:
                             f"another thread with the same ID."
                         )
                     active.add(tid.value)
-            elif isinstance(stmt, ast.ThreadWait):
-                for tid_expr in (stmt.thread_ids or []):
+                    ever_started.add(tid.value)
+            elif isinstance(check, ast.ThreadWait):
+                for tid_expr in (check.thread_ids or []):
                     if isinstance(tid_expr, ast.Number):
+                        if tid_expr.value not in ever_started:
+                            self._emit(
+                                'ERROR', None, 'Thread Not Started',
+                                f"thread.wait({tid_expr.value}) used, but no "
+                                f"thread(..., {tid_expr.value}) was seen first.",
+                                f"Start the thread with that ID before waiting on it."
+                            )
                         active.discard(tid_expr.value)
+            elif isinstance(check, ast.ThreadRunning):
+                tid_expr = check.thread_id
+                if isinstance(tid_expr, ast.Number) and tid_expr.value not in ever_started:
+                    self._emit(
+                        'ERROR', None, 'Thread Not Started',
+                        f"thread.running({tid_expr.value}) used, but no "
+                        f"thread(..., {tid_expr.value}) was seen first.",
+                        f"Start the thread with that ID before checking it."
+                    )
             for attr in ('then_body', 'else_body', 'body', 'try_body', 'error_body'):
                 sub = getattr(stmt, attr, None)
                 if sub:
-                    self._scan_thread_reuse(sub, active)
+                    self._scan_thread_reuse(sub, active, ever_started)
 
     def _class_def(self, node: ast.ClassDef, scope: Scope):
         if node.name in self.classes and self.classes[node.name].get('_seen'):
@@ -1947,6 +2024,20 @@ class Analyzer:
                         f"Collection '{cname}' is immutable.",
                         f"Declare '{cname}' with 'let mut' to modify it."
                     )
+                # Bug 14: idx().add("existing_key", val) where "existing_key"
+                # is provably already a key in idx's literal initializer.
+                if info is not None and node.method == 'add' and node.args:
+                    existing_keys = info.get('index_keys')
+                    if existing_keys:
+                        new_key = self._literal_key(node.args[0])
+                        if new_key is not None and new_key in existing_keys:
+                            self._emit(
+                                'ERROR', info.get('line'), 'Duplicate Key',
+                                f"Key {new_key[1]!r} already exists in index '{cname}'.\n"
+                                f".add() on an existing key is a runtime error.",
+                                f"Use {cname}({new_key[1]!r}).set(...) to update "
+                                f"an existing key instead of .add()."
+                            )
         # Bug 6: string-mutation methods (.set/.insert/.replace) called
         # directly on a variable (e.g. `text.set(0, "J")`) need the same
         # mutability check — these reach us with node.obj as a plain Var,
