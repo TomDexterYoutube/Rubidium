@@ -205,9 +205,11 @@ let x = "Hi"
 
 # Other:
 #   str   — text string
+#   str+  — a string but uses 3 " on each side
 #   bool  — True or False
 #   Null  — valid for all types, means "exists but empty"
 #   Any   — can hold a value of any type
+#   SY    — Holds a string that can be used in code
 
 # Collections:
 #   list
@@ -457,6 +459,34 @@ print(text.len())
 # 5
 
 # =========================================
+# SY
+# =========================================
+
+# SY type is like a string but can be used in code
+
+let varable_name: SY = 'New varable'
+let (varable_name): str = "Hello I'm a varable"
+
+let function_name: SY = 'New function'
+
+fn (function_name) {
+    print("I'm a new Function")
+}
+
+# You put () around the SY when its used and ' when its made
+
+# =========================================
+# STR+
+# =========================================
+
+# str+ is the same as str but it uses 3 " and can use more then 1 line
+
+let my_str_plus: str+ = """
+Hello
+I'm a big string!
+"""
+
+# =========================================
 # COLLECTIONS
 # =========================================
 
@@ -482,6 +512,10 @@ my_list(0).set("changed")
 # Append a new item using .add():
 
 my_list().add("new_item")
+
+# when a list is printed it shows text in "" and everthing else as is 
+let my_list = "Hello".slice() + [1, 2, 3]
+print(my_list) # ["H", "e", "l", "l", "o", 1, 2, 3]
 
 # -----------------------------------------
 # LIST UTILITIES
