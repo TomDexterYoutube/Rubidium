@@ -1397,6 +1397,21 @@ fn main() {
 }
 
 # =========================================
+# PACKAGES
+# =========================================
+
+# If you install Rubidium from the offical manager (xeon)
+# Then you can use pakages
+
+xeon math_tools
+
+print(math_tools.pi)
+
+# Packages are the same as import even tho they work diffrent 
+# You can use xeon to download a large amount of diffrent packages
+# If you want to learn more use the command xeon pkg help
+
+# =========================================
 # NOTES
 # =========================================
 

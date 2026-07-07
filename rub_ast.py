@@ -112,6 +112,19 @@ class Drop:
     def __init__(self, name):
         self.name = name
 
+class ElementDrop:
+    """items(1).drop() — remove an element/key from a collection and shift,
+    per spec (unlike collection_set's index(0).set(...), this does NOT
+    replace with Null; it removes the slot entirely)."""
+    def __init__(self, access_node):
+        self.access_node = access_node
+
+class LinkArg:
+    """link expr — pass-by-reference marker for the Link Rule (avoids a
+    deep copy when passing a large local value to a function)."""
+    def __init__(self, expr):
+        self.expr = expr
+
 class For:
     def __init__(self, var, start, end, body, iterable=None):
         self.var = var
@@ -155,9 +168,11 @@ class ThreadRunning:
         self.thread_id = thread_id
 
 class Import:
-    def __init__(self, module_name, alias=None):
+    def __init__(self, module_name, alias=None, is_xeon_pkg=False):
         self.module_name = module_name
         self.alias = alias          # e.g.  import math_tools as mt  →  alias="mt"
+        self.is_xeon_pkg = is_xeon_pkg  # True for `xeon math_tools` (installed package,
+                                         # resolved from ~/.xeon/packages/ instead of a relative path)
 
 class Use:
     def __init__(self, module_name):

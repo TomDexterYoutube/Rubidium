@@ -23,6 +23,7 @@ declare %Box* @box_i(i64)
 declare %Box* @box_f(double)
 declare %Box* @box_s(i8*)
 declare %Box* @box_p(i8*)
+declare %Box* @box_b(i64)
 declare i64 @unbox_i(%Box*)
 declare double @unbox_f(%Box*)
 declare i8* @unbox_s(%Box*)
@@ -44,6 +45,9 @@ declare void @collection_add1(%Box*, %Box*)
 @_rub_error_msg = global i8* null
 declare %Box* @collection_get_at(%Box*, i32)
 declare void @box_drop(%Box*)
+declare void @collection_drop(%Box*, %Box*)
+declare void @rub_throw(i8*)
+declare %Box* @box_add(%Box*, %Box*)
 declare %Box* @box_copy(%Box*)
 declare i1 @collection_has(%Box*, %Box*)
 declare i32 @_rub_str_hash(i8*)
@@ -75,7 +79,8 @@ class RubidiumTypeError(Exception): pass
 class RubidiumNameError(Exception): pass
 
 class CodeGen:
-    def __init__(self, import_aliases=None):
+    def __init__(self, import_aliases=None, shared_lib=False):
+        self.shared_lib  = shared_lib  # -s flag: compile as a shared library, no main entry
         self.fn_lines    = []
         self.global_decls = []
         self.str_count   = 0
@@ -327,6 +332,7 @@ class CodeGen:
         self.global_decls += extern_decls.split("\n")
         self.global_decls += [
             "", "declare i32 @printf(i8* noundef, ...)", "declare i32 @puts(i8* noundef)", "declare i32 @fflush(i8*)",
+            "declare void @print_int_or_null(i64)",
             "declare i8* @malloc(i64)", "declare void @free(i8*)", "declare i64 @strlen(i8*)",
             "declare i32 @scanf(i8*, ...)", "declare i8* @fgets(i8*, i32, i8*)",
             "declare i8* @strcpy(i8*, i8*)", "declare i32 @strcmp(i8*, i8*)",
@@ -377,14 +383,37 @@ class CodeGen:
             for m in cls.methods:
                 self._emit_class_method(self.functions[self.method_ir_name(cls.name, m.name)], cls.name)
 
-        if "main" not in self.functions:
+        if not self.shared_lib and "main" not in self.functions:
             self.emit_fn(FnDef("main", [], "i32", []))
 
-        self._inject_init_call()
+        if self.shared_lib:
+            self._emit_global_ctor_init()
+        else:
+            self._inject_init_call()
 
         out = ["; Rubidium compiled output", 'source_filename = "rubidium"', ""]
         out += self.global_decls + [""] + self.fn_lines
         return "\n".join(out)
+
+    def _emit_global_ctor_init(self):
+        """-s (shared lib) mode: no main() is guaranteed to exist/run, so
+        global variable init (_rubidium_init/_rubidium_init_rng) can't be
+        patched into main's entry block like the executable path does.
+        Instead, register a constructor via @llvm.global_ctors, which the
+        C runtime loader (glibc/ld.so) guarantees runs at load time —
+        i.e. as soon as the .so is dlopen'd — before any exported fn can
+        be called from the host language."""
+        self.fn_lines += [
+            "define void @_rubidium_ctor() {",
+            "  call void @_rubidium_init_rng()",
+            "  call i64 @_rubidium_init()",
+            "  ret void",
+            "}", ""
+        ]
+        self.global_decls.append(
+            "@llvm.global_ctors = appending global [1 x { i32, void ()*, i8* }] "
+            "[{ i32, void ()*, i8* } { i32 65535, void ()* @_rubidium_ctor, i8* null }]"
+        )
 
     def _inject_init_call(self):
         patched = []; in_main = False; injected = False
@@ -416,6 +445,17 @@ class CodeGen:
         if isinstance(node, Input): return "i8*"
         if isinstance(node, FileHandleStmt):
             if node.method in ("read", "readln"): return "i8*"
+            return "i64"
+
+        if isinstance(node, FieldAccess):
+            obj_name = node.obj.name if hasattr(node.obj, 'name') else str(node.obj)
+            resolved_obj = self.import_aliases.get(obj_name, obj_name)
+            mangled_var = f"{resolved_obj}_{node.field}"
+            if obj_name not in self.instances and mangled_var in self.global_vars:
+                return self.global_vars[mangled_var]
+            if obj_name in self.instances:
+                _, ir_t = self.field_index(self.instances[obj_name], node.field)
+                return ir_t
             return "i64"
         
         if isinstance(node, MethodCall):
@@ -544,7 +584,46 @@ class CodeGen:
         return "i64"
 
     def collect_globals(self, stmts):
+        # Phase 1: a variable declared at global scope with `let` more than once
+        # using DIFFERENT types (spec's "drop and recreate" overwrite rule) can't
+        # be stored as a single fixed-type LLVM global — so first detect any name
+        # that's declared with conflicting types and force it to the dynamic
+        # %Box* representation (same mechanism already used for `Any`). Without
+        # this, a later store used the *new* type against a slot sized/typed for
+        # the *first* declaration, corrupting memory.
+        type_map = {}
+        self._gather_vardecl_types(stmts, type_map)
+        self._polymorphic_globals = {n for n, ts in type_map.items() if len(ts) > 1}
         for s in stmts: self._collect_global(s)
+
+    def _gather_vardecl_types(self, stmts, type_map):
+        for node in stmts:
+            if isinstance(node, VarDecl):
+                if node.is_local: continue
+                if isinstance(node.value, (ClassInstantiate, FnCall)):
+                    raw_cn = node.value.class_name if isinstance(node.value, ClassInstantiate) else node.value.name
+                    if raw_cn in self.class_defs or f"main_{raw_cn}" in self.class_defs:
+                        continue  # class instances aren't part of scalar polymorphism tracking
+                ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
+                type_map.setdefault(node.name, set()).add(ir_t)
+            elif isinstance(node, If):
+                self._gather_vardecl_types(node.then_body, type_map)
+                self._gather_vardecl_types(node.else_body or [], type_map)
+            elif isinstance(node, While):
+                self._gather_vardecl_types(node.body, type_map)
+            elif isinstance(node, For):
+                self._gather_vardecl_types(node.body, type_map)
+            elif isinstance(node, Try):
+                self._gather_vardecl_types(node.try_body, type_map)
+                self._gather_vardecl_types(node.error_body, type_map)
+            elif isinstance(node, FnDef):
+                self._gather_vardecl_types(node.body, type_map)
+            elif isinstance(node, FileOpen):
+                if node.var_name:
+                    self._file_handle_vars[node.var_name] = -1  # sentinel during gather pass
+                self._gather_vardecl_types(node.body, type_map)
+                if node.var_name:
+                    self._file_handle_vars.pop(node.var_name, None)
 
     def _collect_global(self, node):
         if isinstance(node, VarDecl):
@@ -563,6 +642,8 @@ class CodeGen:
                 self.instances[node.name] = cn
             else:
                 ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
+                if node.name in getattr(self, "_polymorphic_globals", ()):
+                    ir_t = "%Box*"
                 self.declare_global(node.name, ir_t)
             if node.mutable: self.mutable_vars.add(node.name)
         elif isinstance(node, FFIBind):
@@ -597,11 +678,47 @@ class CodeGen:
             if node.var_name:
                 self._file_handle_vars.pop(node.var_name, None)
 
+    def _gather_local_types(self, stmts, type_map, only_local=False):
+        """Scan a function/method body for `let` redeclarations of the same
+        local variable name with different types (same corruption risk as
+        globals, but for stack-allocated locals — an alloca is only
+        sized/typed once). Does NOT recurse into nested FnDef (separate
+        function scope). If only_local=True (class methods, where non-local
+        `let` becomes an instance field instead), only is_local nodes count."""
+        for node in stmts:
+            if isinstance(node, VarDecl):
+                if only_local and not node.is_local: continue
+                if isinstance(node.value, (ClassInstantiate, FnCall)):
+                    raw_cn = node.value.class_name if isinstance(node.value, ClassInstantiate) else node.value.name
+                    if raw_cn in self.class_defs or f"main_{raw_cn}" in self.class_defs:
+                        continue
+                ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
+                type_map.setdefault(node.name, set()).add(ir_t)
+            elif isinstance(node, If):
+                self._gather_local_types(node.then_body, type_map, only_local)
+                self._gather_local_types(node.else_body or [], type_map, only_local)
+            elif isinstance(node, While):
+                self._gather_local_types(node.body, type_map, only_local)
+            elif isinstance(node, For):
+                self._gather_local_types(node.body, type_map, only_local)
+            elif isinstance(node, Try):
+                self._gather_local_types(node.try_body, type_map, only_local)
+                self._gather_local_types(node.error_body, type_map, only_local)
+            elif isinstance(node, FileOpen):
+                if node.var_name:
+                    self._file_handle_vars[node.var_name] = -1  # sentinel during gather pass
+                self._gather_local_types(node.body, type_map, only_local)
+                if node.var_name:
+                    self._file_handle_vars.pop(node.var_name, None)
+
     def emit_fn(self, node):
         self.tmp_count, self.label_count, self.cur_fn, self.cur_class = 0, 0, node.name, None
         self.local_vars_stack = [{}]  # Stack of scopes, each scope is a dict of variable names to types
         self.dropped_vars = set()
         self._alloca_emitted = set()  # track which local names have had alloca emitted
+        _type_map = {}
+        self._gather_local_types(node.body, _type_map, only_local=False)
+        self._local_polymorphic = {n for n, ts in _type_map.items() if len(ts) > 1}
         
         ret_ir = "i32" if node.name == "main" else (self.rubi_type_to_ir(node.ret_type) if node.ret_type else "i64")
         self._cur_fn_ret_ir = ret_ir   # Return handler uses this when fn has no declared ret type
@@ -612,6 +729,7 @@ class CodeGen:
         for pn, pt in node.params:
             ir_t = self.rubi_type_to_ir(pt)
             self.local_vars_stack[-1][pn] = ir_t
+            self.mutable_vars.add(pn)  # params have no `mut` syntax; spec examples mutate them directly
             self.emit(f"  %ptr_{pn} = alloca {ir_t}")
             self.emit(f"  store {ir_t} %param_{pn}, {ir_t}* %ptr_{pn}")
             
@@ -645,6 +763,9 @@ class CodeGen:
         self.local_vars_stack = [{}]  # Stack of scopes, each scope is a dict of variable names to types
         self.dropped_vars = set()
         self._alloca_emitted = set()
+        _type_map = {}
+        self._gather_local_types(mfn.body, _type_map, only_local=True)
+        self._local_polymorphic = {n for n, ts in _type_map.items() if len(ts) > 1}
         
         struct_t, ret_ir = self.class_ir_type(class_name), (self.rubi_type_to_ir(mfn.ret_type) if mfn.ret_type else "i64")
         self._cur_fn_ret_ir = ret_ir   # Return handler uses this when method has no declared ret type
@@ -661,6 +782,7 @@ class CodeGen:
         for pn, pt in mfn.params[1:]:
             ir_t = self.rubi_type_to_ir(pt)
             self.local_vars_stack[-1][pn] = ir_t
+            self.mutable_vars.add(pn)
             self.emit(f"  %ptr_{pn} = alloca {ir_t}")
             self.emit(f"  store {ir_t} %param_{pn}, {ir_t}* %ptr_{pn}")
             
@@ -697,6 +819,8 @@ class CodeGen:
             # Local variables are function-scoped (not global)
             if node.is_local:
                 ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
+                if node.name in getattr(self, "_local_polymorphic", ()):
+                    ir_t = "%Box*"
                 self.local_vars_stack[-1][node.name] = ir_t
                 if node.mutable: self.mutable_vars.add(node.name)
                 ptr_str = f"%ptr_{node.name}"
@@ -763,6 +887,8 @@ class CodeGen:
                         self.emit_class_init(ptr_str, cn, init_args)
                     return False
                 ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
+                if node.name in getattr(self, "_local_polymorphic", ()):
+                    ir_t = "%Box*"
                 self.local_vars_stack[-1][node.name] = ir_t
                 if node.mutable: self.mutable_vars.add(node.name)
                 ptr_str = f"%ptr_{node.name}"
@@ -794,11 +920,17 @@ class CodeGen:
                 ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
                 if node.mutable: self.mutable_vars.add(node.name)
                 self.declare_global(node.name, ir_t)
+                # Use the AUTHORITATIVE type the global was actually declared with
+                # (may be %Box* if this name was re-declared elsewhere with a
+                # different type — see collect_globals's polymorphism detection).
+                # Using a freshly-recomputed ir_t here instead would store using
+                # the wrong type/size against the real global, corrupting memory.
+                actual_t = self.global_vars.get(node.name, ir_t)
                 val, val_t = self.emit_expr(node.value)
-                val = self.coerce(val, val_t, ir_t)
+                val = self.coerce(val, val_t, actual_t)
                 val = self._deep_copy_if_var(val, val_t, node.value)
                 ir_name = f"_var_{node.name}" if node.name in ("pow", "sin", "cos", "tan", "sqrt", "log", "log10", "exp", "fabs", "floor", "ceil", "round") else node.name
-                self.emit(f"  store {ir_t} {val}, {ir_t}* @{ir_name}")
+                self.emit(f"  store {actual_t} {val}, {actual_t}* @{ir_name}")
                 if isinstance(node.value, FFILoad):
                     slot = f"@_ffi_slot_{node.name}"
                     if not any(d.startswith(slot) for d in self.global_decls):
@@ -862,6 +994,8 @@ class CodeGen:
                     self.emit(f"  store i8* {result}, i8** {ptr_str}")
                     return False
             self.emit_method_call_expr(node)
+        elif isinstance(node, ElementDrop):
+            self.emit_element_drop(node)
         elif isinstance(node, Drop):
             self.dropped_vars.add(node.name)
             # Look for variable in the innermost scope first
@@ -920,6 +1054,40 @@ class CodeGen:
         elif isinstance(node, Use):
             pass  # module activation — tracked at parse time, no IR needed
         return False
+
+    def emit_element_drop(self, node):
+        """items(1).drop() — remove element/key at the given index/key and
+        shift, per spec (does NOT replace with Null, unlike .set(Null))."""
+        access_node = node.access_node
+        keys = []
+        curr = access_node
+        while isinstance(curr, (FnCall, MethodCall)):
+            if curr.args:
+                keys = curr.args + keys
+            curr = curr.obj if isinstance(curr, MethodCall) else curr.name
+
+        self._check_collection_mutable(curr)
+        if isinstance(curr, Var) and self.is_class_field(curr.name):
+            col_v, col_t = self.emit_field_access(Var("__self"), curr.name)
+        elif isinstance(curr, str) and self.is_class_field(curr):
+            col_v, col_t = self.emit_field_access(Var("__self"), curr)
+        elif isinstance(curr, str):
+            col_v, col_t = self.emit_expr(Var(curr))
+        else:
+            col_v, col_t = self.emit_expr(curr)
+        col_b = self.coerce_to_box(col_v, col_t)
+
+        for i in range(len(keys) - 1):
+            k_v, k_t = self.emit_expr(keys[i])
+            k_b = self.coerce_to_box(k_v, k_t)
+            next_col = self.new_tmp()
+            self.emit(f"  {next_col} = call %Box* @collection_get(%Box* {col_b}, %Box* {k_b})")
+            col_b = next_col
+
+        last_key = keys[-1]
+        k_v, k_t = self.emit_expr(last_key)
+        k_b = self.coerce_to_box(k_v, k_t)
+        self.emit(f"  call void @collection_drop(%Box* {col_b}, %Box* {k_b})")
 
     def _check_collection_mutable(self, curr):
         """Per spec (NOTES/Collections): 'Collections require mut to be modified'.
@@ -1314,13 +1482,12 @@ class CodeGen:
             true_ptr = self.new_tmp(); false_ptr = self.new_tmp(); sel_ptr = self.new_tmp()
             self.emit(f"  {true_ptr} = getelementptr [{true_len} x i8], [{true_len} x i8]* {true_lbl}, i64 0, i64 0")
             self.emit(f"  {false_ptr} = getelementptr [{false_len} x i8], [{false_len} x i8]* {false_lbl}, i64 0, i64 0")
-            self.emit(f"  {sel_ptr} = select i1 {val}, i8* {false_ptr}, i8* {true_ptr}")
-            cv = self.coerce(val, val_t, "i64")
-            fmt, flen = self.intern_str("%lld\n")
-            ptr = self.new_tmp()
-            self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
-            self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, i64 {cv})')
+            self.emit(f"  {sel_ptr} = select i1 {val}, i8* {true_ptr}, i8* {false_ptr}")
+            self.emit(f'  call i32 (i8*, ...) @printf(i8* {sel_ptr})')
             self.emit(f'  call i32 @fflush(i8* null)')
+        elif val_t in ("i32", "i64", "i128", "i256", "i512", "i1024", "i2048"):
+            cv = self.coerce(val, val_t, "i64")
+            self.emit(f'  call void @print_int_or_null(i64 {cv})')
         elif val_t in ("float", "double", "fp128"):
             fmt, flen = self.intern_str("%g\n")
             ptr = self.new_tmp()
@@ -1666,7 +1833,28 @@ class CodeGen:
         # Assign a unique slot for this open() block
         slot = self._file_slot_counter
         self._file_slot_counter += 1
-        self.emit(f"  call i64 @file_open(i64 {slot}, i8* {path_s}, i32 0)")
+        rc = self.new_tmp()
+        self.emit(f"  {rc} = call i64 @file_open(i64 {slot}, i8* {path_s}, i32 0)")
+        is_err = self.new_tmp()
+        self.emit(f"  {is_err} = icmp eq i64 {rc}, -1")
+        if self._try_error_label:
+            ok_l = self.new_label("fopenok")
+            err_lbl, err_len = self.intern_str("file not found")
+            err_ptr = self.new_tmp()
+            self.emit(f"  {err_ptr} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
+            self.emit(f"  store i8* {err_ptr}, i8** @_rub_error_msg")
+            self.emit(f"  br i1 {is_err}, label %{self._try_error_label}, label %{ok_l}")
+            self.emit(f"{ok_l}:")
+        else:
+            ok_l = self.new_label("fopenok")
+            self.emit(f"  br i1 {is_err}, label %fopenfail{slot}, label %{ok_l}")
+            self.emit(f"fopenfail{slot}:")
+            msg_lbl, msg_len = self.intern_str("file not found")
+            msg_ptr = self.new_tmp()
+            self.emit(f"  {msg_ptr} = getelementptr [{msg_len} x i8], [{msg_len} x i8]* {msg_lbl}, i64 0, i64 0")
+            self.emit(f"  call void @rub_throw(i8* {msg_ptr})")
+            self.emit(f"  br label %{ok_l}")
+            self.emit(f"{ok_l}:")
         # Register this var_name as a file handle pointing to this slot
         self._file_handle_vars[node.var_name] = slot
         # Allocate the variable in local/global scope so Var(f) can be resolved
@@ -1938,6 +2126,13 @@ class CodeGen:
         self._pending_trampolines += pending
 
     def emit_expr(self, node):
+        if isinstance(node, LinkArg):
+            # Link Rule: pass-by-reference. Collections/Any are already
+            # %Box* (pointer/reference) and function calls currently never
+            # deep-copy arguments (see bugs.log BUG #1 note), so evaluating
+            # the inner expression normally already gives the shared-
+            # reference behavior the spec describes.
+            return self.emit_expr(node.expr)
         if isinstance(node, Number):
             if isinstance(node.value, float): return f"{node.value:.17e}", "double"
             return str(int(node.value)), "i64"
@@ -2090,7 +2285,18 @@ class CodeGen:
     def emit_field_access(self, obj, field_name):
         # Extract the name if it's an ast.Var object
         obj_name = obj.name if hasattr(obj, 'name') else str(obj)
-        
+
+        # Module-qualified variable access (e.g. `xeon math_tools` / `import
+        # math_tools` then `math_tools.pi` -> the global `math_tools_pi`).
+        # Resolves aliases too (e.g. `import math_tools as mt` -> `mt.pi`).
+        resolved_obj = self.import_aliases.get(obj_name, obj_name)
+        mangled_var = f"{resolved_obj}_{field_name}"
+        if obj_name not in self.instances and mangled_var in self.global_vars:
+            ir_t = self.global_vars[mangled_var]
+            tmp = self.new_tmp()
+            self.emit(f"  {tmp} = load {ir_t}, {ir_t}* @{mangled_var}")
+            return tmp, ir_t
+
         if obj_name not in self.instances: 
             raise RubidiumNameError(f"'{obj_name}' is not an instance")
             
@@ -2479,6 +2685,26 @@ class CodeGen:
                 val_b = self.coerce_to_box(val_v, val_t)
                 self.emit(f"  call void @dict_set(%Box* {col_b}, %Box* {key_b}, %Box* {val_b})")
             return "0", "i64"
+
+        # 2a2b2. Handle add on a bare Var that's a plain local/global/parameter
+        # collection (e.g. `val.add(7)` where val: Any/list — spec's Link Rule
+        # example uses this exact form, with no () marker before .add).
+        if node.method == "add" and isinstance(node.obj, Var) and not self.is_class_field(obj_name):
+            var_exists = any(obj_name in scope for scope in self.local_vars_stack) or obj_name in self.global_vars
+            if var_exists:
+                col_v, col_t = self.emit_expr(node.obj)
+                col_b = self.coerce_to_box(col_v, col_t)
+                if len(node.args) == 1:
+                    val_v, val_t = self.emit_expr(node.args[0])
+                    val_b = self.coerce_to_box(val_v, val_t)
+                    self.emit(f"  call void @collection_add1(%Box* {col_b}, %Box* {val_b})")
+                elif len(node.args) == 2:
+                    key_v, key_t = self.emit_expr(node.args[0])
+                    val_v, val_t = self.emit_expr(node.args[1])
+                    key_b = self.coerce_to_box(key_v, key_t)
+                    val_b = self.coerce_to_box(val_v, val_t)
+                    self.emit(f"  call void @dict_set(%Box* {col_b}, %Box* {key_b}, %Box* {val_b})")
+                return "0", "i64"
 
         # 2a2c. Handle set on Var where Var is a class field (e.g., scores(0).set(0) inside a class method)
         if node.method == "set" and isinstance(node.obj, Var) and self.is_class_field(obj_name):
@@ -2916,13 +3142,11 @@ class CodeGen:
             self.emit(f"  {tmp} = call i64 @strlen(i8* {obj_val})")
             return tmp, "i64"
         if method == "char" and len(args) == 1:
-            # str.char(1) returns the character at 1-based index
+            # str.char(0) returns the character at 0-based index (per spec)
             idx_v, idx_t = self.emit_expr(args[0])
             idx_i = self.coerce(idx_v, idx_t, "i64")
-            off_i = self.new_tmp()
-            self.emit(f"  {off_i} = add i64 {idx_i}, 1")
             char_ptr = self.new_tmp()
-            self.emit(f"  {char_ptr} = getelementptr i8, i8* {obj_val}, i64 {off_i}")
+            self.emit(f"  {char_ptr} = getelementptr i8, i8* {obj_val}, i64 {idx_i}")
             char_val = self.new_tmp()
             self.emit(f"  {char_val} = load i8, i8* {char_ptr}")
             # Return as a single-char string by allocating and storing
@@ -3104,9 +3328,14 @@ class CodeGen:
             elif lt == "i8*" and rt == "%Box*":
                 r = self.coerce_to_string(r, rt); rt = "i8*"
             elif lt == "%Box*" and rt == "%Box*":
-                # Both boxed — convert both to string (covers int+int→concat in string context)
-                l = self.coerce_to_string(l, lt); lt = "i8*"
-                r = self.coerce_to_string(r, rt); rt = "i8*"
+                # Both boxed — could be list+list (merge, per spec:
+                # "Hello".slice() + [1,2,3] -> ["H","e","l","l","o",1,2,3]),
+                # or two boxed scalars (int+int -> string concat in string
+                # context). box_add() decides at runtime based on the
+                # actual boxed type tag.
+                tmp = self.new_tmp()
+                self.emit(f"  {tmp} = call %Box* @box_add(%Box* {l}, %Box* {r})")
+                return tmp, "%Box*"
         # For non-string arithmetic, unbox Box* to i64/double
         if lt == "%Box*" and node.op not in ("+",) :
             l = self.coerce(l, lt, "i64"); lt = "i64"
@@ -3185,6 +3414,14 @@ class CodeGen:
                 r_d = self.coerce(r, "i64", "double")
                 self.emit(f"  {tmp} = call double @_rubidium_pow(double {l_d}, double {r_d})")
                 return tmp, "double"
+            # Handle binary root operator (n */ value) -> value ** (1/n)
+            if node.op == "*/":
+                l_d = self.coerce(l, "i64", "double")
+                r_d = self.coerce(r, "i64", "double")
+                inv = self.new_tmp()
+                self.emit(f"  {inv} = fdiv double 1.0, {l_d}")
+                self.emit(f"  {tmp} = call double @_rubidium_pow(double {r_d}, double {inv})")
+                return tmp, "double"
         else:
             instr = {"+":"fadd","-":"fsub","*":"fmul","/":"fdiv"}.get(node.op)
             if instr:
@@ -3193,6 +3430,12 @@ class CodeGen:
             # Handle power operator (**) for float types
             if node.op == "**":
                 self.emit(f"  {tmp} = call double @_rubidium_pow(double {l}, double {r})")
+                return tmp, "double"
+            # Handle binary root operator (n */ value) for float types
+            if node.op == "*/":
+                inv = self.new_tmp()
+                self.emit(f"  {inv} = fdiv double 1.0, {l}")
+                self.emit(f"  {tmp} = call double @_rubidium_pow(double {r}, double {inv})")
                 return tmp, "double"
         return "0", "i64"
 
@@ -3261,7 +3504,10 @@ class CodeGen:
     def coerce_to_box(self, val, t):
         if t == "%Box*": return val
         tmp = self.new_tmp()
-        if t in ("i1", "i32", "i64"):
+        if t == "i1":
+            v = self.coerce(val, t, "i64")
+            self.emit(f"  {tmp} = call %Box* @box_b(i64 {v})")
+        elif t in ("i32", "i64"):
             v = self.coerce(val, t, "i64")
             self.emit(f"  {tmp} = call %Box* @box_i(i64 {v})")
         elif t in ("float", "double"):
@@ -3360,8 +3606,14 @@ class CodeGen:
             if fr == tr: return val
             if fr > tr:  # narrowing → trunc
                 self.emit(f"  {tmp} = trunc {from_t} {val} to {to_t}"); return tmp
-            else:        # widening → zext
-                self.emit(f"  {tmp} = zext {from_t} {val} to {to_t}"); return tmp
+            else:        # widening
+                if from_t == "i1":
+                    # bool is unsigned 0/1 — zero-extend (sext would turn
+                    # True into -1)
+                    self.emit(f"  {tmp} = zext {from_t} {val} to {to_t}"); return tmp
+                # signed integer types — sign-extend, or e.g. -1/Null
+                # sentinels would turn into huge positive values
+                self.emit(f"  {tmp} = sext {from_t} {val} to {to_t}"); return tmp
 
         # ---- Float ↔ Float ----
         if from_t in self._FLOAT_IR_SET and to_t in self._FLOAT_IR_SET:

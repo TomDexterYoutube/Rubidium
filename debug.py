@@ -1,6 +1,8 @@
 import sys
 import os
 import argparse
+import copy
+import shutil
 
 _dir = os.path.dirname(os.path.abspath(__file__))
 if _dir not in sys.path:
@@ -250,7 +252,7 @@ class Debugger:
         # ── Variable Declaration ──────────────────────────────────────────────
         if isinstance(node, ast.VarDecl):
             self.line = self._lmap.get(('var', node.name), "?")
-            value = self.evaluate(node.value)
+            value = self._deep_copy_value(self.evaluate(node.value))
             # Per spec: 'let' without 'local' enters the global memory pool.
             target = self.scope if node.is_local else self._root_scope
             target.declare(node.name, {
@@ -273,7 +275,7 @@ class Debugger:
             if not info.get("mutable", True):
                 self.error(f"Assignment to immutable variable '{node.name}' (declare with 'mut')")
                 return
-            info["value"] = self.evaluate(node.value)
+            info["value"] = self._deep_copy_value(self.evaluate(node.value))
             info["type"]  = self.rub_type(info["value"])
 
         # ── Field Assignment ──────────────────────────────────────────────────
@@ -281,6 +283,26 @@ class Debugger:
             obj = self.evaluate(node.obj) if hasattr(node, 'obj') else None
             if isinstance(obj, dict):
                 obj[node.field] = self.evaluate(node.value)
+
+        # ── Element Drop: items(1).drop() — remove-and-shift, not Null ────────
+        elif isinstance(node, ast.ElementDrop):
+            keys = []
+            curr = node.access_node
+            while isinstance(curr, (ast.FnCall, ast.MethodCall)):
+                if curr.args: keys = list(curr.args) + keys
+                curr = curr.obj if isinstance(curr, ast.MethodCall) else curr.name
+            # `curr` is now the base collection name (str) or an expr node
+            coll = self.scope.lookup(curr)["value"] if isinstance(curr, str) else self.evaluate(curr)
+            for k in keys[:-1]:
+                key_v = self.evaluate(k)
+                coll = coll[key_v] if isinstance(coll, dict) else coll[int(key_v)]
+            if keys:
+                last = self.evaluate(keys[-1])
+                if isinstance(coll, list):
+                    idx = int(last)
+                    if 0 <= idx < len(coll): del coll[idx]
+                elif isinstance(coll, dict):
+                    if last in coll: del coll[last]
 
         # ── Drop ──────────────────────────────────────────────────────────────
         elif isinstance(node, ast.Drop):
@@ -296,13 +318,13 @@ class Debugger:
         # ── Print ─────────────────────────────────────────────────────────────
         elif isinstance(node, ast.Print):
             value = self.evaluate(node.value)
-            out   = "[Null]" if value is None else value
+            out   = self._format_value(value)
             print(out)
             self.output.append(out)
 
         elif isinstance(node, ast.Println):
             value = self.evaluate(node.value)
-            out   = "[Null]" if value is None else value
+            out   = self._format_value(value)
             print(f"\r{out}", end="")
             self.output.append(out)
 
@@ -400,15 +422,54 @@ class Debugger:
                 self.scope.declare(alias, {"value": {"__module__": mod}, "type": "module",
                                            "mutable": False, "dropped": False})
 
-        # ── Stubs: OS / FFI / Threads / File I/O ─────────────────────────────
+        # ── Stubs: OS / FFI / Threads (still not simulated in debug mode) ────
         elif isinstance(node, (
             ast.FFILoad, ast.FFIBind,
             ast.ThreadCall, ast.ThreadWait, ast.ThreadRunning,
             ast.OsStart, ast.OsRun, ast.OsDrop,
-            ast.FileOpen, ast.FileNew, ast.FileHandleStmt,
-            ast.FileExists, ast.FileDelete, ast.FileRename, ast.FileCopy,
         )):
             pass   # not executed in debug mode
+
+        # ── File I/O — real file operations, matching the compiled runtime ──
+        elif isinstance(node, ast.FileOpen):
+            path = self.evaluate(node.path_expr)
+            if not os.path.exists(str(path)):
+                raise Exception("file not found")
+            self.scope.declare(node.var_name, {
+                "value": {"__file__": True, "path": str(path)},
+                "type": "file", "dropped": False, "mutable": True,
+            })
+            for stmt in node.body:
+                self.execute(stmt)
+
+        elif isinstance(node, ast.FileNew):
+            path = str(self.evaluate(node.path_expr))
+            open(path, "w").close()
+            if node.body:
+                self.scope.declare("file", {
+                    "value": {"__file__": True, "path": path},
+                    "type": "file", "dropped": False, "mutable": True,
+                })
+                for stmt in node.body:
+                    self.execute(stmt)
+
+        elif isinstance(node, ast.FileHandleStmt):
+            self._file_handle_op(node.var_name, node.method, node.args)
+
+        elif isinstance(node, ast.FileExists):
+            pass  # handled as an expression via evaluate(); nothing to do as a statement
+
+        elif isinstance(node, ast.FileDelete):
+            path = str(self.evaluate(node.path_expr))
+            if os.path.exists(path): os.remove(path)
+
+        elif isinstance(node, ast.FileRename):
+            old, new = str(self.evaluate(node.old_path)), str(self.evaluate(node.new_path))
+            if os.path.exists(old): os.rename(old, new)
+
+        elif isinstance(node, ast.FileCopy):
+            src, dst = str(self.evaluate(node.src_path)), str(self.evaluate(node.dst_path))
+            if os.path.exists(src): shutil.copy(src, dst)
 
         else:
             self.evaluate(node)
@@ -420,6 +481,17 @@ class Debugger:
         if node.iterable is not None:
             # for x in <collection>
             iterable = self.evaluate(node.iterable)
+            if isinstance(iterable, bool):
+                pass  # fall through to the not-iterable error below
+            elif isinstance(iterable, int):
+                # Per spec: `for i in N` (e.g. `for i in str.len()`) iterates
+                # i from 0 to N-1 — same as `for i in range(0, N)`.
+                iterable = range(iterable)
+            elif isinstance(iterable, dict) and iterable.get("__file__"):
+                # for line in file — iterate the file's lines (no trailing \n)
+                path = iterable["path"]
+                with open(path, "r") as f:
+                    iterable = [ln.rstrip("\n") for ln in f.readlines()]
             if iterable is None:
                 self.error(
                     f"'for {node.var} in ...' — iterable resolved to None.\n"
@@ -480,6 +552,20 @@ class Debugger:
         if node is None:
             return None
 
+        if isinstance(node, ast.FileHandleMethod):
+            return self._file_handle_op(node.var_name, node.method, node.args)
+
+        if isinstance(node, ast.FileExists):
+            path = self.evaluate(node.path_expr)
+            return os.path.exists(str(path)) if path is not None else False
+
+        if isinstance(node, ast.LinkArg):
+            # Link Rule: pass-by-reference. _call_fn binds params directly
+            # to the evaluated arg value with no copy (matching the
+            # compiler), so evaluating the inner expr already gives the
+            # shared-reference behavior the spec describes.
+            return self.evaluate(node.expr)
+
         if isinstance(node, ast.Number):
             return node.value
 
@@ -533,7 +619,17 @@ class Debugger:
                 if node.op == "*":   return left * right
                 if node.op == "/":
                     if right == 0: self.error("Division by zero", highlight="/"); return None
+                    if isinstance(left, int) and isinstance(right, int):
+                        # Truncate toward zero (matches the compiler's sdiv),
+                        # not Python's floor division.
+                        q = left / right
+                        return int(q) if q >= 0 else -int(-q)
                     return left / right
+                if node.op == "*/":
+                    # n */ value -> value's n-th root (matches the unary
+                    # `*/value` sqrt case, generalized to any degree).
+                    if left == 0: self.error("Division by zero", highlight="*/"); return None
+                    return right ** (1.0 / left)
                 if node.op == "**":  return left ** right
                 if node.op == "%":   return left % right
                 if node.op == "and": return bool(left) and bool(right)
@@ -565,11 +661,6 @@ class Debugger:
             except Exception as e:
                 self.error(f"Comparison '{node.op}' failed: {e}")
             return False
-
-        if isinstance(node, ast.FileExists):
-            import os as _os
-            path = self.evaluate(node.path_expr)
-            return _os.path.exists(str(path)) if path is not None else False
 
         if isinstance(node, ast.TypeCast):
             val = self.evaluate(node.expr)
@@ -644,6 +735,12 @@ class Debugger:
             return max(*args) if len(args) > 1 else (max(args[0]) if args else None)
         if fname == "round":
             return round(args[0], args[1] if len(args) > 1 else 0) if args else None
+        if fname == "range":
+            # Per spec: range(start, end) — end is exclusive (matches Python's range).
+            if len(args) >= 2:
+                return range(int(args[0]), int(args[1]))
+            if len(args) == 1:
+                return range(int(args[0]))
 
         # User-defined function
         if fname and fname in self._fn_defs:
@@ -683,6 +780,14 @@ class Debugger:
     def _eval_method_call(self, node):
         method = node.method
         args   = [self.evaluate(a) for a in node.args]
+
+        # ── file.read()/write()/add()/writeln()/readln() as a plain
+        # MethodCall (the parser only special-cases FileHandleMethod for
+        # some contexts; expression position falls through to here) ──────
+        if isinstance(node.obj, ast.Var) and method in ("write", "add", "read", "readln", "writeln"):
+            info = self.scope.lookup(node.obj.name)
+            if info is not None and isinstance(info.get("value"), dict) and "path" in info["value"]:
+                return self._file_handle_op(node.obj.name, method, node.args)
 
         # ── Special case: mutating method on a collection-element access ─────
         # e.g. my_list(0).set("val")   →  my_list[0] = "val"
@@ -803,7 +908,12 @@ class Debugger:
             if method == "len":     return len(obj)
             if method == "has":     return args[0] in obj if args else False
             if method == "combine": return "".join(str(x) for x in obj)
-            if method == "add":     obj.append(args[0]) if args else None; return None
+            if method == "add":
+                if len(obj) == 1 and obj[0] is None:
+                    obj[0] = args[0] if args else None
+                else:
+                    obj.append(args[0]) if args else None
+                return None
             if method == "set":
                 if len(args) >= 2:
                     try: obj[int(args[0])] = args[1]
@@ -846,6 +956,70 @@ class Debugger:
 
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _deep_copy_value(self, value):
+        """Per spec: every assignment/let creates a full deep copy (lists,
+        dicts/index, and class instances are all Python dict/list objects
+        here) so mutating one variable never affects another. Module stubs
+        and None/scalars pass through unchanged (deepcopy is a no-op for
+        immutables anyway, but module stubs shouldn't be duplicated)."""
+        if isinstance(value, dict) and "__module__" in value:
+            return value
+        if isinstance(value, (dict, list)):
+            return copy.deepcopy(value)
+        return value
+
+    def _format_value(self, value, nested=False):
+        """Render a value the way Rubidium's compiled print() does: Null/True/
+        False instead of Python's None/True/False reprs, and strings quoted
+        only when nested inside a list/dict (top-level strings print bare)."""
+        if value is None:
+            return "Null"
+        if isinstance(value, bool):
+            return "True" if value else "False"
+        if isinstance(value, str):
+            return f'"{value}"' if nested else value
+        if isinstance(value, list):
+            return "[" + ", ".join(self._format_value(v, nested=True) for v in value) + "]"
+        if isinstance(value, dict):
+            if "__module__" in value: return f"<module {value['__module__']}>"
+            if "__class__" in value:  return f"<{value['__class__']} instance>"
+            return "{" + ", ".join(
+                f"{self._format_value(k, nested=True)}: {self._format_value(v, nested=True)}"
+                for k, v in value.items()) + "}"
+        if isinstance(value, float):
+            return f"{value:g}"
+        return str(value)
+
+    def _file_handle_op(self, var_name, method, args):
+        info = self.scope.lookup(var_name)
+        if info is None or not isinstance(info.get("value"), dict) or "path" not in info["value"]:
+            return None
+        path = info["value"]["path"]
+        arg_vals = [self.evaluate(a) for a in args]
+        if method == "write":
+            with open(path, "w") as f: f.write(str(arg_vals[0]) if arg_vals else "")
+            return None
+        if method == "add":
+            with open(path, "a") as f: f.write(str(arg_vals[0]) if arg_vals else "")
+            return None
+        if method == "read":
+            with open(path, "r") as f: return f.read()
+        if method == "readln":
+            idx = int(arg_vals[0]) if arg_vals else 1
+            with open(path, "r") as f: lines = f.readlines()
+            return lines[idx-1].rstrip("\n") if 0 < idx <= len(lines) else ""
+        if method == "writeln":
+            if len(arg_vals) < 2: return None
+            line_num, data = int(arg_vals[0]), str(arg_vals[1])
+            lines = []
+            if os.path.exists(path):
+                with open(path, "r") as f: lines = f.readlines()
+            while len(lines) < line_num: lines.append("\n")
+            lines[line_num - 1] = data + "\n"
+            with open(path, "w") as f: f.writelines(lines)
+            return None
+        return None
 
     def rub_type(self, value):
         if isinstance(value, bool):  return "bool"
@@ -1494,14 +1668,20 @@ class Analyzer:
                 })
                 self._expr(node.value, scope)
                 return
-            existing_line = existing.get('line', '?')
-            self._emit(
-                'ERROR', self._ln('var', node.name), 'Duplicate Symbol',
-                f"Variable '{node.name}' was already declared "
-                f"(first seen at line {existing_line}).",
-                f"Rename one of the '{node.name}' declarations, "
-                f"or use assignment (=) to update the existing variable."
-            )
+            # Per spec's Variables Overwrite Rule: re-using `let` with an
+            # existing variable name drops and recreates it (even with a new
+            # type) — this is NOT a duplicate-symbol error. (Genuine conflicts
+            # with a function/class name are tracked in separate scope dicts
+            # and checked elsewhere, so anything reaching here is var-vs-var.)
+            existing.update({
+                'mutable':       node.mutable,
+                'vtype':         node.vtype or inferred_type,
+                'is_heap':       is_heap,
+                'possibly_null': possibly_null,
+                'line':          self._ln('var', node.name),
+                'dropped':       False,
+            })
+            self._expr(node.value, scope)
             return
 
         target_scope.declare(node.name, info)

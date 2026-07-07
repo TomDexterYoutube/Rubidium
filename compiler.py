@@ -19,6 +19,8 @@ RUNTIME_C = r"""
 #include <pthread.h>
 
 typedef struct { int type; long long i; double f; char* s; void* p; } Box;
+typedef struct { int magic; Box** items; int count; int cap; } RList;
+typedef struct { int magic; Box** keys; Box** vals; int count; int cap; } RDict;
 
 Box* _thread_results[1024]; 
 
@@ -118,16 +120,13 @@ void box_drop(Box* b) {
     if (b->type == 3 && b->p) {
         int* magic = (int*)b->p;
         if (magic && *magic == 1) {
-            Box** items = *(Box***)((char*)b->p + sizeof(int));
-            int count = *(int*)((char*)b->p + sizeof(int) + sizeof(Box**));
-            for(int i=0; i<count; i++) box_drop(items[i]);
-            free(items); free(b->p);
+            RList* l = (RList*)b->p;
+            for(int i=0; i<l->count; i++) box_drop(l->items[i]);
+            free(l->items); free(l);
         } else if (magic && *magic == 2) {
-            Box** keys = *(Box***)((char*)b->p + sizeof(int));
-            Box** vals = *(Box***)((char*)b->p + sizeof(int) + sizeof(Box**));
-            int count = *(int*)((char*)b->p + sizeof(int) + 2*sizeof(Box**));
-            for(int i=0; i<count; i++) { box_drop(keys[i]); box_drop(vals[i]); }
-            free(keys); free(vals); free(b->p);
+            RDict* d = (RDict*)b->p;
+            for(int i=0; i<d->count; i++) { box_drop(d->keys[i]); box_drop(d->vals[i]); }
+            free(d->keys); free(d->vals); free(d);
         } else {
             free(b->p);
         }
@@ -139,11 +138,13 @@ Box* box_i(long long i) { Box* b=malloc(sizeof(Box)); b->type=0; b->i=i; return 
 Box* box_f(double f) { Box* b=malloc(sizeof(Box)); b->type=1; b->f=f; return b; }
 Box* box_s(char* s) { Box* b=malloc(sizeof(Box)); b->type=2; b->s=strdup(s); return b; }
 Box* box_p(void* p) { Box* b=malloc(sizeof(Box)); b->type=3; b->p=p; return b; }
+Box* box_b(long long i) { Box* b=malloc(sizeof(Box)); b->type=4; b->i=i; return b; }
 Box* box_copy(Box* src) {
     if(!src) return box_i(0);
     if(src->type==0) return box_i(src->i);
     if(src->type==1) return box_f(src->f);
     if(src->type==2) return box_s(src->s);
+    if(src->type==4) return box_b(src->i);
     return src; /* collections: return same pointer, caller must not drop */
 }
 
@@ -168,9 +169,12 @@ void rub_throw(const char* msg) {
     exit(1);
 }
 
+void print_int_or_null(long long v) {
+    if (v == -2147483648LL) { printf("Null\n"); } else { printf("%lld\n", v); }
+    fflush(stdout);
+}
 double _rubidium_pow(double base, double exp) { return pow(base, exp); }
 
-typedef struct { int magic; Box** items; int count; int cap; } RList;
 Box* make_list() { RList* l=malloc(sizeof(RList)); l->magic=1; l->count=0; l->cap=8; l->items=malloc(8*sizeof(Box*)); return box_p(l); }
 void list_append(Box* lst, Box* b) { 
     if(!lst || lst->type != 3) return;
@@ -222,7 +226,6 @@ Box* list_get(void* col, Box* idx) {
     rub_throw(msg); return box_i(0);
 }
 
-typedef struct { int magic; Box** keys; Box** vals; int count; int cap; } RDict;
 Box* make_dict() { RDict* d=malloc(sizeof(RDict)); d->magic=2; d->count=0; d->cap=8; d->keys=malloc(8*sizeof(Box*)); d->vals=malloc(8*sizeof(Box*)); return box_p(d); }
 
 // Recursive content equality for any Box value, including nested list/index/dict
@@ -407,6 +410,30 @@ void collection_set(Box* col_box, Box* key, Box* val) {
     }
 }
 
+// items(1).drop() — remove element/key and shift (spec: NOT replaced with Null)
+void collection_drop(Box* col_box, Box* key) {
+    if (!col_box || col_box->type != 3 || !col_box->p) return;
+    int* magic = (int*)col_box->p;
+    if (*magic == 1) {
+        RList* l = (RList*)col_box->p;
+        long long idx = key->i;
+        if (idx < 0 || idx >= l->count) return;
+        box_drop(l->items[idx]);
+        for (int j = (int)idx; j < l->count - 1; j++) l->items[j] = l->items[j+1];
+        l->count--;
+    } else if (*magic == 2) {
+        RDict* d = (RDict*)col_box->p;
+        for (int j = 0; j < d->count; j++) {
+            if (box_eq(d->keys[j], key)) {
+                box_drop(d->keys[j]); box_drop(d->vals[j]);
+                for (int k = j; k < d->count - 1; k++) { d->keys[k] = d->keys[k+1]; d->vals[k] = d->vals[k+1]; }
+                d->count--;
+                return;
+            }
+        }
+    }
+}
+
 int collection_len(Box* col_box) {
     if (!col_box) return 0;
     if (col_box->type == 2) return col_box->s ? (int)strlen(col_box->s) : 0;
@@ -505,6 +532,18 @@ double time_timer_read(int tid) {
 }
 
 char* box_to_cstr(Box* b);  // forward declaration
+// elem_cstr(): like box_to_cstr but wraps plain strings in quotes — used when
+// formatting an element NESTED inside a list/dict/index, per spec: "when a
+// list is printed it shows text in "" and everything else as is".
+char* elem_cstr(Box* b) {
+    if(b && b->type==2) {
+        const char* s = b->s ? b->s : "";
+        char* out = malloc(strlen(s)+3);
+        snprintf(out, strlen(s)+3, "\"%s\"", s);
+        return out;
+    }
+    return box_to_cstr(b);
+}
 void print_boxed(Box* b) {
     // Delegate entirely to box_to_cstr so nested collections print recursively.
     if(!b) { printf("null\n"); fflush(stdout); return; }
@@ -523,6 +562,7 @@ char* box_to_cstr(Box* b) {
         if(b->i == -2147483648LL) { snprintf(buf, 64, "Null"); }  // sentinel
         else { snprintf(buf, 64, "%lld", b->i); }
     }
+    else if(b->type==4) { snprintf(buf, 64, "%s", b->i ? "True" : "False"); }
     else if(b->type==1) { snprintf(buf, 64, "%g",   b->f); }
     else if(b->type==2) { free(buf); return strdup(b->s ? b->s : ""); }
     else if(b->type==3 && b->p) {
@@ -534,7 +574,7 @@ char* box_to_cstr(Box* b) {
             out[pos++] = '[';
             for(int i=0; i<l->count; i++) {
                 if(i>0) { out[pos++]= ','; out[pos++]=' '; }
-                char* s = box_to_cstr(l->items[i]);
+                char* s = elem_cstr(l->items[i]);
                 size_t slen = strlen(s);
                 while(pos+slen+4 >= cap) { cap*=2; out=realloc(out,cap); }
                 memcpy(out+pos, s, slen); pos+=slen; free(s);
@@ -548,8 +588,8 @@ char* box_to_cstr(Box* b) {
             out[pos++] = '{';
             for(int i=0; i<d->count; i++) {
                 if(i>0) { out[pos++]=','; out[pos++]=' '; }
-                char* ks = box_to_cstr(d->keys[i]);
-                char* vs = box_to_cstr(d->vals[i]);
+                char* ks = elem_cstr(d->keys[i]);
+                char* vs = elem_cstr(d->vals[i]);
                 size_t kl=strlen(ks), vl=strlen(vs);
                 while(pos+kl+vl+4 >= cap) { cap*=2; out=realloc(out,cap); }
                 memcpy(out+pos,ks,kl); pos+=kl;
@@ -564,6 +604,43 @@ char* box_to_cstr(Box* b) {
     }
     else { free(buf); buf = malloc(7); strcpy(buf,"<obj>"); }
     return buf;
+}
+
+// merges two lists into a new list (deep-copying each element)
+Box* list_concat(Box* a, Box* b) {
+    Box* result = make_list();
+    if (a && a->type==3 && a->p) {
+        int* am = (int*)a->p;
+        if (am && *am==1) {
+            RList* la = (RList*)a->p;
+            for(int i=0; i<la->count; i++) list_append(result, box_copy(la->items[i]));
+        }
+    }
+    if (b && b->type==3 && b->p) {
+        int* bm = (int*)b->p;
+        if (bm && *bm==1) {
+            RList* lb = (RList*)b->p;
+            for(int i=0; i<lb->count; i++) list_append(result, box_copy(lb->items[i]));
+        }
+    }
+    return result;
+}
+
+// `+` between two boxed values: merges lists (per spec's list-concat
+// example), otherwise falls back to stringify-and-concatenate (covers
+// boxed scalars, e.g. two Any-typed numbers used in a string context)
+Box* box_add(Box* a, Box* b) {
+    if (a && a->type==3 && a->p && b && b->type==3 && b->p) {
+        int* am = (int*)a->p; int* bm = (int*)b->p;
+        if (am && bm && *am==1 && *bm==1) return list_concat(a, b);
+    }
+    char* sa = box_to_cstr(a);
+    char* sb = box_to_cstr(b);
+    char* buf = malloc(strlen(sa)+strlen(sb)+1);
+    strcpy(buf, sa); strcat(buf, sb);
+    Box* result = box_s(buf);
+    free(sa); free(sb); free(buf);
+    return result;
 }
 
 // list.combine() — joins all list items as strings with no separator
@@ -753,8 +830,11 @@ long long file_open(long long slot, const char* path, int mode) {
     if(mode == 1) {
         _file_handles[slot] = fopen(path, "w");
     } else {
-        FILE* touch = fopen(path, "a"); if(touch) fclose(touch);
+        // open() as — the file must already exist; use file.new()/file.write()
+        // to create one. No auto-create "touch" here (that silently defeated
+        // the spec's missing-file try/error example).
         _file_handles[slot] = fopen(path, "r+");
+        if (!_file_handles[slot]) return -1;
     }
     return slot;
 }
@@ -1059,14 +1139,17 @@ def _prefix_fn_calls(node, prefix, local_fns=None):
         for part in node.parts:
             _prefix_fn_calls(part, prefix, local_fns)
 
-def parse_file(filepath, parsed_files, combined_ast, is_main=False):
+def parse_file(filepath, parsed_files, combined_ast, is_main=False, mod_name_override=None):
     abs_path = os.path.abspath(filepath)
     if abs_path in parsed_files:
         return
     parsed_files.add(abs_path)
     
-    # Generate module name from file (e.g., 'math_tools' from 'math_tools.rub')
-    mod_name = os.path.splitext(os.path.basename(filepath))[0]
+    # Generate module name from file (e.g., 'math_tools' from 'math_tools.rub').
+    # Package imports (`xeon <name>`) override this: every package's main file
+    # is literally named pkg.rub, so deriving the prefix from the filename
+    # would collide across packages — use the package name instead.
+    mod_name = mod_name_override or os.path.splitext(os.path.basename(filepath))[0]
     
     try:
         with open(filepath, "r") as f:
@@ -1111,6 +1194,17 @@ def parse_file(filepath, parsed_files, combined_ast, is_main=False):
     
     for node in ast:
         if isinstance(node, Import):
+            if node.is_xeon_pkg:
+                pkg_dir = os.path.join(os.path.expanduser("~"), ".xeon", "packages", node.module_name)
+                mod_path = os.path.join(pkg_dir, "pkg.rub")
+                if os.path.exists(mod_path):
+                    parse_file(mod_path, parsed_files, combined_ast, mod_name_override=node.module_name)
+                else:
+                    alias_note = f" (alias: {node.alias})" if getattr(node, 'alias', None) else ""
+                    print(f"\033[1;33mWARNING\033[0m: Package '{node.module_name}'{alias_note} "
+                          f"is not installed — run 'xeon pkg pull {node.module_name}' first. "
+                          f"Calls to this module will be no-ops.")
+                continue
             mod_file = node.module_name.replace(".", os.sep) + ".rub"
             base_dir = os.path.dirname(filepath)
             mod_path = os.path.join(base_dir, mod_file) if base_dir else mod_file
@@ -1125,7 +1219,7 @@ def parse_file(filepath, parsed_files, combined_ast, is_main=False):
     
     combined_ast.extend(ast)
     
-def compile_files(source_files, output=None):
+def compile_files(source_files, output=None, shared_lib=False):
     try:
         parsed_files = set()
         combined_ast = []
@@ -1137,11 +1231,14 @@ def compile_files(source_files, output=None):
             node.alias: os.path.splitext(os.path.basename(node.module_name.replace(".", os.sep)))[0]
             for node in combined_ast
             if isinstance(node, Import) and getattr(node, 'alias', None)
-        })
+        }, shared_lib=shared_lib)
         ir_code = gen.gen(combined_ast)
 
         if output: output_bin = output
         else: output_bin = os.path.splitext(os.path.basename(source_files[0]))[0]
+
+        if shared_lib and not output_bin.endswith((".so", ".dylib", ".dll")):
+            output_bin += ".so"
 
         with tempfile.NamedTemporaryFile(suffix=".ll", delete=False, mode="w") as f_ll:
             f_ll.write(ir_code)
@@ -1152,10 +1249,13 @@ def compile_files(source_files, output=None):
             c_path = f_c.name
 
         try:
-            result = subprocess.run(
-                ["clang", ir_path, c_path, "-o", output_bin, "-O2", "-pthread", "-ldl", "-lm"],
-                capture_output=True, text=True
-            )
+            if shared_lib:
+                clang_cmd = ["clang", "-shared", "-fPIC", ir_path, c_path,
+                             "-o", output_bin, "-O2", "-pthread", "-ldl", "-lm"]
+            else:
+                clang_cmd = ["clang", ir_path, c_path, "-o", output_bin,
+                             "-O2", "-pthread", "-ldl", "-lm"]
+            result = subprocess.run(clang_cmd, capture_output=True, text=True)
         finally:
             pass
             # os.unlink(ir_path)
@@ -1166,7 +1266,10 @@ def compile_files(source_files, output=None):
             print(result.stderr)
             sys.exit(1)
 
-        print(f"✔ Compiled → ./{output_bin}")
+        if shared_lib:
+            print(f"✔ Compiled shared library → ./{output_bin} (no entry point — fn's are exported for FFI)")
+        else:
+            print(f"✔ Compiled → ./{output_bin}")
     
     except SyntaxError as e:
         print(f"✖ Syntax Error: {e}")
@@ -1183,15 +1286,23 @@ def compile_files(source_files, output=None):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python compiler.py <file1.rub> [file2.rub ...] [output]")
+        print("Usage: python compiler.py [-s] <file1.rub> [file2.rub ...] [output]")
         sys.exit(1)
-    
-    if not sys.argv[-1].endswith('.rub'):
-        output = sys.argv[-1]
-        source_files = sys.argv[1:-1]
+
+    argv = sys.argv[1:]
+    shared_lib = "-s" in argv
+    argv = [a for a in argv if a != "-s"]
+
+    if not argv:
+        print("Usage: python compiler.py [-s] <file1.rub> [file2.rub ...] [output]")
+        sys.exit(1)
+
+    if not argv[-1].endswith('.rub'):
+        output = argv[-1]
+        source_files = argv[:-1]
     else:
         output = None
-        source_files = sys.argv[1:]
+        source_files = argv[:]
     
     expanded_files = []
     for pattern in source_files:
@@ -1200,4 +1311,4 @@ if __name__ == "__main__":
         else:
             expanded_files.append(pattern)
     
-    compile_files(expanded_files, output)
+    compile_files(expanded_files, output, shared_lib=shared_lib)

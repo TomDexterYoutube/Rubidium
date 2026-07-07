@@ -24,6 +24,7 @@ TOKEN_SPEC = [
     ("TRY",      r"try\b"),
     ("ON_ERROR", r"on_error\b"),
     ("IMPORT",   r"import\b"),
+    ("XEON",     r"xeon\b"),
     ("USE",      r"use\b"),
     ("FILE",     r"\bfile\b"),
 

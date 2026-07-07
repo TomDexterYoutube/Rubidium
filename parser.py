@@ -37,6 +37,7 @@ class Parser:
         while self.peek():
             t = self.peek()
             if   t[0] == "IMPORT": stmts.append(self.import_stmt())
+            elif t[0] == "XEON":   stmts.append(self.import_stmt(is_xeon_pkg=True))
             elif t[0] == "USE":    stmts.append(self.use_stmt())
             elif t[0] == "CLASS":  stmts.append(self.class_def())
             elif t[0] == "FN":     stmts.append(self.fn_def())
@@ -85,8 +86,8 @@ class Parser:
                 break
         return res
 
-    def import_stmt(self):
-        self.match("IMPORT")
+    def import_stmt(self, is_xeon_pkg=False):
+        self.match("XEON" if is_xeon_pkg else "IMPORT")
         name = self.match("IDENT")
         while self.peek() and self.peek()[0] == "DOT":
             self.match("DOT")
@@ -95,7 +96,7 @@ class Parser:
         if self.peek() and self.peek()[0] == "AS":
             self.match("AS")
             alias = self.match("IDENT")
-        return Import(name, alias=alias)
+        return Import(name, alias=alias, is_xeon_pkg=is_xeon_pkg)
 
     def use_stmt(self):
         self.match("USE")
@@ -171,6 +172,7 @@ class Parser:
         if t is None: return []
         if t[0] == "RBRACE": return []
         if   t[0] == "IMPORT":  return [self.import_stmt()]
+        elif t[0] == "XEON":    return [self.import_stmt(is_xeon_pkg=True)]
         elif t[0] == "USE":     return [self.use_stmt()]
         elif t[0] == "LET":     return [self.var_decl()]
         elif t[0] == "PRINT":   return [self.print_stmt()]
@@ -308,7 +310,7 @@ class Parser:
     # right after 'return' means it's a bare `return` with no value, not the
     # start of an expression that happens to be missing.
     _STMT_BOUNDARY_TOKENS = {
-        "RBRACE", "IMPORT", "USE", "LET", "PRINT", "PRINTLN", "IF", "WHILE",
+        "RBRACE", "IMPORT", "XEON", "USE", "LET", "PRINT", "PRINTLN", "IF", "WHILE",
         "FOR", "BREAK", "CONTINUE", "RETURN", "TRY", "FN", "OPEN", "CLASS",
         "DROP",
     }
@@ -432,6 +434,12 @@ class Parser:
         if isinstance(res, FieldAccess) and res.field == "drop":
             return Drop(res.obj.name)
         if isinstance(res, MethodCall) and res.method == "drop":
+            # items(1).drop() — obj is an indexing FnCall/MethodCall chain with
+            # args (a collection element/key) — remove-and-shift, NOT a whole-
+            # variable drop. items.drop() (obj is a bare Var) drops the whole
+            # variable as before.
+            if isinstance(res.obj, (FnCall, MethodCall)) and getattr(res.obj, "args", None):
+                return ElementDrop(res.obj)
             obj_name = res.obj.name if hasattr(res.obj, "name") else str(res.obj)
             return Drop(obj_name)
         return res
@@ -517,10 +525,12 @@ class Parser:
         return left
     def term(self):
         left = self.cast_expr()
-        while self.peek() and self.peek()[1] in ("*","/","**"):
+        while self.peek() and self.peek()[1] in ("*","/","**","*/"):
             op = self.match("OP")
             if op == "**":
                 left = BinOp(left, "**", self.cast_expr())
+            elif op == "*/":
+                left = BinOp(left, "*/", self.cast_expr())
             else:
                 left = BinOp(left, op, self.cast_expr())
         return left
@@ -528,6 +538,14 @@ class Parser:
     def factor(self):
         tok = self.peek()
         if tok is None: return Number(0)
+
+        # The Link Rule: `link expr` — pass-by-reference marker, valid
+        # anywhere an expression is (in practice, only meaningful as a
+        # function-call argument). Handled here (not in every individual
+        # call-argument loop) since "link" isn't otherwise a valid term.
+        if tok[0] == "IDENT" and tok[1] == "link":
+            self.match("IDENT")
+            return LinkArg(self.factor())
 
         # Handle square root operator (unary) - must be checked BEFORE general OP handling
         if tok[0] == "OP" and tok[1] == "*/":
