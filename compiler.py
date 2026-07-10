@@ -668,6 +668,8 @@ char* list_combine(Box* col_box) {
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 typedef struct {
     pid_t pid;
@@ -883,12 +885,13 @@ void file_append_all(long long slot, const char* data) {
     fflush(_file_handles[slot]);
 }
 
-// file.readln(n) — read specific line (1-based)
+// file.readln(n) — read specific line (0-based, matching the rest of the
+// language's indexing convention — see bugs.log follow-up)
 char* file_readln(long long slot, long long line_num) {
     if(slot < 0 || slot >= 1024 || !_file_handles[slot]) return strdup("");
     FILE* f = _file_handles[slot];
     rewind(f);
-    char buf[4096]; long long cur = 1;
+    char buf[4096]; long long cur = 0;
     while(fgets(buf, sizeof(buf), f)) {
         if(cur == line_num) {
             size_t len = strlen(buf);
@@ -900,7 +903,7 @@ char* file_readln(long long slot, long long line_num) {
     return strdup("");
 }
 
-// file.writeln(line_num, data) — replace or write specific line
+// file.writeln(line_num, data) — replace or write specific line (0-based)
 void file_writeln(long long slot, long long line_num, const char* data) {
     if(slot < 0 || slot >= 1024 || !_file_paths[slot]) return;
     // Read all lines, replace target, write back
@@ -914,16 +917,16 @@ void file_writeln(long long slot, long long line_num, const char* data) {
         lines[count++] = strdup(buf);
     }
     fclose(f);
-    // Extend if needed
-    while(count < line_num) {
+    // Extend if needed (need indices 0..line_num, i.e. at least line_num+1 lines)
+    while(count <= line_num) {
         if(count == cap) { cap *= 2; lines = realloc(lines, cap * sizeof(char*)); }
         lines[count++] = strdup("\n");
     }
-    free(lines[line_num - 1]);
+    free(lines[line_num]);
     size_t dlen = strlen(data);
     char* newline = malloc(dlen + 2);
     memcpy(newline, data, dlen); newline[dlen] = '\n'; newline[dlen+1] = '\0';
-    lines[line_num - 1] = newline;
+    lines[line_num] = newline;
     f = fopen(_file_paths[slot], "w");
     for(int i = 0; i < count; i++) { fputs(lines[i], f); free(lines[i]); }
     free(lines);
@@ -967,6 +970,34 @@ int file_copy_file(const char* src, const char* dst) {
     while((n = fread(buf, 1, sizeof(buf), in)) > 0) fwrite(buf, 1, n, out);
     fclose(in); fclose(out);
     return 0;
+}
+
+// file.list(path) — list directory entries, like `ls`. Directories get a
+// trailing "/" appended to their name; regular files/other entries are
+// listed as-is. "." and ".." are skipped.
+Box* file_list_dir(const char* path) {
+    Box* lst = make_list();
+    DIR* d = opendir(path);
+    if(!d) return lst;
+    struct dirent* ent;
+    while((ent = readdir(d)) != NULL) {
+        const char* name = ent->d_name;
+        if(strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+        char full[4096];
+        snprintf(full, sizeof(full), "%s/%s", path, name);
+        struct stat st;
+        int is_dir = 0;
+        if(stat(full, &st) == 0) is_dir = S_ISDIR(st.st_mode);
+        if(is_dir) {
+            char with_slash[4100];
+            snprintf(with_slash, sizeof(with_slash), "%s/", name);
+            list_append(lst, box_s(with_slash));
+        } else {
+            list_append(lst, box_s(name));
+        }
+    }
+    closedir(d);
+    return lst;
 }
 
 // str.replace(old, new) - replace all occurrences of old with new

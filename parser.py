@@ -6,6 +6,12 @@ class Parser:
         self.pos = 0
         self.line_no = 1
         self._active_file_handles = set()  # var names bound via open() as varname
+        # BUGFIX/FEATURE (bugs.log #2): SY is a compile-time name-substitution
+        # mechanism — `let x: SY = 'literal'` has no runtime existence; it just
+        # records x -> "literal" here. `(x)` used anywhere a name is expected
+        # (a `let`/`fn` declaration name, or a value/call-target reference)
+        # is replaced with the recorded literal at parse time.
+        self.sy_table = {}
 
     def peek(self):
         return self.tokens[self.pos] if self.pos < len(self.tokens) else None
@@ -14,6 +20,35 @@ class Parser:
         if self.pos < len(self.tokens):
             self.line_no = self.tokens[self.pos][2] if len(self.tokens[self.pos]) > 2 else self.line_no
         self.pos += 1
+
+    def _resolve_sy_name(self):
+        """BUGFIX/FEATURE (bugs.log #2): if the parser is sitting on
+        `( IDENT )` where IDENT is a known SY symbol, consume all three
+        tokens and return the substituted literal name. Otherwise leaves
+        the token stream untouched and returns None (so callers fall back
+        to normal parsing — e.g. an ordinary parenthesized expression)."""
+        if (self.peek() and self.peek()[0] == "LPAREN"
+                and self.pos + 2 < len(self.tokens)
+                and self.tokens[self.pos + 1][0] == "IDENT"
+                and self.tokens[self.pos + 1][1] in self.sy_table
+                and self.tokens[self.pos + 2][0] == "RPAREN"):
+            sy_name = self.tokens[self.pos + 1][1]
+            self.advance(); self.advance(); self.advance()  # LPAREN, IDENT, RPAREN
+            literal = self.sy_table[sy_name]
+            # The literal is used directly as a real variable/function name at
+            # the LLVM level, which requires a valid bare identifier (letters,
+            # digits, underscore). SY literals are free-form text (the spec's
+            # own examples use names with spaces, e.g. 'New varable'), so
+            # sanitize any non-identifier characters to underscores. This is
+            # purely an internal-symbol concern — the raw literal was never
+            # otherwise typeable/visible in source anyway, since it's only
+            # ever reached again through another `(name)` substitution.
+            import re as _re
+            safe = _re.sub(r"[^a-zA-Z0-9_]", "_", literal)
+            if safe and safe[0].isdigit():
+                safe = "_" + safe
+            return safe or "_sy_empty"
+        return None
 
     def match(self, kind):
         tok = self.peek()
@@ -117,7 +152,10 @@ class Parser:
 
     def fn_def(self):
         self.match("FN")
-        name = self.match("IDENT")
+        # BUGFIX/FEATURE (bugs.log #2): `fn (function_name) { ... }` — dynamic
+        # function name substituted from a previously-declared SY symbol.
+        sy_name = self._resolve_sy_name()
+        name = sy_name if sy_name is not None else self.match("IDENT")
         # FFI binding: fn handle_name symbol_name(params) -> ret  (no body brace)
         # Detected when the token after `name` is another IDENT (not LPAREN)
         if self.peek() and self.peek()[0] == "IDENT":
@@ -142,16 +180,25 @@ class Parser:
                 alias = self.match("IDENT")
             return FFIBind(name, symbol_name, params, ret_type, alias=alias)
         # Normal function
-        self.match("LPAREN")
+        # BUGFIX (bugs.log #2): the spec's `fn (function_name) { ... }` form
+        # has NO parameter-list parentheses at all — the substituted name
+        # occupies the name slot and the body brace follows directly. Without
+        # this check, `self.match("LPAREN")` below would silently fail to
+        # consume anything (next token is LBRACE), and the parameter-parsing
+        # while-loop would then spin forever never seeing RPAREN — an
+        # infinite loop/hang. Only require the parens when they're actually
+        # there.
         params = []
-        while self.peek() and self.peek()[0] != "RPAREN":
-            pname = self.match("IDENT")
-            self.match("COLON")
-            ptype = self.match("TYPE")
-            params.append((pname, ptype))
-            if self.peek() and self.peek()[0] == "COMMA":
-                self.match("COMMA")
-        self.match("RPAREN")
+        if self.peek() and self.peek()[0] == "LPAREN":
+            self.match("LPAREN")
+            while self.peek() and self.peek()[0] != "RPAREN":
+                pname = self.match("IDENT")
+                self.match("COLON")
+                ptype = self.match("TYPE")
+                params.append((pname, ptype))
+                if self.peek() and self.peek()[0] == "COMMA":
+                    self.match("COMMA")
+            self.match("RPAREN")
         ret_type = None
         if self.peek() and self.peek()[1] == "->":
             self.match("OP")
@@ -184,6 +231,9 @@ class Parser:
         elif t[0] == "CONTINUE":self.match("CONTINUE"); return [Continue()]
         elif t[0] == "RETURN":  return [self.return_stmt()]
         elif t[0] == "TRY":     return [self.try_stmt()]
+        elif t[0] == "RAISE":
+            self.match("RAISE")
+            return [Raise(self.expr())]
         elif t[0] == "FN":      return [self.fn_def()]
         elif t[0] == "OPEN":    return [self.open_stmt()]
         elif t[0] == "FILE":    
@@ -192,6 +242,13 @@ class Parser:
                 return [result]
             return []
         elif t[0] == "IDENT" or t[0] == "TYPE":   return [self.ident_stmt()]
+        elif t[0] == "LPAREN":
+            # BUGFIX/FEATURE (bugs.log #2): a statement starting with `(` is a
+            # dynamic SY call/reference, e.g. `(function_name)()`. Previously
+            # unhandled here, so it silently fell into the generic "unknown
+            # token, skip one and continue" branch below, one token at a time
+            # — the call was never actually parsed or emitted.
+            return [self.expr()]
         else:
             self.advance()
             return []
@@ -223,15 +280,22 @@ class Parser:
         self.match("LET")
         mut = bool(self.match("MUT"))
         is_local = bool(self.match("LOCAL"))
-        # Accept both IDENT and TYPE tokens for variable names (e.g., "list" is a TYPE but can be a variable name)
-        # Also check if this is a file handle variable inside an open() block
-        tok = self.peek()
-        if tok and tok[0] in ("IDENT", "TYPE"):
-            name = self.match(tok[0])  # match returns the value
-        elif tok and tok[0] == "FILE":
-            name = self.match("FILE")
+        # BUGFIX/FEATURE (bugs.log #2): `let (varable_name): str = ...` — the
+        # declared name is dynamically substituted from a previously-declared
+        # SY symbol. Must be checked before the normal IDENT/TYPE name parsing.
+        sy_name = self._resolve_sy_name()
+        if sy_name is not None:
+            name = sy_name
         else:
-            name = self.match("IDENT")
+            # Accept both IDENT and TYPE tokens for variable names (e.g., "list" is a TYPE but can be a variable name)
+            # Also check if this is a file handle variable inside an open() block
+            tok = self.peek()
+            if tok and tok[0] in ("IDENT", "TYPE"):
+                name = self.match(tok[0])  # match returns the value
+            elif tok and tok[0] == "FILE":
+                name = self.match("FILE")
+            else:
+                name = self.match("IDENT")
         vtype = None
         if self.peek() and self.peek()[0] == "COLON":
             self.match("COLON")
@@ -246,6 +310,11 @@ class Parser:
             self.match("TYPE")
         self.match("OP")
         value = self.expr()
+        # BUGFIX/FEATURE (bugs.log #2): `let x: SY = 'literal'` has no runtime
+        # existence — record the compile-time name mapping and emit nothing.
+        if vtype == "SY":
+            self.sy_table[name] = value.value if isinstance(value, Str) else str(value)
+            return NoOp()
         return VarDecl(name, mut, is_local, vtype, value)
 
     def print_stmt(self):
@@ -312,7 +381,7 @@ class Parser:
     _STMT_BOUNDARY_TOKENS = {
         "RBRACE", "IMPORT", "XEON", "USE", "LET", "PRINT", "PRINTLN", "IF", "WHILE",
         "FOR", "BREAK", "CONTINUE", "RETURN", "TRY", "FN", "OPEN", "CLASS",
-        "DROP",
+        "DROP", "RAISE",
     }
 
     def return_stmt(self):
@@ -341,7 +410,14 @@ class Parser:
         file_var = file_tok[1] if file_tok else "file"
         self.match("FILE")
         self.match("DOT")
-        method = self.match("IDENT")
+        # BUGFIX: use match_attr() (accepts any token kind), not match("IDENT").
+        # Method names after a dot can collide with reserved keywords — e.g.
+        # `file.list(...)` tokenizes "list" as a TYPE token (it's also a
+        # collection-type keyword), not IDENT, so match("IDENT") would fail
+        # silently (no error, no advance) and leave the parser stuck reading
+        # the same TYPE("list") token as if 'file.list(...)' had never been
+        # consumed at all — producing garbage downstream.
+        method = self.match_attr()
 
         # If inside an open() block and this matches the handle var, parse as handle method
         # Also parse as handle method if file_var is "file" (default handle for file.new)
@@ -376,6 +452,10 @@ class Parser:
             dst_path = self.expr()
             self.match("RPAREN")
             return FileCopy(src_path, dst_path)
+        elif method == "list":
+            path = self.expr()
+            self.match("RPAREN")
+            return FileList(path)
         elif method == "new":
             path = self.expr()
             self.match("RPAREN")
@@ -525,7 +605,7 @@ class Parser:
         return left
     def term(self):
         left = self.cast_expr()
-        while self.peek() and self.peek()[1] in ("*","/","**","*/"):
+        while self.peek() and self.peek()[1] in ("*","/","**","*/","%"):
             op = self.match("OP")
             if op == "**":
                 left = BinOp(left, "**", self.cast_expr())
@@ -606,9 +686,13 @@ class Parser:
             self.advance()
             if tok[1] in ("None", "Null"): return None_()
             return Bool(tok[1] == "True")
-        if tok[0] == "STRING":
+        if tok[0] in ("STRING", "STRING3", "SYSTRING"):
             self.advance()
-            res = Str(tok[1][1:-1])
+            # BUGFIX (bugs.log #3/#2): STRING3 (triple-quoted `"""..."""`) strips 3
+            # quote characters from each side instead of 1; SYSTRING (single-quoted
+            # SY literal, e.g. 'New varable') strips 1 single-quote from each side.
+            strip_n = 3 if tok[0] == "STRING3" else 1
+            res = Str(tok[1][strip_n:-strip_n])
             # Allow method chaining on string literals: "foo".len(), "foo".combine(...)
             while self.peek() and self.peek()[0] == "DOT":
                 self.match("DOT")
@@ -634,6 +718,22 @@ class Parser:
         if tok[0] == "NOT":
             self.advance(); return UnaryOp("not", self.factor())
         if tok[0] == "LPAREN":
+            # BUGFIX/FEATURE (bugs.log #2): `(varable_name)` / `(function_name)()`
+            # — dynamic reference to a previously-declared SY symbol. Must be
+            # checked before the generic parenthesized-expression grouping
+            # below, but only fires when the identifier is a KNOWN SY symbol,
+            # so ordinary grouped expressions like `(1 + 2)` are unaffected.
+            sy_name = self._resolve_sy_name()
+            if sy_name is not None:
+                if self.peek() and self.peek()[0] == "LPAREN":
+                    self.match("LPAREN")
+                    args = []
+                    while self.peek() and self.peek()[0] != "RPAREN":
+                        args.append(self.expr())
+                        if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
+                    self.match("RPAREN")
+                    return FnCall(sy_name, args)
+                return Var(sy_name)
             self.advance(); e = self.expr(); self.match("RPAREN"); return e
 
         # FILE token used as file handle variable inside open() block

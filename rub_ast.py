@@ -255,6 +255,12 @@ class FileCopy:
         self.src_path = src_path
         self.dst_path = dst_path
 
+class FileList:
+    """file.list(path) — directory listing (like `ls`); directories get a
+    trailing '/' appended to their name."""
+    def __init__(self, path_expr):
+        self.path_expr = path_expr
+
 class FileNew:
     def __init__(self, path_expr, body):
         self.path_expr = path_expr
@@ -272,3 +278,17 @@ class FileHandleStmt:
         self.var_name = var_name
         self.method = method
         self.args = args
+
+class NoOp:
+    """A statement with no runtime effect — used for SY declarations
+    (bugs.log #2), which are pure compile-time name substitutions."""
+    def __init__(self):
+        pass
+
+class Raise:
+    """raise <expr> — raises a runtime error with the given message.
+    If inside a try block, control jumps to that try's error handler
+    (with `error` set to the message); otherwise it's an uncaught
+    runtime error (program exits after printing the message)."""
+    def __init__(self, message):
+        self.message = message

@@ -3,7 +3,18 @@ import re
 TOKEN_SPEC = [
     ("NUMBER",   r"\d+\.\d+|\d+"),
     ("ISTRING_PLACEHOLDER", r"i\"PLACEHOLDER\""),  # placeholder — handled below
+    # BUGFIX (bugs.log #3): triple-quoted multi-line strings (used for the `str+`
+    # type) must be matched BEFORE the single-quote STRING rule below, or a
+    # `"""..."""` literal gets split into three separate STRING tokens (two
+    # empty strings plus the real content), which previously produced a NULL
+    # value at runtime and crashed. [\s\S]*? matches across newlines, non-greedy
+    # so it stops at the first closing """.
+    ("STRING3",  r'"""[\s\S]*?"""'),
     ("STRING",   r'"[^"]*"'),
+    # BUGFIX (bugs.log #2): SY type literals are written with single quotes,
+    # e.g. `let varable_name: SY = 'New varable'`. Previously unsupported —
+    # a bare `'` fell through to "Unexpected character".
+    ("SYSTRING", r"'[^']*'"),
     ("BOOL",     r"True|False|Null|None"),
 
     ("LET",      r"let\b"),
@@ -22,6 +33,7 @@ TOKEN_SPEC = [
     ("PRINT",    r"print\b"),
     ("RANGE",    r"range\b"),
     ("TRY",      r"try\b"),
+    ("RAISE",    r"raise\b"),
     ("ON_ERROR", r"on_error\b"),
     ("IMPORT",   r"import\b"),
     ("XEON",     r"xeon\b"),
@@ -33,13 +45,13 @@ TOKEN_SPEC = [
     ("OR",       r"or\b"),
     ("NOT",      r"not\b"),
 
-    ("TYPE",     r"\b(?:i32|i64|i128|i256|i512|i1024|i2048|f32|f64|f128|f256|f512|f1024|f2048|str|bool|list|index|dict|Any)\b"),
+    ("TYPE",     r"\bstr\+|\bSY\b|\b(?:i32|i64|i128|i256|i512|i1024|i2048|f32|f64|f128|f256|f512|f1024|f2048|str|bool|list|index|dict|Any)\b"),
     ("LOCAL",    r"\blocal\b"),
     ("OPEN",     r"\bopen\b"),
 
     ("IDENT",    r"[a-zA-Z_][a-zA-Z0-9_]*"),
 
-    ("OP",       r"==|!=|<=|>=|->|=|\+|-|\*\*|\*/|\*|/|<|>"),
+    ("OP",       r"==|!=|<=|>=|->|=|\+|-|\*\*|\*/|\*|/|%|<|>"),
     ("LPAREN",   r"\("),
     ("RPAREN",   r"\)"),
     ("LBRACE",   r"\{"),
@@ -124,4 +136,6 @@ def tokenize(code):
             raise SyntaxError(f"Line {line_no}: Unexpected character: {value!r}")
 
         tokens.append((kind, value, line_no))
+        if kind == "STRING3":
+            line_no += value.count("\n")
     return tokens

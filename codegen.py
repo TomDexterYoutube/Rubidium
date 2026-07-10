@@ -72,6 +72,7 @@ declare i32 @file_exists(i8*)
 declare i32 @file_delete(i8*)
 declare i32 @file_rename_file(i8*, i8*)
 declare i32 @file_copy_file(i8*, i8*)
+declare %Box* @file_list_dir(i8*)
 '''
 
 
@@ -107,6 +108,46 @@ class CodeGen:
         # Tracks the IR return type of the function currently being emitted;
         # used by the Return handler to avoid type mismatches when ret_type is None.
         self._cur_fn_ret_ir: str = "i64"
+        # BUGFIX (bugs.log #1): the generated runtime C file (compiler.py) includes
+        # <math.h>/<stdio.h>/<stdlib.h>/<string.h>/<time.h>/<pthread.h>, which already
+        # declare these C-library symbol names. A Rubidium function or FFI alias that
+        # shares one of these names (e.g. `fn sqrt(...)` or `fn lib sin(...) as sin`,
+        # both used verbatim in the syntax file's own examples) previously caused
+        # clang to fail with "invalid redefinition of function". We keep the
+        # Rubidium-visible name (used as the self.functions dict key, so calls still
+        # resolve normally) but emit the actual LLVM symbol under a safe alias when it
+        # collides with one of these reserved names.
+        self._RESERVED_C_SYMBOLS = frozenset({
+            # math.h
+            "sin","cos","tan","asin","acos","atan","atan2","sinh","cosh","tanh",
+            "asinh","acosh","atanh","exp","exp2","expm1","log","log2","log10","log1p",
+            "pow","sqrt","cbrt","hypot","fabs","floor","ceil","round","trunc","fmod",
+            "remainder","ldexp","frexp","modf","copysign","nan","erf","erfc","gamma",
+            "lgamma","tgamma","j0","j1","jn","y0","y1","yn",
+            # stdio.h / stdlib.h / string.h
+            "printf","fprintf","sprintf","snprintf","scanf","fopen","fclose","fread",
+            "fwrite","fgets","fputs","fflush","malloc","calloc","realloc","free",
+            "exit","abort","atoi","atol","atof","rand","srand","system","getenv",
+            "strlen","strcmp","strncmp","strcpy","strncpy","strcat","strncat","strchr",
+            "strstr","strdup","memcpy","memmove","memset","memcmp","abs","labs","qsort",
+            # time.h / pthread.h / unistd.h / dlfcn.h
+            "time","clock","difftime","mktime","localtime","gmtime","sleep","usleep",
+            "pthread_create","pthread_join","pthread_exit","pthread_mutex_lock",
+            "pthread_mutex_unlock","fork","exec","wait","waitpid","dlopen","dlsym",
+            "dlclose","dlerror",
+        })
+        # Maps a Rubidium-visible function name -> the safe LLVM symbol actually
+        # emitted for it, ONLY when the two differ (i.e. only for reserved-name
+        # collisions). Populated at function/FFI-bind registration time.
+        self._fn_symbol_override = {}
+
+    def _safe_fn_symbol(self, name):
+        """Return an LLVM-safe symbol for a Rubidium function name, avoiding
+        collisions with C library symbols already declared via the runtime's
+        #include headers (see bugs.log #1). No-op for non-colliding names."""
+        if name in self._RESERVED_C_SYMBOLS and name != "main":
+            return f"__rub_{name}"
+        return name
 
     def is_class_field(self, name):
         if not self.cur_class: return False
@@ -182,6 +223,7 @@ class CodeGen:
         if t in ("list", "index", "dict", "Any"): return "%Box*"
         if t == "bool":  return "i1"
         if t == "str":   return "i8*"
+        if t == "str+":  return "i8*"  # bugs.log #3: str+ (big/multi-line string) uses the same representation as str
         if t in self._INT_IR:  return self._INT_IR[t]
         if t in self._FLT_IR:  return self._FLT_IR[t]
         # Fallback: already an IR type (e.g. "i64" from internal use)
@@ -250,6 +292,18 @@ class CodeGen:
         for scope in reversed(self.local_vars_stack):
             if name in scope:
                 return f"%ptr_{name}", scope[name]
+        # FEATURE: class methods cannot see global variables — they only see
+        # their own instance fields (handled earlier, before get_var_ptr is
+        # even called — see is_class_field()/emit_field_access in the Var
+        # branch of emit_expr) and their own locals/parameters (the scope
+        # check just above). Globals are treated as if they don't exist,
+        # unless explicitly passed in as a parameter.
+        if self.cur_class:
+            raise RubidiumNameError(
+                f"Class '{self.cur_class}' cannot access global variable '{name}': "
+                f"globals are not accessible from inside a class (pass it in as "
+                f"a parameter instead)"
+            )
         # Check for mangled name if original conflicts with C lib func
         c_lib_funcs = {"pow", "sin", "cos", "tan", "sqrt", "log", "log10", "exp", "fabs", "floor", "ceil", "round"}
         mangled = f"_var_{name}" if name in c_lib_funcs else name
@@ -323,7 +377,18 @@ class CodeGen:
                     mfn.class_name = s.name
                     self.functions[mangled_name] = mfn
             elif isinstance(s, FnDef):
-                self.functions[s.name] = s
+                # BUGFIX (bugs.log #1): keep the dict key as the original,
+                # Rubidium-visible name (so calls elsewhere that look it up by
+                # source name keep working), but if it collides with a reserved
+                # C symbol, emit the actual LLVM define/call under a safe mangled
+                # name (stored on the FnDef object's .name, used by emit_fn and
+                # by call sites via fn_obj.name rather than the dict key).
+                original_name = s.name
+                safe_name = self._safe_fn_symbol(original_name)
+                if safe_name != original_name:
+                    self._fn_symbol_override[original_name] = safe_name
+                    s.name = safe_name
+                self.functions[original_name] = s
 
         self._register_implicit_class_fields()
         self.collect_globals(stmts)
@@ -436,6 +501,15 @@ class CodeGen:
         return val
 
     def _infer_type(self, node):
+        if isinstance(node, FileList): return "%Box*"
+        if isinstance(node, LinkArg):
+            # BUGFIX (bugs.log #4): `link expr` is a pass-by-reference marker,
+            # not a distinct type — it must infer as whatever `expr` itself is
+            # (e.g. `link a_list` is still %Box*). Previously unhandled, so it
+            # fell through to the generic "i64" default, causing `let y = link x`
+            # (with no explicit type annotation) to allocate/coerce as i64 and
+            # silently produce a wrong value instead of the linked collection.
+            return self._infer_type(node.expr)
         if isinstance(node, Number): return "double" if isinstance(node.value, float) else "i64"
         if isinstance(node, Bool): return "i1"
         if isinstance(node, None_): return "i64"
@@ -626,6 +700,8 @@ class CodeGen:
                     self._file_handle_vars.pop(node.var_name, None)
 
     def _collect_global(self, node):
+        if isinstance(node, NoOp):
+            return  # SY declarations (bugs.log #2) — nothing to collect
         if isinstance(node, VarDecl):
             # Local variables are function-scoped, not global
             if node.is_local:
@@ -650,7 +726,12 @@ class CodeGen:
             # Pre-register the bound symbol so calls resolve in collect pass.
             # Use the 'as' alias when provided (e.g. fn lib rb_sin(...) -> f64 as sin  → "sin")
             fn_name = node.alias if node.alias else node.symbol_name
-            self.functions[fn_name] = FnDef(fn_name, node.params, node.ret_type, [])
+            # BUGFIX (bugs.log #1): avoid colliding with reserved C symbols
+            # (e.g. `as sin` shadowing libm's sin) — see _safe_fn_symbol.
+            safe_name = self._safe_fn_symbol(fn_name)
+            if safe_name != fn_name:
+                self._fn_symbol_override[fn_name] = safe_name
+            self.functions[fn_name] = FnDef(safe_name, node.params, node.ret_type, [])
         elif isinstance(node, If):
             for s in node.then_body: self._collect_global(s)
             for s in (node.else_body or []): self._collect_global(s)
@@ -700,6 +781,28 @@ class CodeGen:
             elif isinstance(node, While):
                 self._gather_local_types(node.body, type_map, only_local)
             elif isinstance(node, For):
+                # BUGFIX (bugs.log #5): a for-loop implicitly (re)declares its
+                # loop variable each time the block runs. If that name was
+                # already used (before or after, textually) for a `let` of a
+                # different underlying LLVM type — or for another for-loop
+                # with a different natural type — the two allocas collide,
+                # since alloca is only sized/typed once per name. Register the
+                # loop var's "natural" type here so the same polymorphism
+                # detection used for `let` redeclarations also catches this,
+                # forcing a shared %Box* representation instead of silently
+                # reusing a mistyped alloca (previously caused a segfault).
+                if getattr(node, "var", None):
+                    if node.iterable is None:
+                        nat_t = "i64"  # for i in a..b (range)
+                    elif isinstance(node.iterable, Var) and node.iterable.name in self._file_handle_vars:
+                        nat_t = "%Box*"  # for line in file_handle
+                    else:
+                        try:
+                            it_t = self._infer_type(node.iterable)
+                        except Exception:
+                            it_t = "%Box*"
+                        nat_t = "i64" if it_t in self._INT_IR_SET else "%Box*"
+                    type_map.setdefault(node.var, set()).add(nat_t)
                 self._gather_local_types(node.body, type_map, only_local)
             elif isinstance(node, Try):
                 self._gather_local_types(node.try_body, type_map, only_local)
@@ -796,6 +899,24 @@ class CodeGen:
         self.emit("}\n")
 
     def emit_stmt(self, node):
+        if isinstance(node, NoOp):
+            return  # SY declarations (bugs.log #2) — compile-time only, nothing to emit
+        if isinstance(node, Raise):
+            # FEATURE: raise <expr> — same error-propagation path already used
+            # by builtin runtime errors (division by zero, missing file, etc.):
+            # store the message in the global error buffer and jump to the
+            # nearest enclosing try's error handler, or call rub_throw() for
+            # an uncaught error if not inside a try.
+            msg_v, msg_t = self.emit_expr(node.message)
+            msg_s = self.coerce(msg_v, msg_t, "i8*")
+            if self._try_error_label:
+                self.emit(f"  store i8* {msg_s}, i8** @_rub_error_msg")
+                cont_l = self.new_label("after_raise")
+                self.emit(f"  br label %{self._try_error_label}")
+                self.emit(f"{cont_l}:")
+            else:
+                self.emit(f"  call void @rub_throw(i8* {msg_s})")
+            return
         if isinstance(node, VarDecl):
             if node.name in self.dropped_vars: self.dropped_vars.discard(node.name)
             
@@ -1038,6 +1159,7 @@ class CodeGen:
         elif isinstance(node, FileDelete): self.emit_file_delete(node)
         elif isinstance(node, FileRename): self.emit_file_rename(node)
         elif isinstance(node, FileCopy): self.emit_file_copy(node)
+        elif isinstance(node, FileList): self.emit_file_list(node)
         elif isinstance(node, FileNew): self.emit_file_new(node)
         elif isinstance(node, OsStart):
             id_v, id_t = self.emit_expr(node.id_expr)
@@ -1574,23 +1696,42 @@ class CodeGen:
             # Integer iterable: for i in N → loop from 1 to N (inclusive)
             if iter_t in self._INT_IR_SET:
                 iter_v_64 = self.coerce(iter_v, iter_t, "i64")
+                # BUGFIX (bugs.log #5): if node.var was also used elsewhere with a
+                # different underlying type (another `let`/for-loop), keep the loop
+                # mechanics on a hidden i64 counter and box the value into the
+                # user-visible %Box* variable each iteration, instead of reusing a
+                # stale/mistyped alloca for node.var directly (previously corrupted
+                # memory / segfaulted).
+                is_poly = node.var in getattr(self, "_local_polymorphic", ())
                 if self.cur_fn is not None and self.cur_fn != "_rubidium_init":
-                    var_ptr = f"%ptr_{node.var}"
-                    if node.var not in self._alloca_emitted:
-                        self.local_vars_stack[-1][node.var] = "i64"
-                        self.emit(f"  {var_ptr} = alloca i64")
-                        self._alloca_emitted.add(node.var)
+                    if is_poly:
+                        ctr_ptr = f"%ptr_{node.var}_ctr_{self.new_tmp()[1:]}"
+                        self.emit(f"  {ctr_ptr} = alloca i64")
+                        var_ptr = f"%ptr_{node.var}"
+                        if node.var not in self._alloca_emitted:
+                            self.emit(f"  {var_ptr} = alloca %Box*")
+                            self._alloca_emitted.add(node.var)
+                        self.local_vars_stack[-1][node.var] = "%Box*"
                     else:
+                        ctr_ptr = f"%ptr_{node.var}"
+                        if node.var not in self._alloca_emitted:
+                            self.emit(f"  {ctr_ptr} = alloca i64")
+                            self._alloca_emitted.add(node.var)
                         self.local_vars_stack[-1][node.var] = "i64"
                 else:
                     self.declare_global(node.var, "i64")
-                    var_ptr = f"@{node.var}"
-                self.emit(f"  store i64 0, i64* {var_ptr}")
+                    ctr_ptr = f"@{node.var}"
+                self.emit(f"  store i64 0, i64* {ctr_ptr}")
                 cond_l, body_l, cont_l, end_l = self.new_label("fcond"), self.new_label("fbody"), self.new_label("fcont"), self.new_label("fend")
                 self.emit(f"  br label %{cond_l}\n{cond_l}:")
                 cur, cond = self.new_tmp(), self.new_tmp()
-                self.emit(f"  {cur} = load i64, i64* {var_ptr}\n  {cond} = icmp slt i64 {cur}, {iter_v_64}")
+                self.emit(f"  {cur} = load i64, i64* {ctr_ptr}\n  {cond} = icmp slt i64 {cur}, {iter_v_64}")
                 self.emit(f"  br i1 {cond}, label %{body_l}, label %{end_l}\n{body_l}:")
+                if is_poly:
+                    cur_v = self.new_tmp()
+                    self.emit(f"  {cur_v} = load i64, i64* {ctr_ptr}")
+                    boxed = self.coerce_to_box(cur_v, "i64")
+                    self.emit(f"  store %Box* {boxed}, %Box** {var_ptr}")
                 self.loop_end_stack.append(end_l)
                 self.loop_cond_stack.append(cont_l)
                 self.emit_body(node.body)
@@ -1598,7 +1739,7 @@ class CodeGen:
                 self.loop_end_stack.pop()
                 self.emit(f"  br label %{cont_l}\n{cont_l}:")
                 inc, cur2 = self.new_tmp(), self.new_tmp()
-                self.emit(f"  {cur2} = load i64, i64* {var_ptr}\n  {inc} = add i64 {cur2}, 1\n  store i64 {inc}, i64* {var_ptr}")
+                self.emit(f"  {cur2} = load i64, i64* {ctr_ptr}\n  {inc} = add i64 {cur2}, 1\n  store i64 {inc}, i64* {ctr_ptr}")
                 self.emit(f"  br label %{cond_l}\n{end_l}:")
                 return
 
@@ -1660,30 +1801,47 @@ class CodeGen:
             sv, st = self.emit_expr(node.start); ev, et = self.emit_expr(node.end)
             sv = self.coerce(sv, st, "i64"); ev = self.coerce(ev, et, "i64")
 
+            # BUGFIX (bugs.log #5): same fix as the integer-iterable branch above —
+            # keep loop mechanics on a hidden i64 counter and box into node.var's
+            # own %Box* alloca each iteration if the name is polymorphic (reused
+            # elsewhere with a different type), instead of reusing a stale alloca.
+            is_poly = node.var in getattr(self, "_local_polymorphic", ())
             if self.cur_fn is not None and self.cur_fn != "_rubidium_init":
-                var_ptr = f"%ptr_{node.var}"
-                if node.var not in self._alloca_emitted:
-                    self.local_vars_stack[-1][node.var] = "i64"
-                    self.emit(f"  {var_ptr} = alloca i64")
-                    self._alloca_emitted.add(node.var)
+                if is_poly:
+                    ctr_ptr = f"%ptr_{node.var}_ctr_{self.new_tmp()[1:]}"
+                    self.emit(f"  {ctr_ptr} = alloca i64")
+                    var_ptr = f"%ptr_{node.var}"
+                    if node.var not in self._alloca_emitted:
+                        self.emit(f"  {var_ptr} = alloca %Box*")
+                        self._alloca_emitted.add(node.var)
+                    self.local_vars_stack[-1][node.var] = "%Box*"
                 else:
+                    ctr_ptr = f"%ptr_{node.var}"
+                    if node.var not in self._alloca_emitted:
+                        self.emit(f"  {ctr_ptr} = alloca i64")
+                        self._alloca_emitted.add(node.var)
                     self.local_vars_stack[-1][node.var] = "i64"
             else:
                 self.declare_global(node.var, "i64")
-                var_ptr = f"@{node.var}"
+                ctr_ptr = f"@{node.var}"
 
             # Determine direction at codegen time: is_up = (start < end)
             is_up = self.new_tmp()
             self.emit(f"  {is_up} = icmp slt i64 {sv}, {ev}")
-            self.emit(f"  store i64 {sv}, i64* {var_ptr}")
+            self.emit(f"  store i64 {sv}, i64* {ctr_ptr}")
             cond_l, body_l, cont_l, end_l = self.new_label("fcond"), self.new_label("fbody"), self.new_label("fcont"), self.new_label("fend")
             self.emit(f"  br label %{cond_l}\n{cond_l}:")
             cur, cur_lt, cur_gt, cond = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
-            self.emit(f"  {cur} = load i64, i64* {var_ptr}")
+            self.emit(f"  {cur} = load i64, i64* {ctr_ptr}")
             self.emit(f"  {cur_lt} = icmp sle i64 {cur}, {ev}")
             self.emit(f"  {cur_gt} = icmp sgt i64 {cur}, {ev}")
             self.emit(f"  {cond} = select i1 {is_up}, i1 {cur_lt}, i1 {cur_gt}")
             self.emit(f"  br i1 {cond}, label %{body_l}, label %{end_l}\n{body_l}:")
+            if is_poly:
+                cur_v = self.new_tmp()
+                self.emit(f"  {cur_v} = load i64, i64* {ctr_ptr}")
+                boxed = self.coerce_to_box(cur_v, "i64")
+                self.emit(f"  store %Box* {boxed}, %Box** {var_ptr}")
             self.loop_end_stack.append(end_l)
             self.loop_cond_stack.append(cont_l)
             self.emit_body(node.body)
@@ -1692,7 +1850,7 @@ class CodeGen:
             self.emit(f"  br label %{cont_l}\n{cont_l}:")
             step, inc, cur2 = self.new_tmp(), self.new_tmp(), self.new_tmp()
             self.emit(f"  {step} = select i1 {is_up}, i64 1, i64 -1")
-            self.emit(f"  {cur2} = load i64, i64* {var_ptr}\n  {inc} = add i64 {cur2}, {step}\n  store i64 {inc}, i64* {var_ptr}")
+            self.emit(f"  {cur2} = load i64, i64* {ctr_ptr}\n  {inc} = add i64 {cur2}, {step}\n  store i64 {inc}, i64* {ctr_ptr}")
             self.emit(f"  br label %{cond_l}\n{end_l}:")
 
     def _emit_for_file(self, node):
@@ -1701,8 +1859,16 @@ class CodeGen:
         # Loop variable stores the current line as i8*
         if self.cur_fn is not None and self.cur_fn != "_rubidium_init":
             var_ptr = f"%ptr_{node.var}"
+            # BUGFIX (bugs.log #5): registering the var's type in the CURRENT
+            # scope must happen every time we enter this loop, not just the
+            # first time the alloca is emitted — otherwise a later lexical
+            # block (e.g. a second `open(...) as file { for line in file }`)
+            # never learns "line" maps to %ptr_line in its own scope (the
+            # scope that originally registered it has already been popped),
+            # so lookups fall through and silently resolve to a bogus/global
+            # binding instead — this was the actual cause of the segfault.
+            self.local_vars_stack[-1][node.var] = "%Box*"
             if node.var not in self._alloca_emitted:
-                self.local_vars_stack[-1][node.var] = "%Box*"
                 self.emit(f"  {var_ptr} = alloca %Box*")
                 self._alloca_emitted.add(node.var)
         else:
@@ -1936,6 +2102,13 @@ class CodeGen:
         dst_val, dst_t = self.emit_expr(node.dst_path)
         self.emit(f"  call i32 @file_copy_file(i8* {src_val}, i8* {dst_val})")
 
+    def emit_file_list(self, node):
+        path_val, path_t = self.emit_expr(node.path_expr)
+        path_s = self.coerce(path_val, path_t, "i8*")
+        result = self.new_tmp()
+        self.emit(f"  {result} = call %Box* @file_list_dir(i8* {path_s})")
+        return result, "%Box*"
+
     def _os_run_core(self, node):
         """Shared logic: emit os_run() call, return (result_tmp, "i8*")"""
         null_lbl, null_len = self.intern_str("")
@@ -2068,15 +2241,22 @@ class CodeGen:
         fn_ptr_t = f"{ret_ir} ({', '.join(param_ir_types)})*" if param_ir_types else f"{ret_ir} ()*"
         # Rubidium-callable name: use 'as' alias when provided, else fall back to C symbol name
         fn_name = node.alias if node.alias else node.symbol_name
+        # BUGFIX (bugs.log #1): don't emit the LLVM define under a name that
+        # collides with a reserved C symbol (e.g. `as sin`/`as sqrt`, both used
+        # verbatim in the syntax file's FFI examples) — keep `fn_name` as the
+        # Rubidium-visible dict key, but emit/define under `safe_name`.
+        safe_name = self._safe_fn_symbol(fn_name)
+        if safe_name != fn_name:
+            self._fn_symbol_override[fn_name] = safe_name
         params_ir = ", ".join(f"{pt} %p{i}" for i, pt in enumerate(param_ir_types))
 
         # Register immediately so calls in the same scope resolve
-        self.functions[fn_name] = FnDef(fn_name, node.params, node.ret_type, [])
+        self.functions[fn_name] = FnDef(safe_name, node.params, node.ret_type, [])
 
         # Buffer the wrapper — flush after current function closes (like trampolines)
         # so we don't emit a define inside another define
         pending = []
-        pending.append(f"\ndefine {ret_ir} @{fn_name}({params_ir}) {{")
+        pending.append(f"\ndefine {ret_ir} @{safe_name}({params_ir}) {{")
         pending.append("entry:")
 
         # Get handle index from the dedicated global slot written when FFI("path") ran.
@@ -2217,6 +2397,8 @@ class CodeGen:
             return self.emit_file_handle_method(node.var_name, node.method, node.args)
         if isinstance(node, FileExists):
             return self.emit_file_exists(node)
+        if isinstance(node, FileList):
+            return self.emit_file_list(node)
         if isinstance(node, Var):
             if node.name in self.dropped_vars:
                 # Runtime behavior: print error message instead of crash
@@ -2336,10 +2518,20 @@ class CodeGen:
             if ir_method in self.functions:
                 struct_t = self.class_ir_type(self.cur_class)
                 self_ptr, _ = self.get_var_ptr("__self")
+                # BUGFIX: get_var_ptr returns the ALLOCA slot (%class_X**), not
+                # the actual instance pointer (%class_X*) — must load it first,
+                # exactly like every other __self use in this file does (see
+                # e.g. the field-assignment path a few lines above). Passing
+                # the alloca pointer directly silently passed a wrong/garbage
+                # self pointer to the callee, so field reads/writes through it
+                # (like `health = health + amount` in a same-class helper
+                # method) had no visible effect on the real instance.
+                self_val = self.new_tmp()
+                self.emit(f"  {self_val} = load {struct_t}*, {struct_t}** {self_ptr}")
                 fn_def = self.functions[ir_method]
                 param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_def.params]
                 ret_ir = self.rubi_type_to_ir(fn_def.ret_type) if fn_def.ret_type else "i64"
-                args_ir = [f"{struct_t}* {self_ptr}"]
+                args_ir = [f"{struct_t}* {self_val}"]
                 for i, a in enumerate(node.args):
                     av, at = self.emit_expr(a)
                     if i < len(param_types):
@@ -2458,10 +2650,15 @@ class CodeGen:
                         tramp_lines.append(f"  %fp{i} = getelementptr {struct_t}, {struct_t}* %s, i32 0, i32 {i}")
                         tramp_lines.append(f"  %v{i} = load {pt}, {pt}* %fp{i}")
                         call_arg_strs.append(f"{pt} %v{i}")
-                    tramp_lines.append(f"  call {ret_ir} @{fn_name}({', '.join(call_arg_strs)})")
+                    # BUGFIX (bugs.log #1): call the actual emitted symbol
+                    # (fn_def.name), which differs from fn_name only when the
+                    # task function's name collided with a reserved C symbol.
+                    call_target = fn_def.name if fn_def else fn_name
+                    tramp_lines.append(f"  call {ret_ir} @{call_target}({', '.join(call_arg_strs)})")
                     tramp_lines.append(f"  call void @free(i8* %_arg)")
                 else:
-                    tramp_lines.append(f"  call {ret_ir} @{fn_name}()")
+                    call_target = fn_def.name if fn_def else fn_name
+                    tramp_lines.append(f"  call {ret_ir} @{call_target}()")
                 tramp_lines += ["  ret i8* null", "}", ""]
                 self._pending_trampolines += tramp_lines
                 self.functions[tramp] = FnDef(tramp, [], None, [])
@@ -2494,13 +2691,26 @@ class CodeGen:
             target_name = f"main_{node.name}"
         
         if target_name in self.functions:
+            # FEATURE: inside a class method, only the class's own methods
+            # (already handled above, before this point) are callable —
+            # top-level functions are treated as if they don't exist, unless
+            # passed in as a parameter (which resolves as a local, not here).
+            if self.cur_class:
+                raise RubidiumNameError(
+                    f"Class '{self.cur_class}' cannot call function '{node.name}': "
+                    f"functions outside the class are not accessible from inside it "
+                    f"(pass it in as a parameter instead)"
+                )
             args_ir = []
             for a in node.args:
                 v, t = self.emit_expr(a); args_ir.append(f"{t} {v}")
             tmp = self.new_tmp()
-            fn_ret = self.functions[target_name].ret_type
+            fn_obj = self.functions[target_name]
+            fn_ret = fn_obj.ret_type
             ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else "i64"
-            self.emit(f"  {tmp} = call {ret_ir} @{target_name}({', '.join(args_ir)})")
+            # BUGFIX (bugs.log #1): call fn_obj.name, the actual emitted symbol,
+            # which differs from target_name only for reserved-C-symbol collisions.
+            self.emit(f"  {tmp} = call {ret_ir} @{fn_obj.name}({', '.join(args_ir)})")
             return tmp, ret_ir
 
         # 4. PRIORITY 4: Dynamic Collection Access
@@ -2990,9 +3200,11 @@ class CodeGen:
                 for a in node.args:
                     v, t = self.emit_expr(a); args_ir.append(f"{t} {v}")
                 tmp = self.new_tmp()
-                fn_ret = self.functions[target_name].ret_type
+                fn_obj = self.functions[target_name]
+                fn_ret = fn_obj.ret_type
                 ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else "i64"
-                self.emit(f"  {tmp} = call {ret_ir} @{target_name}({', '.join(args_ir)})")
+                # BUGFIX (bugs.log #1): call the real emitted symbol (fn_obj.name).
+                self.emit(f"  {tmp} = call {ret_ir} @{fn_obj.name}({', '.join(args_ir)})")
                 return tmp, ret_ir
 
             # FFI bindings: c_lib.my_c_func -> method name alone is the bound symbol
@@ -3009,7 +3221,9 @@ class CodeGen:
                 tmp = self.new_tmp()
                 fn_ret = fn_def.ret_type
                 ret_ir = self._ffi_type_to_ir(fn_ret) if fn_ret else "i64"
-                self.emit(f"  {tmp} = call {ret_ir} @{node.method}({', '.join(args_ir)})")
+                # BUGFIX (bugs.log #1): call fn_def.name (the safe emitted symbol),
+                # not node.method (the raw, possibly-colliding native symbol name).
+                self.emit(f"  {tmp} = call {ret_ir} @{fn_def.name}({', '.join(args_ir)})")
                 return tmp, ret_ir
 
         # 4.5 Handle namespace.var.method() - e.g., wrap.glfw.glfwInit()
@@ -3023,9 +3237,10 @@ class CodeGen:
                     for a in node.args:
                         v, t = self.emit_expr(a); args_ir.append(f"{t} {v}")
                     tmp = self.new_tmp()
-                    fn_ret = self.functions[target].ret_type
+                    fn_obj = self.functions[target]
+                    fn_ret = fn_obj.ret_type
                     ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else "i64"
-                    self.emit(f"  {tmp} = call {ret_ir} @{target}({', '.join(args_ir)})")
+                    self.emit(f"  {tmp} = call {ret_ir} @{fn_obj.name}({', '.join(args_ir)})")
                     return tmp, ret_ir
 
         # 4b. Object is a known import alias but the prefixed function wasn't registered.
@@ -3129,9 +3344,10 @@ class CodeGen:
             for a in node.args:
                 v, t = self.emit_expr(a); args_ir.append(f"{t} {v}")
             tmp = self.new_tmp()
-            fn_ret = self.functions[target_name].ret_type
+            fn_obj = self.functions[target_name]
+            fn_ret = fn_obj.ret_type
             ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else "i64"
-            self.emit(f"  {tmp} = call {ret_ir} @{target_name}({', '.join(args_ir)})")
+            self.emit(f"  {tmp} = call {ret_ir} @{fn_obj.name}({', '.join(args_ir)})")
             return tmp, ret_ir
         from rub_ast import FnCall as _FnCall
         return self.emit_call_expr(_FnCall(target_name, node.args))
@@ -3423,7 +3639,7 @@ class CodeGen:
                 self.emit(f"  {tmp} = call double @_rubidium_pow(double {r_d}, double {inv})")
                 return tmp, "double"
         else:
-            instr = {"+":"fadd","-":"fsub","*":"fmul","/":"fdiv"}.get(node.op)
+            instr = {"+":"fadd","-":"fsub","*":"fmul","/":"fdiv","%":"frem"}.get(node.op)
             if instr:
                 self.emit(f"  {tmp} = {instr} double {l}, {r}")
                 return tmp, "double"

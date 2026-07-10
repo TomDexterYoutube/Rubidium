@@ -1,8 +1,12 @@
-# -----------------------------------------
+# =========================================
+# =========================================
 # Rubidium Programming Language Reference
 # File extension: .rub
 # Designed for beginners. Built to scale into real systems programming.
-# -----------------------------------------
+# =========================================
+# =========================================
+
+
 
 # =========================================
 # EXECUTION MODEL
@@ -46,152 +50,17 @@ fn main() {
 # =========================================
 
 # Rubidium is designed around simplicity,
-
 # predictability, and explicit behavior.
-
-#
-
 # Many modern languages use garbage collection,
-
 # ownership systems, reference counting,
-
 # borrow checking, or other hidden mechanisms.
-
-#
-
 # Rubidium instead favors rules that are
-
 # visible and easy to reason about.
 
-# -----------------------------------------
-# GLOBAL BY DEFAULT
-# -----------------------------------------
-
-# Variables created normally are placed into
-
-# the global memory pool.
-
-let score = 100
-
-# Global variables can be accessed anywhere.
-
-# Local variables must be declared explicitly.
-
-let local temp = 100
-
-# Local variables never enter the global pool
-
-# and are automatically dropped when their
-
-# scope ends.
-
-# -----------------------------------------
-# ASSIGNMENT ALWAYS COPIES
-# -----------------------------------------
-
-# Assigning one value to another creates a
-
-# complete deep copy.
-
-let a = [1, 2, 3]
-let b = a
-
-# a and b are completely independent.
-
-# Rubidium does not use references,
-
-# borrowing, or shared ownership.
-
-# -----------------------------------------
-# MANUAL MEMORY MANAGEMENT
-# -----------------------------------------
-
-# Memory is never freed automatically except
-
-# for special scoped values.
-
-# Normal variables remain alive until .drop()
-
-# is called.
-
-let data = [1, 2, 3]
-data.drop()
-
-# -----------------------------------------
-# PREDICTABILITY OVER OPTIMIZATION
-# -----------------------------------------
-
 # Rubidium favors behavior that is easy to
-
-# understand over behavior that is heavily
-
-# optimized.
-
+# understand over behavior that is heavily optimized.
 # The language intentionally prioritizes
-
-# clarity and consistency over maximum
-
-# performance.
-
-# -----------------------------------------
-# NULL BEHAVIOR
-# -----------------------------------------
-
-# Null is a valid value for every type.
-
-let value: i32 = Null
-
-# Null is considered smaller than every
-
-# non-null value.
-
-# Conceptually, Null behaves like negative
-
-# infinity.
-
-Null < 0         # True
-Null < -999999   # True
-Null == Null     # True
-
-# =========================================
-# VARIABLES
-# =========================================
-
-# Declare with 'let'. Type is optional — Rubidium infers it.
-
-let x = 10
-let name = "Rubidium"
-let flag = True
-
-# Use 'mut' if you need to reassign the variable later.
-
-let mut counter = 0
-counter = 5
-
-# Trying to reassign a non-mut variable is a compile error.
-
-let a = 10
-a = 20   # ERROR: a is not mutable
-
-
-# -----------------------------------------
-# VARIABLES OVERWRITE RULE
-# ----------------------------------------- 
-
-# If you declare a varable
-let mut x: i32 = 10
-
-# Then you can edit it since its mut
-
-x = 15
-
-# But you dont use let to change it
-# IF you use let
-
-let x = "Hi"
-
-# And a varable with that name already exits then it drops it and recreates it
-
+# clarity and consistency over maximum performance.
 
 # =========================================
 # DATA TYPES
@@ -223,14 +92,107 @@ let d: bool = True
 let e: i32  = Null
 let f: Any  = "I can be anything!"
 
-# Any can be used when you don't know the type in advance, for functions and return types and such
-# Strings are also indexable
+# Any can be used when you don't know the type in advance, for functions, return types and such
 
-let str: str = "Hello, World!"
+# =========================================
+# GLOBAL BY DEFAULT
+# =========================================
 
-for i in str.len() {
-    print(str.char(i))
+# Variables created normally are placed into the global memory pool.
+
+let score = 100
+
+# Global variables can be accessed anywhere.
+# Local variables must be declared explicitly.
+
+let local temp = 100
+
+# Local variables never enter the global pool
+# and are automatically dropped when their scope ends.
+
+# =========================================
+# THE DEEP COPY RULE
+# =========================================
+
+# Assigning one value to another creates a complete deep copy.
+
+let mut a = [1, 2, 3]
+let mut b = a
+
+# a and b are completely independent.
+# Rubidium does not use references,
+# borrowing, or shared ownership.
+
+# =========================================
+# NULL BEHAVIOR
+# =========================================
+
+# Null is a valid value for every type.
+
+let value: i32 = Null
+
+# Null is considered smaller than every non-null value.
+# Conceptually, Null behaves like negative infinity.
+
+Null < 0         # True
+Null < -999999   # True
+Null == Null     # True
+
+# =========================================
+# VARIABLES
+# =========================================
+
+# Declare with 'let'. Type is optional — Rubidium infers it.
+
+let x = 10
+let name = "Rubidium"
+let flag = True
+
+# Use 'mut' if you need to reassign the variable later.
+
+let mut counter = 0
+counter = 5
+
+# Trying to reassign a non-mut variable is a compile error.
+
+let a = 10
+a = 20   # ERROR: a is not mutable
+
+# =========================================
+# THE VARIABLE OVERWRITE RULE
+# =========================================
+
+# If you declare a variable
+let mut x: i32 = 10
+
+# Then you can edit it since its mut
+
+x = 15
+
+# But you don't use let to change it
+# IF you use let
+
+let x = "Hi"
+
+# And a variable with that name already exits then it drops it
+# Then recreates it as a new variable
+
+# =========================================
+# SCOPE
+# =========================================
+
+# The different scopes can have slightly different rules
+
+while True {
+    let local num = 10
+    break
 }
+
+# When the loop ends the local is dropped that is Ture for
+# For loops
+# Functions
+# While loop
+# And if loops
 
 # =========================================
 # TYPE CASTING
@@ -254,21 +216,6 @@ let f: f64 = 100 as f64
 # val = "hello"   # ERROR: wrong type
 
 # =========================================
-# DEEP COPY RULE
-# =========================================
-
-# Every assignment creates a full deep copy.
-# There is no borrowing or sharing of values.
-
-let a = [1, 2, 3]
-let b = a
-
-b(0).set(999)
-
-print(a)   # [1, 2, 3]  — a is unchanged
-print(b)   # [999, 2, 3]
-
-# =========================================
 # MATH
 # =========================================
 
@@ -279,6 +226,7 @@ print(b)   # [999, 2, 3]
 #   /   division
 #   **  power
 #   */  root
+#   %   remainder
 
 let a = 10 + 5       # 15
 let b = 10 - 5       # 5
@@ -286,6 +234,7 @@ let c = 10 * 5       # 50
 let d = 10 / 5       # 2
 let e = 2 ** 3       # 8
 let f = 2 */ 16      # 4
+let g = 2 % 10 # Max come back to this later
 
 # Standard BODMAS precedence applies.
 
@@ -381,7 +330,6 @@ print(text)
 # Output:
 # Jello
 
-
 # value must be a single character string.
 
 text.set(4, "!")
@@ -390,7 +338,6 @@ print(text)
 
 # Output:
 # Hell!
-
 
 # Insert text before an index.
 
@@ -464,12 +411,12 @@ print(text.len())
 
 # SY type is like a string but can be used in code
 
-let varable_name: SY = 'New varable'
-let (varable_name): str = "Hello I'm a varable"
+let variable_name: SY = 'New variable'
+let (variable_name): str = "Hello I'm a variable"
 
 let function_name: SY = 'New function'
 
-fn (function_name) {
+fn (function_name)() {
     print("I'm a new Function")
 }
 
@@ -513,7 +460,7 @@ my_list(0).set("changed")
 
 my_list().add("new_item")
 
-# when a list is printed it shows text in "" and everthing else as is 
+# when a list is printed it shows text in "" and everything else as is
 let my_list = "Hello".slice() + [1, 2, 3]
 print(my_list) # ["H", "e", "l", "l", "o", 1, 2, 3]
 
@@ -621,9 +568,9 @@ let user: str = input("Enter your name: ")
 open("data.txt") as file {
 
     file.write("Hello")        # overwrite entire file
-    file.add(" World")      # add to end of file
+    file.add(" World")         # add to end of file
 
-    let data = file.read()     # read entire file
+    let data = file.read()     # read entire file (would be the str+ type)
     print(data)
 
     let line = file.readln(3)  # read a specific line
@@ -632,15 +579,16 @@ open("data.txt") as file {
     file.writeln(2, "Updated") # overwrite a specific line
 }
 
+# Line indexing starts at 0
 # Iterate over a file line by line:
 
 open("data.txt") as file {
-
     for line in file {
         print(line)
     }
 }
 
+# If the file does not exist then open will give a error make the file then continue
 # File utility functions (used outside of open blocks):
 
 file.exists("data.txt")              # returns bool
@@ -648,17 +596,14 @@ file.new("data.txt")                 # create a new file
 file.delete("old.txt")               # delete a file
 file.rename("old.txt", "new.txt")    # rename a file
 file.copy("save.txt", "backup.txt")  # copy a file
+file.list("data/")                   # used like linux ls command
 
 # File errors can be caught with try/error:
 
 try {
-
     open("missing.txt") as file {
         print(file.read())
-    }
-
-} error {
-
+    } error {
     print("File error: " + error)
 }
 
@@ -676,8 +621,8 @@ val.drop()
 let mut items: list = [1, 2, 3]
 items.drop()
 
-# You can remove a spesific varble in a collection 
-# It removes it and shifts the structer it DOES NOT replace it with Null
+# You can remove a specific variable in a collection
+# It removes it and shifts the structure it DOES NOT replace it with Null
 
 items(1).drop()
 
@@ -695,6 +640,8 @@ if x == 7 {
     print("something else")
 }
 
+# The else must be on the } end of the if or other else
+
 # =========================================
 # LOOPS
 # =========================================
@@ -708,9 +655,9 @@ while count < 5 {
     count = count + 1
 }
 
-# -----------------------------------------
+# =========================================
 # RANGE LOOP
-# -----------------------------------------
+# =========================================
 
 # range(start, end) — end is exclusive.
 
@@ -739,9 +686,9 @@ for banana in range(1, 10) {
 
 # Loop indexing starts at 0
 
-# -----------------------------------------
+# =========================================
 # COLLECTION ITERATION
-# -----------------------------------------
+# =========================================
 
 # Lists, indexes, dicts, and files can be
 # used directly in for loops.
@@ -806,29 +753,21 @@ open("data.txt") as file {
     }
 }
 
-# -----------------------------------------
+# =========================================
 # BREAK & CONTINUE
-# -----------------------------------------
+# =========================================
 
 # break exits the loop immediately.
 
 for i in range(1, 10) {
-
-    if i == 5 {
-        break
-    }
-
+    if i == 5 {break}
     print(i)
 }
 
 # continue skips the current iteration.
 
 for i in range(1, 10) {
-
-    if i == 5 {
-        continue
-    }
-
+    if i == 5 {continue}
     print(i)
 }
 
@@ -841,7 +780,6 @@ for i in range(1, 10) {
 # Function parameters are local to the function
 # and are automatically dropped when the function returns.
 
-# Imported files are isolated through namespaces.
 # Basic function:
 
 fn greet() {
@@ -863,12 +801,12 @@ fn log(msg: str) {
     print(i"[LOG] {msg}")
 }
 
-# -----------------------------------------
+# =========================================
 # The Link Rule
-# -----------------------------------------
+# =========================================
 
-# Say you have a varable that is a local val and it is large
-# And you want another function to use it but you dont want to deep copy the large value
+# Say you have a variable that is a local val and it is large
+# And you want another function to use it but you don't want to deep copy the large value
 # Then use link
 
 fn stuff(val: Any) -> Any {
@@ -879,22 +817,36 @@ fn main() {
     stuff(link large_list)
 }
 
-# This would let the function stuff access the local varable without a deep copy
-# Both functions are now using the same varable both have full access if it is mut both can edit it
+# This would let the function stuff access the local variable without a deep copy
+# Both functions are now using the same variable both have full access if it is mut both can edit it
+
+# If you love pain (rust) then you can use link for variables
+
+let a = 10
+
+let b = link a
+
+# Now if a changes then b will change but if b changes without a then they become unlinked
+# then become there own variable in memory this also works for lists
+
+let x = [1, 2, 3]
+let y = link x(2)
+
+# or
+
+let x = [1, 2, 3]
+let y = link x
 
 # =========================================
 # ERROR HANDLING
 # =========================================
 
 # Use try/error to catch runtime errors.
-# The error variable holds the error message as a string.
+# The error variable holds the error message as a str+.
 
 try {
-
     let bad: i32 = 10 / 0
-
 } error {
-
     print("Error: " + error)
 }
 
@@ -910,8 +862,8 @@ try {
 
 class player() {
 
-    let mut health: i32 = 100
-    let mut name: str   = "unnamed"
+    let mut health: i32  = 100
+    let mut name: str    = "unnamed"
     let mut scores: list = [0, 0, 0]
 
     fn greet() {
@@ -981,7 +933,6 @@ obj.value = 99   # ERROR: value is not declared mut
 
 # Class instances do not store their fields
 # in the global memory pool.
-
 # Each instance owns its own data.
 
 let mut a = player()
@@ -1001,6 +952,8 @@ b.health = 10
 
 print(a.health) # 100
 print(b.health) # 10
+
+# Classes can not access global memory unless link is used or passed through
 
 # =========================================
 # THREADING
@@ -1125,26 +1078,16 @@ fn add() {
 # -----------------------------------------
 
 # When a thread finishes:
-
-#
-
 # - Function parameters are dropped
-
 # - Local variables are dropped
-
 # - Loop variables are dropped
-
-#
-
-# Global variables remain alive.
+# - Global variables remain alive.
 
 # -----------------------------------------
 # THREAD MEMORY MODEL
 # -----------------------------------------
 
 # Variable Type       Shared?
-
-#
 
 # Global Variable     Yes
 
@@ -1156,15 +1099,8 @@ fn add() {
 
 # File Handle         No
 
-# Simple rule:
-
-#
-
-# If it is in the global pool, it is shared.
-
-# Otherwise it belongs only to the currently
-
-# executing thread.
+# Simple rule: If it is in the global pool, it is shared.
+# Otherwise it belongs only to the currently executing thread.
 
 # =========================================
 # RANDOM
@@ -1273,40 +1209,31 @@ use FFI
 
 let ffi_lib = FFI("libs/mylib.so")
 
-
 # Bind the foreign symbol.
 
 fn ffi_lib my_c_function(msg: str) -> i32 as my_function
 
-
 # Call using the Rubidium name.
 
 my_function("hello from Rubidium")
-
-
 
 # -----------------------------------------
 # FFI FUNCTION RENAMING
 # -----------------------------------------
 
 # External libraries often have ugly names:
-#
+
 # calculate_vector3_fast()
 # rb_internal_math_v2()
 # _ZN12SomethingFoo...
-#
-# Rubidium can expose cleaner names.
 
+# Rubidium can expose cleaner names.
 
 let math_lib = FFI("libs/math.so")
 
-
 fn math_lib rb_sin(x: f64) -> f64 as sin
 
-
 print(sin(0.5))
-
-
 
 # -----------------------------------------
 # FFI WRAPPERS
@@ -1315,12 +1242,8 @@ print(sin(0.5))
 # Foreign functions can be wrapped normally.
 
 fn sqrt(value: f64) -> f64 {
-
     return math_lib.sqrt(value)
-
 }
-
-
 
 # -----------------------------------------
 # IMPORTING FFI WRAPPERS
@@ -1330,18 +1253,13 @@ fn sqrt(value: f64) -> f64 {
 
 let native = FFI("libs/math.so")
 
-
 fn native native_sin(x: f64) -> f64 as sin
 
-
 fn native_sqrt(x: f64) -> f64 as sqrt
-
-
 
 # another_file.rub
 
 import math_tools as mt
-
 
 mt.sin(1.0)
 mt.sqrt(25.0)
@@ -1350,6 +1268,7 @@ mt.sqrt(25.0)
 # MODULES & IMPORTS
 # =========================================
 
+# Imported files are isolated through namespaces.
 # 'use' enables built-in compiler-provided modules.
 # A module that is not declared with 'use' cannot be accessed.
 
@@ -1376,11 +1295,9 @@ import math_tools as mt
 
 mt.sin(0.5)
 
-
 # The original namespace still exists.
 
 math_tools.sin(0.5)
-
 
 # Alias names only affect access.
 # They do not copy or duplicate the module.
@@ -1396,20 +1313,35 @@ fn main() {
     print("Welcome to Rubidium!")
 }
 
+
+
 # =========================================
-# PACKAGES
+# XEON
 # =========================================
 
-# If you install Rubidium from the offical manager (xeon)
-# Then you can use pakages
+# Xeon is the Rubidium manager and can do extra stuff
+
+# -----------------------------------------
+# XEON PACKAGES
+# -----------------------------------------
+
+# If you install Rubidium from the official manager (Xeon)
+# Then you can use packages
 
 xeon math_tools
 
 print(math_tools.pi)
 
-# Packages are the same as import even tho they work diffrent 
-# You can use xeon to download a large amount of diffrent packages
-# If you want to learn more use the command xeon pkg help
+# Packages are the same as import even tho they work different
+# You can use Xeon to download a large amount of different packages
+# If you want to learn more use the command Xeon pkg help
+
+# -----------------------------------------
+# XEON LIB COMPILE
+# -----------------------------------------
+
+# With Xeon you can compile Rubidium code without a entry and use as a lib
+# The only different rules are that there is no top level and no main()
 
 # =========================================
 # NOTES
@@ -1474,7 +1406,6 @@ print(math_tools.pi)
 #   - Assignment without let modifies an existing variable
 #   - Attempting to assign to a variable that does not exist causes a compile error
 #   - let cannot be used to modify an existing variable
-#   - Creating a duplicate variable in the same scope causes a compile error
 
 # Mutability:
 #   - Variables are immutable by default
