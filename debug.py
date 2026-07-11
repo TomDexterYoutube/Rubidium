@@ -819,6 +819,24 @@ class Debugger:
                                 self.error(f"'.set()' index error on '{fname}': {e}")
                         return None
 
+        # ── Special case: .add(val) on a dict key whose value is currently
+        # Null (e.g. my_dict().add("new_key") then my_dict("new_key").add(99)).
+        # Per spec/compiler behavior, adding to a Null-valued slot replaces
+        # it with a new single-element list, matching the "[Null].add(5) →
+        # [5]" collection rule. Must run before the generic obj=None check
+        # below, since a Null slot evaluates to None and would otherwise be
+        # rejected as "method called on None".
+        if method == "add" and isinstance(node.obj, ast.FnCall):
+            fname = node.obj.name if isinstance(node.obj.name, str) else None
+            if fname:
+                info = self.scope.lookup(fname)
+                if info is not None and isinstance(info.get("value"), dict):
+                    idx_args = [self.evaluate(a) for a in node.obj.args]
+                    col = info["value"]
+                    if len(idx_args) == 1 and idx_args[0] in col and col[idx_args[0]] is None:
+                        col[idx_args[0]] = [args[0]] if args else []
+                        return None
+
         obj    = self.evaluate(node.obj)
         if obj is None:
             self.error(f"Method '.{method}()' called on None — object may be undefined or dropped")
@@ -931,10 +949,11 @@ class Debugger:
             if method == "add":
                 if len(args) == 1:
                     # dict().add("key") — creates a new top-level key.
-                    # Per spec the key's value starts as Null (empty collection).
-                    # We use [] so subsequent dict(key).add(val) calls work
-                    # (list is mutable in-place; None is not).
-                    obj[args[0]] = []
+                    # Per spec the key's value starts as Null. The paired
+                    # _eval_method_call special-case above upgrades it to a
+                    # list the first time something is added to it, so we
+                    # don't need a placeholder [] here anymore (bugs.log #3).
+                    obj[args[0]] = None
                 elif len(args) >= 2:
                     obj[args[0]] = args[1]
                 return None
@@ -1204,6 +1223,15 @@ class Analyzer:
         if 'Null' in (expected, received):
             return True
         if expected in NUMERIC_TYPES and received in NUMERIC_TYPES:
+            return True
+        # BUGFIX (bugs.log #3): str+ is spec'd as "the same as str but it
+        # uses 3 \" on each side and can use more than 1 line" — it's not a
+        # distinct data type, just a literal-syntax variant. A `let x: str+`
+        # declaration is satisfied by an ordinary str-typed value/literal
+        # (this is exactly the syntax file's own str+ example), so treat
+        # str and str+ as compatible in both directions instead of flagging
+        # a false-positive Type Error that would block valid code.
+        if {expected, received} == {'str', 'str+'}:
             return True
         return False
 

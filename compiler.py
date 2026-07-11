@@ -169,6 +169,19 @@ void rub_throw(const char* msg) {
     exit(1);
 }
 
+// BUGFIX (bugs.log #4): Integer Overflow section of the syntax file requires
+// overflow to clamp to the type's min/max AND report a runtime error, but
+// WITHOUT stopping execution (unlike rub_throw above, which exits). Clamping
+// itself happens inline in the generated IR (select instructions in
+// CodeGen.coerce); this just reports the non-fatal warning when told an
+// overflow occurred, then returns normally so the clamped value keeps flowing.
+void rub_overflow_check(int overflowed, const char* type_name) {
+    if (overflowed) {
+        fprintf(stderr, "Runtime Warning: integer overflow — value clamped to %s range\n", type_name);
+        fflush(stderr);
+    }
+}
+
 void print_int_or_null(long long v) {
     if (v == -2147483648LL) { printf("Null\n"); } else { printf("%lld\n", v); }
     fflush(stdout);
@@ -831,14 +844,17 @@ long long file_open(long long slot, const char* path, int mode) {
     _file_paths[slot] = strdup(path);
     if(mode == 1) {
         _file_handles[slot] = fopen(path, "w");
-    } else {
-        // open() as — the file must already exist; use file.new()/file.write()
-        // to create one. No auto-create "touch" here (that silently defeated
-        // the spec's missing-file try/error example).
-        _file_handles[slot] = fopen(path, "r+");
-        if (!_file_handles[slot]) return -1;
+        return _file_handles[slot] ? slot : -1;
     }
-    return slot;
+    // open() as — per syntax file: "If the file does not exist then open
+    // will give a error make the file then continue". So a missing file is
+    // reported (caller decides catchable-vs-silent based on try/error
+    // context) but the file is still created and the block still runs.
+    _file_handles[slot] = fopen(path, "r+");
+    if (_file_handles[slot]) return slot;          // already existed
+    _file_handles[slot] = fopen(path, "w+");       // create + open r/w
+    if (_file_handles[slot]) return -2;            // missing, now created
+    return -1;                                     // truly unrecoverable (e.g. bad path)
 }
 
 // Close a file handle

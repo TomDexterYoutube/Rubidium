@@ -47,6 +47,7 @@ declare %Box* @collection_get_at(%Box*, i32)
 declare void @box_drop(%Box*)
 declare void @collection_drop(%Box*, %Box*)
 declare void @rub_throw(i8*)
+declare void @rub_overflow_check(i32, i8*)
 declare %Box* @box_add(%Box*, %Box*)
 declare %Box* @box_copy(%Box*)
 declare i1 @collection_has(%Box*, %Box*)
@@ -97,6 +98,7 @@ class CodeGen:
         self.functions    = {}
         self.loop_end_stack = []
         self.loop_cond_stack = []  # continue target labels
+        self.linked_to = {}  # bugs.log #5: name -> target name for scalar `link` aliasing
         self.cur_class    = None
         self._alloca_emitted = set()  # local var names that already have an alloca in current fn
         self._try_error_label = None  # set while inside a try body for div-by-zero guards
@@ -219,6 +221,20 @@ class CodeGen:
     _INT_IR_SET  = {"i1", "i32", "i64", "i128", "i256", "i512", "i1024", "i2048"}
     _FLOAT_IR_SET = {"float", "double", "fp128"}
 
+    # BUGFIX (bugs.log #4): bit widths for each signed integer IR type, used to
+    # compute the min/max representable value so narrowing conversions can be
+    # clamped (per syntax file's "Integer Overflow" section) instead of being
+    # silently truncated. i1 (bool) is excluded — it has no overflow concept.
+    _INT_BITS = {"i32": 32, "i64": 64, "i128": 128,
+                 "i256": 256, "i512": 512, "i1024": 1024, "i2048": 2048}
+
+    def _int_bounds(self, ir_type):
+        """Return (min, max) representable signed values for an integer IR type."""
+        bits = self._INT_BITS[ir_type]
+        max_v = (1 << (bits - 1)) - 1
+        min_v = -(1 << (bits - 1))
+        return min_v, max_v
+
     def rubi_type_to_ir(self, t):
         if t in ("list", "index", "dict", "Any"): return "%Box*"
         if t == "bool":  return "i1"
@@ -263,6 +279,38 @@ class CodeGen:
         self.global_decls.append(f'{lbl} = private unnamed_addr constant [{byte_len} x i8] c"{escaped}"')
         return lbl, byte_len
 
+    def _unlink_var(self, name):
+        """BUGFIX (bugs.log #5): give a variable that was `link`-aliased its own
+        independent storage, the moment it's reassigned directly (per spec:
+        "if b changes without a then they become unlinked ... then become
+        their own variable in memory"). Returns (ptr_str, ir_t) for the now-
+        independent storage, ready for a normal store."""
+        del self.linked_to[name]
+        ir_t = None
+        for scope in reversed(self.local_vars_stack):
+            if name in scope:
+                ir_t = scope[name]; break
+        if ir_t is not None:
+            ptr_str = f"%ptr_{name}"
+            if name not in self._alloca_emitted:
+                self.emit(f"  {ptr_str} = alloca {ir_t}")
+                self._alloca_emitted.add(name)
+            return ptr_str, ir_t
+        # Global scope — emit the `@name = global ...` decl directly (can't
+        # use declare_global(), which no-ops because we already registered
+        # the name's type in self.global_vars when the link was created).
+        ir_t = self.global_vars[name]
+        if not any(d.startswith(f"@{name} =") for d in self.global_decls):
+            if ir_t.endswith("*"):
+                self.global_decls.append(f"@{name} = global {ir_t} null")
+            elif ir_t == "fp128":
+                self.global_decls.append(f"@{name} = global {ir_t} 0xL00000000000000000000000000000000")
+            elif ir_t in ("float", "double"):
+                self.global_decls.append(f"@{name} = global {ir_t} 0.0")
+            else:
+                self.global_decls.append(f"@{name} = global {ir_t} 0")
+        return f"@{name}", ir_t
+
     def declare_global(self, name, ir_type):
         if name in self.global_vars: return
         # Mangle names that conflict with C library functions
@@ -283,6 +331,18 @@ class CodeGen:
             self.global_decls.append(f"@{ir_name} = global {ir_type} 0")
 
     def get_var_ptr(self, name):
+        # BUGFIX (bugs.log #5): scalar variable-level `link` (e.g. `let b = link a`)
+        # previously fell through LinkArg's no-op passthrough in emit_expr, which
+        # only gives real shared-reference behavior for %Box* collections (already
+        # pointers) — for scalars it just copied the current value once, so `b`
+        # never reflected later changes to `a`. VarDecl now registers linked scalar
+        # names in self.linked_to instead of giving them their own storage; any
+        # lookup of a linked name transparently resolves to its target's real
+        # pointer here, so reads always see the target's live value. Assign
+        # handles "unlinking" (see emit_stmt's Assign branch) by giving the name
+        # its own storage the moment it's reassigned directly.
+        if name in self.linked_to:
+            return self.get_var_ptr(self.linked_to[name])
         if "." in name:
             mangled = name.replace(".", "_")
             if mangled in self.global_vars:
@@ -368,8 +428,20 @@ class CodeGen:
                 walk(m.body, cls, seen)
 
     def gen(self, stmts):
+        # BUGFIX (bugs.log #2): top-level functions and classes were being
+        # registered by blindly overwriting self.functions[name] /
+        # self.class_defs[name], so a duplicate `fn foo()` or `class Foo()`
+        # was never caught by Rubidium itself — it silently kept only the
+        # last definition and then (for functions) failed at the LLVM/clang
+        # stage with a raw "invalid redefinition of function" IR error
+        # instead of a proper Rubidium-level compile error. Duplicate
+        # symbol definitions must be a compile-time RubidiumNameError
+        # (per syntax file: "Function names must be unique within a scope",
+        # "Class names must be unique within a scope").
         for s in stmts:
             if isinstance(s, ClassDef):
+                if s.name in self.class_defs:
+                    raise RubidiumNameError(f"Duplicate class definition: '{s.name}'")
                 self.class_defs[s.name] = s
                 for m in s.methods:
                     mangled_name = self.method_ir_name(s.name, m.name)
@@ -384,6 +456,8 @@ class CodeGen:
                 # name (stored on the FnDef object's .name, used by emit_fn and
                 # by call sites via fn_obj.name rather than the dict key).
                 original_name = s.name
+                if original_name in self.functions:
+                    raise RubidiumNameError(f"Duplicate function definition: '{original_name}'")
                 safe_name = self._safe_fn_symbol(original_name)
                 if safe_name != original_name:
                     self._fn_symbol_override[original_name] = safe_name
@@ -919,7 +993,24 @@ class CodeGen:
             return
         if isinstance(node, VarDecl):
             if node.name in self.dropped_vars: self.dropped_vars.discard(node.name)
-            
+
+            # BUGFIX (bugs.log #5): `let [mut] b = link a` for a SCALAR source
+            # (collections already work via shared %Box* pointers, see
+            # _deep_copy_if_var). Register b as an alias of a instead of giving
+            # it its own storage, so get_var_ptr("b") transparently resolves to
+            # a's real pointer and every future read of b sees a's live value.
+            if isinstance(node.value, LinkArg) and isinstance(node.value.expr, Var):
+                target_name = node.value.expr.name
+                target_t = self._infer_type(node.value.expr)
+                if target_t != "%Box*":
+                    if node.is_local or (self.cur_fn is not None and self.cur_fn != "_rubidium_init"):
+                        self.local_vars_stack[-1][node.name] = target_t
+                    else:
+                        self.global_vars[node.name] = target_t
+                    if node.mutable: self.mutable_vars.add(node.name)
+                    self.linked_to[node.name] = target_name
+                    return False
+
             is_class = False
             cn = ""
             is_class_copy_src = None  # set when source is an existing instance var
@@ -1070,7 +1161,10 @@ class CodeGen:
             elif node.name in self.instances: pass
             else:
                 if node.name not in self.mutable_vars: raise RubidiumTypeError(f"Immutable '{node.name}'")
-                ptr_str, ir_t = self.get_var_ptr(node.name)
+                if node.name in self.linked_to:
+                    ptr_str, ir_t = self._unlink_var(node.name)
+                else:
+                    ptr_str, ir_t = self.get_var_ptr(node.name)
                 val, val_t = self.emit_expr(node.value)
                 val = self.coerce(val, val_t, ir_t)
                 val = self._deep_copy_if_var(val, val_t, node.value)
@@ -1833,7 +1927,7 @@ class CodeGen:
             self.emit(f"  br label %{cond_l}\n{cond_l}:")
             cur, cur_lt, cur_gt, cond = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
             self.emit(f"  {cur} = load i64, i64* {ctr_ptr}")
-            self.emit(f"  {cur_lt} = icmp sle i64 {cur}, {ev}")
+            self.emit(f"  {cur_lt} = icmp slt i64 {cur}, {ev}")
             self.emit(f"  {cur_gt} = icmp sgt i64 {cur}, {ev}")
             self.emit(f"  {cond} = select i1 {is_up}, i1 {cur_lt}, i1 {cur_gt}")
             self.emit(f"  br i1 {cond}, label %{body_l}, label %{end_l}\n{body_l}:")
@@ -3820,8 +3914,32 @@ class CodeGen:
             fr = self._TYPE_RANK.get(from_t, 2)
             tr = self._TYPE_RANK.get(to_t, 2)
             if fr == tr: return val
-            if fr > tr:  # narrowing → trunc
-                self.emit(f"  {tmp} = trunc {from_t} {val} to {to_t}"); return tmp
+            if fr > tr:  # narrowing → clamp + trunc
+                # BUGFIX (bugs.log #4): a raw `trunc` here silently wraps
+                # out-of-range values — and for i32 specifically, a value one
+                # over INT32_MAX truncates to exactly INT32_MIN, which is
+                # also this compiler's Null sentinel, so genuine overflow was
+                # being displayed/read back as Null. The syntax file's
+                # "Integer Overflow" section requires clamping to the target
+                # type's min/max and reporting a (non-fatal) runtime warning,
+                # with execution continuing using the clamped value. i1
+                # (bool) has no overflow concept, so it's left as a plain trunc.
+                if to_t == "i1":
+                    self.emit(f"  {tmp} = trunc {from_t} {val} to {to_t}"); return tmp
+                min_v, max_v = self._int_bounds(to_t)
+                gt_max = self.new_tmp(); lt_min = self.new_tmp(); ovf = self.new_tmp()
+                clamped1 = self.new_tmp(); clamped2 = self.new_tmp(); ovf32 = self.new_tmp()
+                tn_lbl, tn_len = self.intern_str(to_t)
+                tn_ptr = self.new_tmp()
+                self.emit(f"  {gt_max} = icmp sgt {from_t} {val}, {max_v}")
+                self.emit(f"  {lt_min} = icmp slt {from_t} {val}, {min_v}")
+                self.emit(f"  {ovf} = or i1 {gt_max}, {lt_min}")
+                self.emit(f"  {clamped1} = select i1 {gt_max}, {from_t} {max_v}, {from_t} {val}")
+                self.emit(f"  {clamped2} = select i1 {lt_min}, {from_t} {min_v}, {from_t} {clamped1}")
+                self.emit(f"  {tn_ptr} = getelementptr [{tn_len} x i8], [{tn_len} x i8]* {tn_lbl}, i64 0, i64 0")
+                self.emit(f"  {ovf32} = zext i1 {ovf} to i32")
+                self.emit(f"  call void @rub_overflow_check(i32 {ovf32}, i8* {tn_ptr})")
+                self.emit(f"  {tmp} = trunc {from_t} {clamped2} to {to_t}"); return tmp
             else:        # widening
                 if from_t == "i1":
                     # bool is unsigned 0/1 — zero-extend (sext would turn
