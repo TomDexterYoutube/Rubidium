@@ -169,6 +169,46 @@ void rub_throw(const char* msg) {
     exit(1);
 }
 
+// BUGFIX/FEATURE (bugs.log #9): backing store for runtime SY reflection.
+// `let (x): dict = {}` inside a loop, where x's value is generated fresh
+// each iteration (e.g. via concatenation with the loop variable), needs a
+// genuine runtime-keyed store — LLVM globals/allocas must have a name fixed
+// at compile time, so this is implemented as a simple string-keyed map from
+// the actual runtime string to a Box* value. Linear scan is fine for the
+// scale this language's collections are typically used at; can become a
+// real hash table later if this becomes a bottleneck.
+//
+// BUGFIX (bugs.log #11): originally had a fixed RUB_DYNVAR_CAP of 8192 —
+// once full, rub_dynvar_set() silently dropped new entries (no error at
+// insert time), and a LATER lookup for one of those silently-dropped
+// entries would crash the whole program with "undefined dynamic variable".
+// Grows via realloc instead of having any hard cap.
+typedef struct { char* key; Box* value; } RubDynVarEntry;
+static RubDynVarEntry* _rub_dynvars = NULL;
+static int _rub_dynvar_count = 0;
+static int _rub_dynvar_cap = 0;
+
+Box* rub_dynvar_get(const char* key) {
+    for (int i = 0; i < _rub_dynvar_count; i++) {
+        if (strcmp(_rub_dynvars[i].key, key) == 0) return _rub_dynvars[i].value;
+    }
+    rub_throw("undefined dynamic variable");
+    return NULL;
+}
+
+void rub_dynvar_set(const char* key, Box* value) {
+    for (int i = 0; i < _rub_dynvar_count; i++) {
+        if (strcmp(_rub_dynvars[i].key, key) == 0) { _rub_dynvars[i].value = value; return; }
+    }
+    if (_rub_dynvar_count >= _rub_dynvar_cap) {
+        _rub_dynvar_cap = _rub_dynvar_cap ? _rub_dynvar_cap * 2 : 256;
+        _rub_dynvars = (RubDynVarEntry*)realloc(_rub_dynvars, _rub_dynvar_cap * sizeof(RubDynVarEntry));
+    }
+    _rub_dynvars[_rub_dynvar_count].key = strdup(key);
+    _rub_dynvars[_rub_dynvar_count].value = value;
+    _rub_dynvar_count++;
+}
+
 // BUGFIX (bugs.log #4): Integer Overflow section of the syntax file requires
 // overflow to clamp to the type's min/max AND report a runtime error, but
 // WITHOUT stopping execution (unlike rub_throw above, which exits). Clamping
@@ -185,6 +225,46 @@ void rub_overflow_check(int overflowed, const char* type_name) {
 void print_int_or_null(long long v) {
     if (v == -2147483648LL) { printf("Null\n"); } else { printf("%lld\n", v); }
     fflush(stdout);
+}
+
+// BUGFIX/FEATURE (bugs.log #17): print() used to always narrow to i64
+// before printing, so even correctly-computed i128 arithmetic (see the
+// codegen-side promote_type fix) couldn't actually be verified/displayed
+// beyond i64's range. Clang supports __int128 natively; printf's %lld
+// doesn't handle it directly, so convert to decimal manually. Same Null-
+// sentinel convention as print_int_or_null (see bugs.log #4's known
+// collision caveat — a real i128 value that happens to equal the sentinel
+// still prints as "Null", same pre-existing ambiguity, just at this width
+// too). i256+ genuinely printing beyond i64 range would need true bignum
+// string conversion on top of that — out of scope here, still clamps.
+void print_i128_or_null(__int128 v) {
+    if (v == -2147483648LL) { printf("Null\n"); fflush(stdout); return; }
+    char buf[48];
+    int i = 46;
+    buf[47] = '\0';
+    int neg = v < 0;
+    unsigned __int128 uv = neg ? (unsigned __int128)(-v) : (unsigned __int128)v;
+    if (uv == 0) buf[i--] = '0';
+    while (uv > 0) { buf[i--] = '0' + (int)(uv % 10); uv /= 10; }
+    if (neg) buf[i--] = '-';
+    printf("%s\n", &buf[i + 1]);
+    fflush(stdout);
+}
+
+// BUGFIX (bugs.log #17): string-conversion counterpart to print_i128_or_null,
+// for string interpolation (coerce_to_string) rather than direct printing.
+// Returns a malloc'd, null-terminated decimal string.
+char* i128_to_str(__int128 v) {
+    char* out = (char*)malloc(48);
+    int i = 46;
+    out[47] = '\0';
+    int neg = v < 0;
+    unsigned __int128 uv = neg ? (unsigned __int128)(-v) : (unsigned __int128)v;
+    if (uv == 0) out[i--] = '0';
+    while (uv > 0) { out[i--] = '0' + (int)(uv % 10); uv /= 10; }
+    if (neg) out[i--] = '-';
+    memmove(out, &out[i + 1], 47 - i);
+    return out;
 }
 double _rubidium_pow(double base, double exp) { return pow(base, exp); }
 
@@ -1280,6 +1360,8 @@ def compile_files(source_files, output=None, shared_lib=False):
             if isinstance(node, Import) and getattr(node, 'alias', None)
         }, shared_lib=shared_lib)
         ir_code = gen.gen(combined_ast)
+        with open('/tmp/dump.ll', 'w') as _f:
+            _f.write(ir_code)
 
         if output: output_bin = output
         else: output_bin = os.path.splitext(os.path.basename(source_files[0]))[0]

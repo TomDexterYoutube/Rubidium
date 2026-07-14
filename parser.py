@@ -12,6 +12,22 @@ class Parser:
         # (a `let`/`fn` declaration name, or a value/call-target reference)
         # is replaced with the recorded literal at parse time.
         self.sy_table = {}
+        # BUGFIX/FEATURE (bugs.log #9): tracks EVERY name ever declared as
+        # `SY` type, whether its value is a literal (also in sy_table) or a
+        # computed/concatenated expression (only trackable here, since its
+        # actual value isn't known until runtime). Variable-side reflection
+        # (`let (x): T = ...` and later `x(...)` access) always routes through
+        # this dynamic set now; sy_table is kept only for the still-static
+        # `fn (name)() {...}` function-reflection case.
+        self.sy_names = set()
+        # BUGFIX/FEATURE (bugs.log #9): `(name)(...)` is used for BOTH calling
+        # a reflected function (fn_def()'s static path — needs a compile-time
+        # resolvable target) and accessing a reflected variable (the new
+        # dynamic path). Same syntax, different meaning — disambiguated by
+        # tracking which holder names were actually used in a `fn (name)()`
+        # definition; those keep going through the old static substitution,
+        # everything else in sy_names goes through the new dynamic path.
+        self.sy_fn_names = set()
 
     def peek(self):
         return self.tokens[self.pos] if self.pos < len(self.tokens) else None
@@ -48,6 +64,23 @@ class Parser:
             if safe and safe[0].isdigit():
                 safe = "_" + safe
             return safe or "_sy_empty"
+        return None
+
+    def _check_sy_dynamic_name(self):
+        """BUGFIX/FEATURE (bugs.log #9): if the parser is sitting on
+        `( IDENT )` where IDENT is a known SY-typed variable (self.sy_names),
+        consume the three tokens and return the raw IDENT (not a substituted
+        literal — the actual value is only known at runtime). Otherwise
+        leaves the token stream untouched and returns None."""
+        if (self.peek() and self.peek()[0] == "LPAREN"
+                and self.pos + 2 < len(self.tokens)
+                and self.tokens[self.pos + 1][0] == "IDENT"
+                and self.tokens[self.pos + 1][1] in self.sy_names
+                and self.tokens[self.pos + 1][1] not in self.sy_fn_names
+                and self.tokens[self.pos + 2][0] == "RPAREN"):
+            holder = self.tokens[self.pos + 1][1]
+            self.advance(); self.advance(); self.advance()  # LPAREN, IDENT, RPAREN
+            return holder
         return None
 
     def match(self, kind):
@@ -113,6 +146,13 @@ class Parser:
                         res = ThreadCall(args[0], args[1])
                     elif res.name == "input":
                         res = Input(args[0] if args else None)
+                    elif res.name in self.sy_names and res.name not in self.sy_fn_names:
+                        # BUGFIX/FEATURE (bugs.log #9): statement-level bare
+                        # `tmp(...)` (e.g. `tmp().add("w")` as a full
+                        # statement) goes through THIS function, not
+                        # factor()'s IDENT branch — needs the same dynamic
+                        # SY-reflection routing applied there.
+                        res = FnCall(DynResolve(res.name), args)
                     else:
                         res = FnCall(res.name, args)
                 else:
@@ -154,6 +194,14 @@ class Parser:
         self.match("FN")
         # BUGFIX/FEATURE (bugs.log #2): `fn (function_name) { ... }` — dynamic
         # function name substituted from a previously-declared SY symbol.
+        # BUGFIX (bugs.log #9): record the holder name (before substitution)
+        # so factor() knows this SY name means "reflected function", not
+        # "reflected variable", when it's called later.
+        if (self.peek() and self.peek()[0] == "LPAREN"
+                and self.pos + 2 < len(self.tokens)
+                and self.tokens[self.pos + 1][0] == "IDENT"
+                and self.tokens[self.pos + 1][1] in self.sy_table):
+            self.sy_fn_names.add(self.tokens[self.pos + 1][1])
         sy_name = self._resolve_sy_name()
         name = sy_name if sy_name is not None else self.match("IDENT")
         # FFI binding: fn handle_name symbol_name(params) -> ret  (no body brace)
@@ -280,9 +328,41 @@ class Parser:
         self.match("LET")
         mut = bool(self.match("MUT"))
         is_local = bool(self.match("LOCAL"))
-        # BUGFIX/FEATURE (bugs.log #2): `let (varable_name): str = ...` — the
-        # declared name is dynamically substituted from a previously-declared
-        # SY symbol. Must be checked before the normal IDENT/TYPE name parsing.
+        # BUGFIX/FEATURE (bugs.log #9): `let (varname): TYPE = ...` where
+        # varname is a runtime-dynamic SY variable — the identity of the
+        # declared thing is only known at runtime (it's whatever varname's
+        # current string value is), so this can't be resolved to a plain
+        # VarDecl at parse time at all. Produces a DynVarDecl instead.
+        dyn_holder = self._check_sy_dynamic_name()
+        if dyn_holder is not None:
+            vtype = None
+            if self.peek() and self.peek()[0] == "COLON":
+                self.match("COLON")
+                vtype = self.match("TYPE")
+            elif self.peek() and self.peek()[0] == "TYPE":
+                vtype = self.match("TYPE")
+            if vtype in ("list", "index", "dict") and self.peek() and self.peek()[0] == "COLON":
+                self.match("COLON")
+                self.match("TYPE")
+            self.match("OP")
+            value = self.expr()
+            # BUGFIX (bugs.log #13): `let (x): index = []` — an empty `[]`
+            # literal is syntactically indistinguishable from an empty list
+            # (no `key: value` pairs to disambiguate), so factor() always
+            # returns a plain ListExpr([]) for it. Real codegen then makes
+            # this an actual runtime LIST (make_list()), completely ignoring
+            # the explicit `index` type annotation — so `d().add("k", 5)`
+            # later crashed with "list index 0 out of bounds", since a 2-arg
+            # add on a list tries to SET index 5 at position "k", not do a
+            # key-value insert. Only the declaration site knows the intended
+            # type, so the substitution has to happen here.
+            if vtype == "index" and isinstance(value, ListExpr) and not value.elements:
+                value = DictExpr([], is_index=True)
+            return DynVarDecl(dyn_holder, mut, is_local, vtype, value)
+        # BUGFIX/FEATURE (bugs.log #2): `let (function_name)...` — this is
+        # only still reachable for the STATIC (literal-valued) SY case here,
+        # since any SY name is now also in sy_names and would have been
+        # caught above; kept as a defensive fallback, not the primary path.
         sy_name = self._resolve_sy_name()
         if sy_name is not None:
             name = sy_name
@@ -310,11 +390,29 @@ class Parser:
             self.match("TYPE")
         self.match("OP")
         value = self.expr()
-        # BUGFIX/FEATURE (bugs.log #2): `let x: SY = 'literal'` has no runtime
-        # existence — record the compile-time name mapping and emit nothing.
+        # BUGFIX (bugs.log #13): see the identical fix in the DynVarDecl path
+        # above — `let x: index = []` must become an actual index (DictExpr
+        # with is_index=True), not a plain empty list, or later `x().add(k,
+        # v)`-style key-value inserts crash at runtime.
+        if vtype == "index" and isinstance(value, ListExpr) and not value.elements:
+            value = DictExpr([], is_index=True)
+        # BUGFIX/FEATURE (bugs.log #9): `let x: SY = <expr>` used to be a
+        # pure compile-time mapping with NO runtime existence at all — fine
+        # for a literal string, but any non-literal expression (e.g.
+        # concatenation with a loop variable, the whole point of generating
+        # a fresh name per iteration) was never evaluated; `str(value)` was
+        # called on the raw AST node object itself, producing garbage like
+        # "<rub_ast.BinOp object at 0x...>" instead of an actual computed
+        # string. x is now a REAL runtime string variable (so concatenation,
+        # .to(SY), loop variables etc. all just work like any other str
+        # expression) and is tracked in sy_names for the dynamic reflection
+        # path above / in factor(). sy_table is still populated for literal
+        # values, preserving the static `fn (name)() {...}` case unchanged.
         if vtype == "SY":
-            self.sy_table[name] = value.value if isinstance(value, Str) else str(value)
-            return NoOp()
+            self.sy_names.add(name)
+            if isinstance(value, Str):
+                self.sy_table[name] = value.value
+            return VarDecl(name, mut, is_local, "str", value)
         return VarDecl(name, mut, is_local, vtype, value)
 
     def print_stmt(self):
@@ -680,8 +778,25 @@ class Parser:
 
         if tok[0] == "NUMBER":
             self.advance()
-            if '.' in tok[1]: return Number(float(tok[1]))
-            return Number(int(tok[1]))
+            if '.' in tok[1]: res = Number(float(tok[1]))
+            else: res = Number(int(tok[1]))
+            # BUGFIX (bugs.log #10): allow method chaining on number literals
+            # (e.g. `0.to(SY)`), matching what STRING literals already
+            # support just below. Real code found this via `0.to(SY)`.
+            while self.peek() and self.peek()[0] == "DOT":
+                self.match("DOT")
+                attr = self.match_attr()
+                if self.peek() and self.peek()[0] == "LPAREN":
+                    self.match("LPAREN")
+                    args = []
+                    while self.peek() and self.peek()[0] != "RPAREN":
+                        args.append(self.expr())
+                        if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
+                    self.match("RPAREN")
+                    res = MethodCall(res, attr, args)
+                else:
+                    res = FieldAccess(res, attr)
+            return res
         if tok[0] == "BOOL":
             self.advance()
             if tok[1] in ("None", "Null"): return None_()
@@ -718,11 +833,27 @@ class Parser:
         if tok[0] == "NOT":
             self.advance(); return UnaryOp("not", self.factor())
         if tok[0] == "LPAREN":
-            # BUGFIX/FEATURE (bugs.log #2): `(varable_name)` / `(function_name)()`
-            # — dynamic reference to a previously-declared SY symbol. Must be
-            # checked before the generic parenthesized-expression grouping
-            # below, but only fires when the identifier is a KNOWN SY symbol,
-            # so ordinary grouped expressions like `(1 + 2)` are unaffected.
+            # BUGFIX/FEATURE (bugs.log #9): `(varname)` / `(varname)(...)` for
+            # a runtime-dynamic SY variable — resolved via the runtime
+            # hash-map (DynResolve), not a compile-time literal substitution,
+            # since varname's value may differ every time this is reached
+            # (e.g. inside a loop). Checked before the old static path.
+            dyn_holder = self._check_sy_dynamic_name()
+            if dyn_holder is not None:
+                if self.peek() and self.peek()[0] == "LPAREN":
+                    self.match("LPAREN")
+                    args = []
+                    while self.peek() and self.peek()[0] != "RPAREN":
+                        args.append(self.expr())
+                        if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
+                    self.match("RPAREN")
+                    return FnCall(DynResolve(dyn_holder), args)
+                return DynResolve(dyn_holder)
+            # BUGFIX/FEATURE (bugs.log #2): `(function_name)()` — static
+            # reference to a previously-declared LITERAL SY symbol. Only
+            # still reachable for names that never went through the dynamic
+            # check above (i.e. names not in sy_names at all), so in
+            # practice this now mainly serves defensively.
             sy_name = self._resolve_sy_name()
             if sy_name is not None:
                 if self.peek() and self.peek()[0] == "LPAREN":
@@ -734,7 +865,41 @@ class Parser:
                     self.match("RPAREN")
                     return FnCall(sy_name, args)
                 return Var(sy_name)
-            self.advance(); e = self.expr(); self.match("RPAREN"); return e
+            self.advance(); e = self.expr(); self.match("RPAREN")
+            # BUGFIX (bugs.log #10): postfix `.method()`/field chaining was
+            # only wired up for specific primary-expression shapes (bare
+            # IDENT, SY reflection, TYPE-as-varname) individually, each with
+            # their own copy of this loop — a parenthesized/grouped
+            # expression like `(layers + 1)` fell straight through this
+            # branch with no chaining at all, so `(layers + 1).to(SY)`
+            # silently mis-parsed (".to" ended up read as a bare, undefined
+            # reference) instead of being treated as a method call. Real
+            # code found this via `(layers + 1).to(SY)` inside a loop.
+            while self.peek():
+                if self.peek()[0] == "DOT":
+                    self.match("DOT")
+                    attr = self.match_attr()
+                    if self.peek() and self.peek()[0] == "LPAREN":
+                        self.match("LPAREN")
+                        args = []
+                        while self.peek() and self.peek()[0] != "RPAREN":
+                            args.append(self.expr())
+                            if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
+                        self.match("RPAREN")
+                        e = MethodCall(e, attr, args)
+                    else:
+                        e = FieldAccess(e, attr)
+                elif self.peek()[0] == "LPAREN":
+                    self.match("LPAREN")
+                    args = []
+                    while self.peek() and self.peek()[0] != "RPAREN":
+                        args.append(self.expr())
+                        if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
+                    self.match("RPAREN")
+                    e = FnCall(e, args)
+                else:
+                    break
+            return e
 
         # FILE token used as file handle variable inside open() block
         if tok[0] == "FILE" and tok[1] in self._active_file_handles:
@@ -873,6 +1038,15 @@ class Parser:
                     if isinstance(res, Var):
                         if res.name == "thread" and len(args) == 2: res = ThreadCall(args[0], args[1])
                         elif res.name == "input": res = Input(args[0] if args else None)
+                        elif res.name in self.sy_names and res.name not in self.sy_fn_names:
+                            # BUGFIX/FEATURE (bugs.log #9): bare `tmp(...)`
+                            # after a reflective declaration (no explicit
+                            # `(tmp)` parens on this later access — the
+                            # pattern real code actually uses) must also
+                            # route through the dynamic runtime lookup, not
+                            # be treated as calling a literal function/
+                            # collection named "tmp" (which doesn't exist).
+                            res = FnCall(DynResolve(res.name), args)
                         else: res = FnCall(res.name, args)
                     else:
                         res = FnCall(res, args)

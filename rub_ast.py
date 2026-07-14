@@ -154,6 +154,27 @@ class ClassInstantiate:
     def __init__(self, class_name):
         self.class_name = class_name
 
+# BUGFIX/FEATURE (bugs.log #9): runtime SY reflection. `let x: SY = <expr>`
+# is now a real runtime string variable (see parser.py), so a name generated
+# from it (e.g. inside a loop, via concatenation) can differ every iteration.
+# DynResolve("x") means "look up the dynamic variable currently named by the
+# runtime value of x" (via a runtime hash-map, see rub_dynvar_get/set in the
+# C runtime) — used as the `name` of a FnCall so it composes for free with
+# the existing chained-collection-access codegen (FnCall(<non-str-expr>, args)).
+# DynVarDecl is the declaration-side equivalent: `let (x): dict = {}` creates
+# a new dynamic-hash-map entry keyed by x's current runtime value.
+class DynResolve:
+    def __init__(self, holder_name):
+        self.holder_name = holder_name
+
+class DynVarDecl:
+    def __init__(self, holder_name, mutable, is_local, vtype, value):
+        self.holder_name = holder_name
+        self.mutable = mutable
+        self.is_local = is_local
+        self.vtype = vtype
+        self.value = value
+
 class ThreadCall:
     def __init__(self, func_call, thread_id):
         self.func_call = func_call

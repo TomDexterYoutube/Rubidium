@@ -48,6 +48,8 @@ declare void @box_drop(%Box*)
 declare void @collection_drop(%Box*, %Box*)
 declare void @rub_throw(i8*)
 declare void @rub_overflow_check(i32, i8*)
+declare %Box* @rub_dynvar_get(i8*)
+declare void @rub_dynvar_set(i8*, %Box*)
 declare %Box* @box_add(%Box*, %Box*)
 declare %Box* @box_copy(%Box*)
 declare i1 @collection_has(%Box*, %Box*)
@@ -94,6 +96,9 @@ class CodeGen:
         self.dropped_vars = set()
         self.class_defs   = {}
         self.instances    = {}
+        # bugs.log #12: see _gather_vardecl_types — pre-scan-only instance
+        # tracking, kept separate from self.instances (see that comment).
+        self._prescan_instances = {}
         self.cur_fn       = None
         self.functions    = {}
         self.loop_end_stack = []
@@ -358,7 +363,15 @@ class CodeGen:
         # branch of emit_expr) and their own locals/parameters (the scope
         # check just above). Globals are treated as if they don't exist,
         # unless explicitly passed in as a parameter.
-        if self.cur_class:
+        #
+        # BUGFIX (bugs.log #14): "error" is the exception — it's the
+        # implicit binding inside a `try { } error { }` block's error body,
+        # scoped (semantically) to that block, not a real user-level global.
+        # It's implemented as a global purely as an internal mechanism (see
+        # emit_try — @error is just where the error message gets stashed),
+        # so it must be exempt from this restriction or try/error simply
+        # couldn't be used inside any class method at all.
+        if self.cur_class and name != "error":
             raise RubidiumNameError(
                 f"Class '{self.cur_class}' cannot access global variable '{name}': "
                 f"globals are not accessible from inside a class (pass it in as "
@@ -472,6 +485,8 @@ class CodeGen:
         self.global_decls += [
             "", "declare i32 @printf(i8* noundef, ...)", "declare i32 @puts(i8* noundef)", "declare i32 @fflush(i8*)",
             "declare void @print_int_or_null(i64)",
+            "declare void @print_i128_or_null(i128)",
+            "declare i8* @i128_to_str(i128)",
             "declare i8* @malloc(i64)", "declare void @free(i8*)", "declare i64 @strlen(i8*)",
             "declare i32 @scanf(i8*, ...)", "declare i8* @fgets(i8*, i32, i8*)",
             "declare i8* @strcpy(i8*, i8*)", "declare i32 @strcmp(i8*, i8*)",
@@ -584,7 +599,14 @@ class CodeGen:
             # (with no explicit type annotation) to allocate/coerce as i64 and
             # silently produce a wrong value instead of the linked collection.
             return self._infer_type(node.expr)
-        if isinstance(node, Number): return "double" if isinstance(node.value, float) else "i64"
+        if isinstance(node, Number):
+            if isinstance(node.value, float): return "double"
+            v = int(node.value)
+            for ir_t in ("i64", "i128", "i256", "i512", "i1024", "i2048"):
+                lo, hi = self._int_bounds(ir_t)
+                if lo <= v <= hi:
+                    return ir_t
+            return "i2048"
         if isinstance(node, Bool): return "i1"
         if isinstance(node, None_): return "i64"
         if isinstance(node, Str): return "i8*"
@@ -640,6 +662,21 @@ class CodeGen:
                 cls = self.class_defs.get(class_name)
                 if cls and any(f.name == node.method for f in cls.fields):
                     return "%Box*" if node.args else self.field_index(class_name, node.method)[1]
+            elif obj_name in self._prescan_instances:
+                # BUGFIX (bugs.log #12): pre-scan-only fallback — see
+                # _gather_vardecl_types. Mirrors the full self.instances
+                # logic above (method lookup, then field-vs-method fallback)
+                # but for a class instance that's only known via the
+                # pre-scan pass at this point (real codegen hasn't reached
+                # its declaration yet).
+                class_name = self._prescan_instances[obj_name]
+                mangled = self.method_ir_name(class_name, node.method)
+                if mangled in self.functions:
+                    fn = self.functions[mangled]
+                    return self.rubi_type_to_ir(fn.ret_type) if fn.ret_type else "i64"
+                cls = self.class_defs.get(class_name)
+                if cls and any(f.name == node.method for f in cls.fields):
+                    return "%Box*" if node.args else self.field_index(class_name, node.method)[1]
             
             if node.method == "len": return "i64"
             if node.method == "char": return "i8*"
@@ -679,6 +716,17 @@ class CodeGen:
         if isinstance(node, OsRun):
             return "i8*"
         if isinstance(node, FnCall):
+            # BUGFIX/FEATURE (bugs.log #9): a non-string node.name means this
+            # is either the existing "chained collection access" pattern
+            # (nested(0)(1) → FnCall(FnCall("nested",[0]),[1])) or the new
+            # DynResolve-based dynamic SY reflection (FnCall(DynResolve(...),
+            # args)) — both ALWAYS evaluate to a %Box*, per emit_call_expr's
+            # `not isinstance(node.name, str)` branch. Falling through to the
+            # generic "i64" default below was wrong and broke method dispatch
+            # (e.g. .add()/.set()) for these, since it made the target look
+            # like a scalar instead of a collection.
+            if not isinstance(node.name, str):
+                return "%Box*"
             # Normalization check
             name = node.name.replace(".", "_") if isinstance(node.name, str) and "." in node.name else node.name
             if isinstance(name, str):
@@ -750,8 +798,26 @@ class CodeGen:
                 if node.is_local: continue
                 if isinstance(node.value, (ClassInstantiate, FnCall)):
                     raw_cn = node.value.class_name if isinstance(node.value, ClassInstantiate) else node.value.name
-                    if raw_cn in self.class_defs or f"main_{raw_cn}" in self.class_defs:
+                    if raw_cn in self.class_defs:
+                        # BUGFIX (bugs.log #12): this pre-scan pass runs BEFORE
+                        # real codegen and recurses into every function body
+                        # (including main()). Real codegen registers
+                        # self.instances[name]=class incrementally as it goes —
+                        # but this pass previously didn't track that at all, so
+                        # a LATER statement in the same body/pre-scan (e.g.
+                        # `let v = b.items(key)`, indexing a collection FIELD
+                        # via call syntax) hit _infer_type's MethodCall handler
+                        # with no way to resolve "b" — a spurious "Cannot infer
+                        # type for method call" error. Uses a SEPARATE dict
+                        # (not self.instances itself) since real codegen's own
+                        # incremental self.instances population is order-
+                        # sensitive elsewhere; _infer_type's fallback checks
+                        # both.
+                        self._prescan_instances.setdefault(node.name, raw_cn)
                         continue  # class instances aren't part of scalar polymorphism tracking
+                    if f"main_{raw_cn}" in self.class_defs:
+                        self._prescan_instances.setdefault(node.name, f"main_{raw_cn}")
+                        continue
                 ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
                 type_map.setdefault(node.name, set()).add(ir_t)
             elif isinstance(node, If):
@@ -776,6 +842,8 @@ class CodeGen:
     def _collect_global(self, node):
         if isinstance(node, NoOp):
             return  # SY declarations (bugs.log #2) — nothing to collect
+        if isinstance(node, DynVarDecl):
+            return  # bugs.log #9: dynamic hash-map entry, no named global to pre-declare
         if isinstance(node, VarDecl):
             # Local variables are function-scoped, not global
             if node.is_local:
@@ -991,6 +1059,19 @@ class CodeGen:
             else:
                 self.emit(f"  call void @rub_throw(i8* {msg_s})")
             return
+        if isinstance(node, DynVarDecl):
+            # BUGFIX/FEATURE (bugs.log #9): `let (x): TYPE = value` where x is
+            # a runtime-dynamic SY variable. The value codegens exactly like
+            # any normal declaration's value (so dict/list/index literals,
+            # scalars, etc. all just work); it's boxed and stored into the
+            # runtime hash-map under x's CURRENT string value, rather than
+            # given a fixed compile-time name.
+            key_v, key_t = self.emit_expr(Var(node.holder_name))
+            key_s = self.coerce(key_v, key_t, "i8*")
+            val, val_t = self.emit_expr(node.value)
+            box_v = self.coerce_to_box(val, val_t)
+            self.emit(f"  call void @rub_dynvar_set(i8* {key_s}, %Box* {box_v})")
+            return
         if isinstance(node, VarDecl):
             if node.name in self.dropped_vars: self.dropped_vars.discard(node.name)
 
@@ -1155,7 +1236,12 @@ class CodeGen:
             if node.name in self.dropped_vars: raise RubidiumNameError(f"Var '{node.name}' is dropped")
             
             # --- FIX: Check for Field Assignment ---
-            if self.is_class_field(node.name):
+            # BUGFIX (bugs.log #15): same precedence fix as the Var read path
+            # above — a local/parameter must shadow a same-named implicit
+            # class field, or assigning to a parameter could silently write
+            # to an unrelated field from a different method instead.
+            in_local_scope = any(node.name in scope for scope in self.local_vars_stack)
+            if not in_local_scope and self.is_class_field(node.name):
                 self.emit_field_assign(FieldAssign(Var("__self"), node.name, node.value))
             # ----------------------------------------
             elif node.name in self.instances: pass
@@ -1701,7 +1787,14 @@ class CodeGen:
             self.emit(f"  {sel_ptr} = select i1 {val}, i8* {true_ptr}, i8* {false_ptr}")
             self.emit(f'  call i32 (i8*, ...) @printf(i8* {sel_ptr})')
             self.emit(f'  call i32 @fflush(i8* null)')
-        elif val_t in ("i32", "i64", "i128", "i256", "i512", "i1024", "i2048"):
+        elif val_t == "i128":
+            # BUGFIX (bugs.log #17): was narrowed to i64 first (clamping
+            # anything outside i64's range), so print() couldn't verify
+            # correctly-computed i128 arithmetic beyond 64 bits. i256+
+            # still narrow below — true bignum printing for those is a
+            # separate, much larger undertaking.
+            self.emit(f'  call void @print_i128_or_null(i128 {val})')
+        elif val_t in ("i32", "i64", "i256", "i512", "i1024", "i2048"):
             cv = self.coerce(val, val_t, "i64")
             self.emit(f'  call void @print_int_or_null(i64 {cv})')
         elif val_t in ("float", "double", "fp128"):
@@ -1950,29 +2043,39 @@ class CodeGen:
     def _emit_for_file(self, node):
         """for line in file_handle { body } — iterate file lines one-by-one."""
         slot = self._file_handle_vars[node.iterable.name]
-        # Loop variable stores the current line as i8*
-        if self.cur_fn is not None and self.cur_fn != "_rubidium_init":
-            var_ptr = f"%ptr_{node.var}"
-            # BUGFIX (bugs.log #5): registering the var's type in the CURRENT
-            # scope must happen every time we enter this loop, not just the
-            # first time the alloca is emitted — otherwise a later lexical
-            # block (e.g. a second `open(...) as file { for line in file }`)
-            # never learns "line" maps to %ptr_line in its own scope (the
-            # scope that originally registered it has already been popped),
-            # so lookups fall through and silently resolve to a bogus/global
-            # binding instead — this was the actual cause of the segfault.
-            self.local_vars_stack[-1][node.var] = "%Box*"
-            if node.var not in self._alloca_emitted:
-                self.emit(f"  {var_ptr} = alloca %Box*")
-                self._alloca_emitted.add(node.var)
-        else:
-            self.declare_global(node.var, "%Box*")
-            var_ptr = f"@{node.var}"
+        # BUGFIX (bugs.log #8): the loop variable used to be declared/stored
+        # directly under its source name (e.g. "line") as %Box*. If that name
+        # was already in use elsewhere as a *different* IR type (e.g. a plain
+        # `let line = "..."` string, which is i8* not %Box*), declare_global's
+        # "already registered, no-op" guard left the OLD i8* declaration in
+        # place while this loop stored a %Box* pointer into it — silent type
+        # confusion, producing garbage on print (readers saw the Box struct's
+        # raw bytes instead of a string). Fix: always give the loop variable
+        # its own uniquely-named %Box* storage, and alias the user-facing name
+        # to it (via the same linked_to mechanism used for scalar `link`) only
+        # for the loop's duration, restoring the old binding afterward.
+        self._file_loop_ctr = getattr(self, "_file_loop_ctr", 0) + 1
+        storage_name = f"__fileline_{self._file_loop_ctr}_{node.var}"
+        had_prior_link = node.var in self.linked_to
+        prior_link = self.linked_to.get(node.var)
+        self.linked_to[node.var] = storage_name
 
-        # Line counter (1-based)
+        if self.cur_fn is not None and self.cur_fn != "_rubidium_init":
+            var_ptr = f"%ptr_{storage_name}"
+            self.local_vars_stack[-1][storage_name] = "%Box*"
+            if storage_name not in self._alloca_emitted:
+                self.emit(f"  {var_ptr} = alloca %Box*")
+                self._alloca_emitted.add(storage_name)
+        else:
+            self.declare_global(storage_name, "%Box*")
+            var_ptr = f"@{storage_name}"
+
+        # Line counter (0-based — file_readln/file_writeln are 0-based;
+        # bugs.log #7: this previously started at 1, silently skipping the
+        # file's first line on every `for line in file` iteration)
         line_ptr = self.new_tmp()
         self.emit(f"  {line_ptr} = alloca i64")
-        self.emit(f"  store i64 1, i64* {line_ptr}")
+        self.emit(f"  store i64 0, i64* {line_ptr}")
 
         cond_l = self.new_label("ffilecond")
         body_l = self.new_label("ffilebody")
@@ -2013,6 +2116,12 @@ class CodeGen:
         self.emit(f"  {inc_v} = add i64 {cur2}, 1")
         self.emit(f"  store i64 {inc_v}, i64* {line_ptr}")
         self.emit(f"  br label %{cond_l}\n{end_l}:")
+
+        # Restore whatever "node.var" resolved to before this loop (bugs.log #8)
+        if had_prior_link:
+            self.linked_to[node.var] = prior_link
+        else:
+            self.linked_to.pop(node.var, None)
 
     def emit_thread_running(self, node):
         """thread.running(id) -> bool: True if thread is still running, False if done."""
@@ -2095,26 +2204,39 @@ class CodeGen:
         self._file_slot_counter += 1
         rc = self.new_tmp()
         self.emit(f"  {rc} = call i64 @file_open(i64 {slot}, i8* {path_s}, i32 0)")
-        is_err = self.new_tmp()
-        self.emit(f"  {is_err} = icmp eq i64 {rc}, -1")
+        # BUGFIX (bugs.log #6): per syntax file, a missing file is reported as
+        # a runtime error (catchable via try/error) but must NOT crash the
+        # program when uncaught — file_open() has already auto-created it, so
+        # the uncaught case just continues normally. A truly unrecoverable
+        # open (rc == -1, e.g. bad path/permissions) still crashes when
+        # uncaught, same as before.
+        is_missing = self.new_tmp()
+        self.emit(f"  {is_missing} = icmp eq i64 {rc}, -2")
+        is_fatal = self.new_tmp()
+        self.emit(f"  {is_fatal} = icmp eq i64 {rc}, -1")
+        ok_l = self.new_label("fopenok")
+        missing_l = self.new_label("fopenmissing")
+        checked_l = self.new_label("fopenchecked")
+        err_lbl, err_len = self.intern_str("file not found")
+        err_ptr = self.new_tmp()
+        self.emit(f"  {err_ptr} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
+        self.emit(f"  br i1 {is_missing}, label %{missing_l}, label %{checked_l}")
+        self.emit(f"{missing_l}:")
+        self.emit(f"  store i8* {err_ptr}, i8** @_rub_error_msg")
         if self._try_error_label:
-            ok_l = self.new_label("fopenok")
-            err_lbl, err_len = self.intern_str("file not found")
-            err_ptr = self.new_tmp()
-            self.emit(f"  {err_ptr} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
-            self.emit(f"  store i8* {err_ptr}, i8** @_rub_error_msg")
-            self.emit(f"  br i1 {is_err}, label %{self._try_error_label}, label %{ok_l}")
-            self.emit(f"{ok_l}:")
+            self.emit(f"  br label %{self._try_error_label}")
         else:
-            ok_l = self.new_label("fopenok")
-            self.emit(f"  br i1 {is_err}, label %fopenfail{slot}, label %{ok_l}")
-            self.emit(f"fopenfail{slot}:")
-            msg_lbl, msg_len = self.intern_str("file not found")
-            msg_ptr = self.new_tmp()
-            self.emit(f"  {msg_ptr} = getelementptr [{msg_len} x i8], [{msg_len} x i8]* {msg_lbl}, i64 0, i64 0")
-            self.emit(f"  call void @rub_throw(i8* {msg_ptr})")
             self.emit(f"  br label %{ok_l}")
-            self.emit(f"{ok_l}:")
+        self.emit(f"{checked_l}:")
+        if self._try_error_label:
+            self.emit(f"  br i1 {is_fatal}, label %{self._try_error_label}, label %{ok_l}")
+        else:
+            fail_l = self.new_label("fopenfatal")
+            self.emit(f"  br i1 {is_fatal}, label %{fail_l}, label %{ok_l}")
+            self.emit(f"{fail_l}:")
+            self.emit(f"  call void @rub_throw(i8* {err_ptr})")
+            self.emit(f"  br label %{ok_l}")
+        self.emit(f"{ok_l}:")
         # Register this var_name as a file handle pointing to this slot
         self._file_handle_vars[node.var_name] = slot
         # Allocate the variable in local/global scope so Var(f) can be resolved
@@ -2409,7 +2531,21 @@ class CodeGen:
             return self.emit_expr(node.expr)
         if isinstance(node, Number):
             if isinstance(node.value, float): return f"{node.value:.17e}", "double"
-            return str(int(node.value)), "i64"
+            v = int(node.value)
+            # BUGFIX (bugs.log #17): a literal was always typed "i64",
+            # regardless of its actual magnitude. A value that doesn't fit
+            # in 64 bits (e.g. i128's max, 2**127-1) got emitted as an
+            # invalid i64 constant, which silently truncated/wrapped —
+            # concretely, 2**127-1's low 64 bits are all 1s, which as a
+            # signed i64 is exactly -1, matching the exact bug that was
+            # reported. Pick the smallest IR integer type that actually
+            # fits the value instead; coerce()/promote_type() take it from
+            # there for arithmetic and narrowing/widening as before.
+            for ir_t in ("i64", "i128", "i256", "i512", "i1024", "i2048"):
+                lo, hi = self._int_bounds(ir_t)
+                if lo <= v <= hi:
+                    return str(v), ir_t
+            return str(v), "i2048"
         if isinstance(node, Bool): return ("1" if node.value else "0"), "i1"
         if isinstance(node, None_): return self._NULL_SENTINEL, "i64"
         if isinstance(node, Str):
@@ -2493,6 +2629,19 @@ class CodeGen:
             return self.emit_file_exists(node)
         if isinstance(node, FileList):
             return self.emit_file_list(node)
+        if isinstance(node, DynResolve):
+            # BUGFIX/FEATURE (bugs.log #9): resolve the dynamic variable
+            # currently named by holder_name's CURRENT runtime value (a
+            # normal i8* string load), via the runtime hash-map. Returns a
+            # %Box* — from here, the existing chained-collection-access
+            # codegen (emit_call_expr's `not isinstance(node.name, str)`
+            # branch, and normal MethodCall handling) treats it exactly like
+            # any other collection value, with no further changes needed.
+            key_v, key_t = self.emit_expr(Var(node.holder_name))
+            key_s = self.coerce(key_v, key_t, "i8*")
+            result = self.new_tmp()
+            self.emit(f"  {result} = call %Box* @rub_dynvar_get(i8* {key_s})")
+            return result, "%Box*"
         if isinstance(node, Var):
             if node.name in self.dropped_vars:
                 # Runtime behavior: print error message instead of crash
@@ -2503,7 +2652,19 @@ class CodeGen:
                 return "0", "i64"
             
             # --- FIX: Implicitly access class field if it exists ---
-            if self.is_class_field(node.name):
+            # BUGFIX (bugs.log #15): a LOCAL variable or PARAMETER must
+            # always shadow a class field of the same name — this is
+            # standard scoping in every OO language, and matters a lot here
+            # because _register_implicit_class_fields() turns ANY un-"local"
+            # `let` in ANY method into a class-wide field. Before this fix,
+            # is_class_field() was checked first, so e.g. a parameter named
+            # "qty" in one method would get silently replaced by an
+            # unrelated implicit field also named "qty" from a totally
+            # different method (very easy to hit with common names like
+            # qty/total/value/temp), reading 0/uninitialized instead of the
+            # real parameter value.
+            in_local_scope = any(node.name in scope for scope in self.local_vars_stack)
+            if not in_local_scope and self.is_class_field(node.name):
                 return self.emit_field_access(Var("__self"), node.name)
             # -------------------------------------------------------
             
@@ -2830,9 +2991,12 @@ class CodeGen:
                 for arg in node.args:
                     idx_v, idx_t = self.emit_expr(arg)
                     idx_b = self.coerce_to_box(idx_v, idx_t)
-                    res = self.new_tmp()
-                    self.emit(f"  {res} = call %Box* @collection_get(%Box* {col_b}, %Box* {idx_b})")
-                    col_b = res
+                    # BUGFIX (bugs.log #16): was the unguarded collection_get,
+                    # so a missing key (e.g. quantities(sku) for an unknown
+                    # sku) crashed the whole program even inside try/error —
+                    # unlike the near-identical branch just above (4.), which
+                    # already used the guarded version.
+                    col_b = self.emit_guarded_collection_get(col_b, idx_b)
                 return col_b, "%Box*"
             return field_val, field_t
 
@@ -3692,12 +3856,20 @@ class CodeGen:
                 self.emit(f"  call i8* @strcpy(i8* {buf}, i8* {str_l})")
                 self.emit(f"  call i8* @strcat(i8* {buf}, i8* {r})")
                 return buf, "i8*"
-        common = "double" if (lt in ("float","double") or rt in ("float","double")) else "i64"
+        # BUGFIX (bugs.log #17): was hardcoded to "double" (if either side
+        # looked like a float) or otherwise always "i64" — completely
+        # ignoring wider types. Any i128+ arithmetic silently computed at
+        # i64 width (wrapping/losing precision for anything not fitting in
+        # 64 bits), and fp128 arithmetic silently computed at double
+        # precision. promote_type() (previously built but never actually
+        # wired in anywhere) picks the widest of the two operand types.
+        common = self.promote_type(lt, rt)
+        is_int = common in self._INT_IR_SET
         l = self.coerce(l, lt, common); r = self.coerce(r, rt, common)
         tmp = self.new_tmp()
-        if common == "i64":
+        if is_int:
             if node.op in ("and","or"):
-                li = self.to_bool(l, "i64"); ri = self.to_bool(r, "i64")
+                li = self.to_bool(l, common); ri = self.to_bool(r, common)
                 instr = "and" if node.op == "and" else "or"
                 self.emit(f"  {tmp} = {instr} i1 {li}, {ri}")
                 return tmp, "i1"
@@ -3709,25 +3881,30 @@ class CodeGen:
                     safe_l  = self.new_label("divok")
                     err_lbl, err_len = self.intern_str("Division by zero")
                     err_ptr = self.new_tmp()
-                    self.emit(f"  {is_zero} = icmp eq i64 {r}, 0")
+                    self.emit(f"  {is_zero} = icmp eq {common} {r}, 0")
                     # Store error message before the conditional branch (always safe, only used on error path)
                     self.emit(f"  {err_ptr} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
                     self.emit(f"  store i8* {err_ptr}, i8** @_rub_error_msg")
                     self.emit(f"  br i1 {is_zero}, label %{self._try_error_label}, label %{safe_l}")
                     self.emit(f"{safe_l}:")
-                self.emit(f"  {tmp} = {instr} i64 {l}, {r}")
-                return tmp, "i64"
+                self.emit(f"  {tmp} = {instr} {common} {l}, {r}")
+                return tmp, common
             # Handle power operator (**)
             if node.op == "**":
                 # Call pow() from math library
-                l_d = self.coerce(l, "i64", "double")
-                r_d = self.coerce(r, "i64", "double")
+                # NOTE: pow/root still compute at double precision even for
+                # i128+ operands — a genuinely wide-precision pow is a much
+                # bigger undertaking (needs its own arbitrary-precision
+                # implementation) than fixing +,-,*,/,% arithmetic, which is
+                # what was concretely broken/reported.
+                l_d = self.coerce(l, common, "double")
+                r_d = self.coerce(r, common, "double")
                 self.emit(f"  {tmp} = call double @_rubidium_pow(double {l_d}, double {r_d})")
                 return tmp, "double"
             # Handle binary root operator (n */ value) -> value ** (1/n)
             if node.op == "*/":
-                l_d = self.coerce(l, "i64", "double")
-                r_d = self.coerce(r, "i64", "double")
+                l_d = self.coerce(l, common, "double")
+                r_d = self.coerce(r, common, "double")
                 inv = self.new_tmp()
                 self.emit(f"  {inv} = fdiv double 1.0, {l_d}")
                 self.emit(f"  {tmp} = call double @_rubidium_pow(double {r_d}, double {inv})")
@@ -3735,17 +3912,21 @@ class CodeGen:
         else:
             instr = {"+":"fadd","-":"fsub","*":"fmul","/":"fdiv","%":"frem"}.get(node.op)
             if instr:
-                self.emit(f"  {tmp} = {instr} double {l}, {r}")
-                return tmp, "double"
+                self.emit(f"  {tmp} = {instr} {common} {l}, {r}")
+                return tmp, common
             # Handle power operator (**) for float types
             if node.op == "**":
-                self.emit(f"  {tmp} = call double @_rubidium_pow(double {l}, double {r})")
+                l_d = self.coerce(l, common, "double")
+                r_d = self.coerce(r, common, "double")
+                self.emit(f"  {tmp} = call double @_rubidium_pow(double {l_d}, double {r_d})")
                 return tmp, "double"
             # Handle binary root operator (n */ value) for float types
             if node.op == "*/":
+                l_d = self.coerce(l, common, "double")
                 inv = self.new_tmp()
-                self.emit(f"  {inv} = fdiv double 1.0, {l}")
-                self.emit(f"  {tmp} = call double @_rubidium_pow(double {r}, double {inv})")
+                self.emit(f"  {inv} = fdiv double 1.0, {l_d}")
+                r_d = self.coerce(r, common, "double")
+                self.emit(f"  {tmp} = call double @_rubidium_pow(double {r_d}, double {inv})")
                 return tmp, "double"
         return "0", "i64"
 
@@ -3800,15 +3981,15 @@ class CodeGen:
             pred = {"==":"eq","!=":"ne","<":"slt",">":"sgt","<=":"sle",">=":"sge"}[node.op]
             self.emit(f"  {tmp} = icmp {pred} i8* {ptr}, {null_val}")
             return tmp, "i1"
-        common = "double" if (lt in ("float","double") or rt in ("float","double")) else "i64"
+        common = self.promote_type(lt, rt)
         l = self.coerce(l, lt, common); r = self.coerce(r, rt, common)
         tmp = self.new_tmp()
-        if common == "double":
+        if common in self._FLOAT_IR_SET:
             pred = {"==":"oeq","!=":"one","<":"olt",">":"ogt","<=":"ole",">=":"oge"}[node.op]
-            self.emit(f"  {tmp} = fcmp {pred} double {l}, {r}")
+            self.emit(f"  {tmp} = fcmp {pred} {common} {l}, {r}")
         else:
             pred = {"==":"eq","!=":"ne","<":"slt",">":"sgt","<=":"sle",">=":"sge"}[node.op]
-            self.emit(f"  {tmp} = icmp {pred} i64 {l}, {r}")
+            self.emit(f"  {tmp} = icmp {pred} {common} {l}, {r}")
         return tmp, "i1"
 
     def coerce_to_box(self, val, t):
@@ -3817,10 +3998,21 @@ class CodeGen:
         if t == "i1":
             v = self.coerce(val, t, "i64")
             self.emit(f"  {tmp} = call %Box* @box_b(i64 {v})")
-        elif t in ("i32", "i64"):
+        elif t in self._INT_IR_SET:
+            # BUGFIX (bugs.log #17): previously only i32/i64 were routed
+            # here — any wider type (i128+) fell through to the generic
+            # `else` branch below, which did `bitcast {t} {val} to i8*`.
+            # bitcast requires equal bit widths, so bitcasting e.g. an i128
+            # value to a 64-bit pointer is invalid IR. The Box struct's
+            # integer field is a 64-bit `long long`, so boxing (used for
+            # collections/Any-type storage/print) is necessarily limited to
+            # 64-bit precision regardless — narrow via the same clamping
+            # coerce() path used elsewhere, rather than emitting invalid IR.
             v = self.coerce(val, t, "i64")
             self.emit(f"  {tmp} = call %Box* @box_i(i64 {v})")
-        elif t in ("float", "double"):
+        elif t in self._FLOAT_IR_SET:
+            # Same reasoning as above — the Box struct's float field is a
+            # 64-bit double, so fp128/etc narrow to double when boxed.
             v = self.coerce(val, t, "double")
             self.emit(f"  {tmp} = call %Box* @box_f(double {v})")
         elif t == "i8*":
@@ -3848,7 +4040,7 @@ class CodeGen:
             self.emit(f"  {false_ptr} = getelementptr [{false_len} x i8], [{false_len} x i8]* {false_lbl}, i64 0, i64 0")
             self.emit(f"  {sel_ptr} = select i1 {val}, i8* {true_ptr}, i8* {false_ptr}")
             return sel_ptr
-        if t in ("i32", "i64"):
+        if t in ("i32", "i64", "i256", "i512", "i1024", "i2048"):
             fmt_lbl, flen = self.intern_str("%lld")
             fmt_ptr = self.new_tmp()
             self.emit(f"  {buf} = call i8* @malloc(i64 32)")
@@ -3856,7 +4048,14 @@ class CodeGen:
             cv = self.coerce(val, t, "i64")
             self.emit(f"  {tmp} = call i32 (i8*, i8*, ...) @sprintf(i8* {buf}, i8* {fmt_ptr}, i64 {cv})")
             return buf
-        elif t in ("float", "double"):
+        if t == "i128":
+            # BUGFIX (bugs.log #17): previously fell through to the generic
+            # `else: return val` below, which returned the raw i128 bit
+            # pattern completely unconverted — later code (e.g. strlen/
+            # strcpy on the "string") would treat that as a garbage pointer.
+            self.emit(f"  {tmp} = call i8* @i128_to_str(i128 {val})")
+            return tmp
+        elif t in ("float", "double", "fp128"):
             fmt_lbl, flen = self.intern_str("%g")
             fmt_ptr = self.new_tmp()
             self.emit(f"  {buf} = call i8* @malloc(i64 32)")
