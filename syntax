@@ -84,6 +84,7 @@ fn main() {
 #   list
 #   index
 #   dict
+#   dict+  — like dict, but values are nested dicts instead of lists (unlimited depth)
 
 let a: i32  = 100
 let b: f64  = 3.14
@@ -188,7 +189,7 @@ while True {
     break
 }
 
-# When the loop ends the local is dropped that is Ture for
+# When the loop ends the local is dropped that is True for
 # For loops
 # Functions
 # While loop
@@ -234,7 +235,7 @@ let c = 10 * 5       # 50
 let d = 10 / 5       # 2
 let e = 2 ** 3       # 8
 let f = 2 */ 16      # 4
-let g = 2 % 10 # Max come back to this later
+let g = 2 % 10       # 2
 
 # Standard BODMAS precedence applies.
 
@@ -534,6 +535,51 @@ my_dict("scores").add(40)
 
 my_dict().add("new_key")
 
+# -----------------------------------------
+# DICT+
+# -----------------------------------------
+
+# dict+ is like dict, but a key's value can be
+# either a list (a leaf, same as normal dict)
+# or another dict+ (a further level of nesting).
+# There is no limit on how many levels deep this can go.
+
+let mut my_dictplus: dict+ = {
+    1 = {
+        "test" = [1, 2, 3, 4]
+    }
+}
+
+# Access a value by chaining keys down through each level:
+# dictplus(key1, key2, ...) — keeps drilling down until
+# it reaches a list, then behaves like a normal dict from there.
+
+print(my_dictplus(1, "test"))          # [1, 2, 3, 4]
+print(my_dictplus(1, "test", 0))       # 1
+
+# Add a value to the list at the end of the path:
+
+my_dictplus(1, "test").add("ten")
+
+# Add a new key at any level.
+# Give it a list to make it a leaf, or a { } block to nest further:
+
+my_dictplus(1).add("other", [5, 6, 7])
+my_dictplus(1).add("deeper", { "layer2" = [8, 9] })
+
+# Add a new top-level key:
+# The new key is created as an empty dict+.
+
+my_dictplus().add(2)
+
+# -----------------------------------------
+# NAMING NOTE
+# -----------------------------------------
+
+# Keys still follow the same rules as index/dict —
+# strings need quotes ("test"), numbers and other
+# types do not.
+
 # =========================================
 # PRINT & INPUT
 # =========================================
@@ -603,7 +649,8 @@ file.list("data/")                   # used like linux ls command
 try {
     open("missing.txt") as file {
         print(file.read())
-    } error {
+    }
+} error {
     print("File error: " + error)
 }
 
@@ -811,6 +858,7 @@ fn log(msg: str) {
 
 fn stuff(val: Any) -> Any {
     val.add(7)
+}
 
 fn main() {
     let local large_list: list = ["Lots of Data"]
@@ -1448,17 +1496,19 @@ print(math_tools.pi)
 
 # Collections:
 #   - Collections require mut to be modified
-#   - list  = ordered sequence of values
-#   - index = key -> value map
-#   - dict  = key -> collection map
+#   - list   = ordered sequence of values
+#   - index  = key -> value map
+#   - dict   = key -> collection map
+#   - dict+  = key -> nested dict+ map (unlimited nesting depth)
 #   - .len() returns the number of items
 #   - .has() checks for keys or values
 #   - Accessing a missing key or index causes a runtime error
 #   - Iteration behavior:
-#       * list  -> values
-#       * index -> keys
-#       * dict  -> keys
-#       * file  -> lines
+#       * list   -> values
+#       * index  -> keys
+#       * dict   -> keys
+#       * dict+  -> keys
+#       * file   -> lines
 #   - Collections use deep copy on assignment
 #   - You can force collection types: let x: list: i32 = [0, 10, 32]
 #   - .set() and .add() completely replace Null values
