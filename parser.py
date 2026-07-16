@@ -213,7 +213,15 @@ class Parser:
             while self.peek() and self.peek()[0] != "RPAREN":
                 pname = self.match("IDENT") or self.match("TYPE")
                 self.match("COLON")
-                ptype = self.match("TYPE")
+                # BUGFIX (bugs.log #18): a class-typed parameter (e.g.
+                # `x: Warehouse`) is tokenized as IDENT, not TYPE — TYPE only
+                # covers built-in type keywords. self.match("TYPE") alone
+                # would silently fail here (consuming nothing), leaving the
+                # class-name token unconsumed; the next loop iteration would
+                # then misparse it as an entirely separate bogus parameter,
+                # corrupting the whole list and shifting every later
+                # parameter's positional binding.
+                ptype = self.match("TYPE") or self.match("IDENT")
                 params.append((pname, ptype))
                 if self.peek() and self.peek()[0] == "COMMA":
                     self.match("COMMA")
@@ -242,7 +250,10 @@ class Parser:
             while self.peek() and self.peek()[0] != "RPAREN":
                 pname = self.match("IDENT")
                 self.match("COLON")
-                ptype = self.match("TYPE")
+                # BUGFIX (bugs.log #18): see the identical fix in the FFI
+                # binding branch above — class-typed parameters are
+                # tokenized as IDENT, not TYPE.
+                ptype = self.match("TYPE") or self.match("IDENT")
                 params.append((pname, ptype))
                 if self.peek() and self.peek()[0] == "COMMA":
                     self.match("COMMA")

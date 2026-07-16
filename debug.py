@@ -3,6 +3,7 @@ import os
 import argparse
 import copy
 import shutil
+import random
 
 _dir = os.path.dirname(os.path.abspath(__file__))
 if _dir not in sys.path:
@@ -89,6 +90,15 @@ class Scope:
     def __init__(self, parent=None):
         self.parent = parent
         self.vars: dict = {}
+        # BUGFIX/FEATURE: tracks which names IN THIS SCOPE are currently
+        # link-aliases (share their info dict with another variable) — see
+        # VarDecl/Assign's `link` handling. Must be per-name, not a flag on
+        # the shared dict itself: since alias and target share the SAME
+        # dict object, a flag on the dict would make the TARGET also look
+        # "linked" the moment the alias is created, causing the target's
+        # own reassignment to incorrectly unlink from the alias instead of
+        # the other way around.
+        self.linked_names: set = set()
 
     def declare(self, name: str, info: dict):
         self.vars[name] = info
@@ -143,6 +153,7 @@ class Debugger:
         self._source_lines  = source_lines or []
         self._lmap          = {}      # ('var'|'fn'|'class'|'for', name) -> line
         self._try_depth     = 0       # >0 means inside a try block; errors raise instead of print
+        self._dynvars       = {}      # runtime SY reflection backing store — see DynResolve/DynVarDecl
         if tokens:
             self._build_lmap(tokens)
 
@@ -252,6 +263,23 @@ class Debugger:
         # ── Variable Declaration ──────────────────────────────────────────────
         if isinstance(node, ast.VarDecl):
             self.line = self._lmap.get(('var', node.name), "?")
+            # BUGFIX/FEATURE: `let b = link a` for a SCALAR value (int/float/
+            # bool/str) previously just evaluated `link a` like any other
+            # expression, which (for scalars) copies the CURRENT value once
+            # — so b never tracked later changes to a, unlike collections,
+            # which already worked correctly via Python's natural mutable-
+            # reference sharing (LinkArg's existing handling). Mirrors the
+            # real compiler's fix: share the exact same info dict as the
+            # link target, so reads/writes to EITHER name see the same
+            # underlying storage — until this name is reassigned directly
+            # (see the Assign branch below), which unlinks it.
+            if isinstance(node.value, ast.LinkArg) and isinstance(node.value.expr, ast.Var):
+                target_info = self.scope.lookup(node.value.expr.name)
+                if target_info is not None and not isinstance(target_info["value"], (list, dict)):
+                    target = self.scope if node.is_local else self._root_scope
+                    target.declare(node.name, target_info)
+                    target.linked_names.add(node.name)
+                    return
             value = self._deep_copy_value(self.evaluate(node.value))
             # Per spec: 'let' without 'local' enters the global memory pool.
             target = self.scope if node.is_local else self._root_scope
@@ -262,6 +290,19 @@ class Debugger:
                 "dropped": False,
                 "line":    self.line,
             })
+
+        # ── Dynamic (runtime SY reflection) Declaration ────────────────────────
+        elif isinstance(node, ast.DynVarDecl):
+            # BUGFIX/FEATURE: `let (x): dict = {}` where x is a runtime-
+            # dynamic SY variable. Mirrors the real compiler's
+            # rub_dynvar_set — stores into self._dynvars keyed by x's
+            # CURRENT string value, rather than a fixed compile-time name.
+            key_info = self.scope.lookup(node.holder_name)
+            key = key_info["value"] if key_info is not None else None
+            if key is None:
+                self.error(f"Variable '{node.holder_name}' used before declaration")
+                return
+            self._dynvars[key] = self._deep_copy_value(self.evaluate(node.value))
 
         # ── Assignment ────────────────────────────────────────────────────────
         elif isinstance(node, ast.Assign):
@@ -275,6 +316,24 @@ class Debugger:
             if not info.get("mutable", True):
                 self.error(f"Assignment to immutable variable '{node.name}' (declare with 'mut')")
                 return
+            # Find which scope actually holds this name (needed both to
+            # check/clear its linked_names set and, if unlinking, to
+            # replace its entry there).
+            s = self.scope
+            while s is not None and node.name not in s.vars:
+                s = s.parent
+            owning_scope = s if s is not None else self.scope
+            if node.name in owning_scope.linked_names:
+                # BUGFIX/FEATURE: reassigning a linked scalar directly must
+                # unlink it — give it its own independent info dict (a copy
+                # of the shared one) instead of mutating the shared dict,
+                # which would incorrectly also change the link target's
+                # value. Checked by NAME in the scope that owns it, not a
+                # flag on the dict itself (see linked_names' docstring for
+                # why that distinction matters).
+                info = dict(info)
+                owning_scope.linked_names.discard(node.name)
+                owning_scope.declare(node.name, info)
             info["value"] = self._deep_copy_value(self.evaluate(node.value))
             info["type"]  = self.rub_type(info["value"])
 
@@ -570,7 +629,14 @@ class Debugger:
             return node.value
 
         if isinstance(node, ast.Str):
-            return node.value
+            # BUGFIX: the real compiler interprets \n/\t escape sequences
+            # at codegen time (CodeGen.intern_str), not in the lexer — so
+            # the debugger's own separate interpreter, which never went
+            # through that code path, was returning string literals with
+            # escape sequences completely uninterpreted (e.g. a literal
+            # backslash-n instead of an actual newline). Matches
+            # intern_str's exact replacement set.
+            return node.value.replace("\\n", "\n").replace("\\t", "\t")
 
         if isinstance(node, ast.Bool):
             v = str(node.value).lower()
@@ -583,7 +649,11 @@ class Debugger:
             parts = []
             for part in node.parts:
                 val = self.evaluate(part)
-                parts.append(str(val) if val is not None else "")
+                # BUGFIX: was plain Python str(val) — showed e.g. "25.0" for
+                # a whole-number float (Python's default float repr) instead
+                # of matching the real compiler's %g-based formatting, and
+                # wouldn't show Null/True/False Rubidium-style either.
+                parts.append(self._format_value(val) if val is not None else "")
             return "".join(parts)
 
         if isinstance(node, ast.Var):
@@ -599,6 +669,19 @@ class Debugger:
                 return None
             return info["value"]
 
+        if isinstance(node, ast.DynResolve):
+            # BUGFIX/FEATURE: runtime SY reflection — mirrors the real
+            # compiler's rub_dynvar_get. self._dynvars is a plain dict
+            # standing in for the compiler's runtime hash-map; the key is
+            # the holder variable's CURRENT string value (so it can differ
+            # every time this is reached, e.g. inside a loop).
+            key_info = self.scope.lookup(node.holder_name)
+            key = key_info["value"] if key_info is not None else None
+            if key is None or key not in self._dynvars:
+                self.error(f"undefined dynamic variable '{key}'")
+                return None
+            return self._dynvars[key]
+
         if isinstance(node, ast.UnaryOp):
             val = self.evaluate(node.value)
             if node.op == "-":   return -val if val is not None else None
@@ -610,6 +693,18 @@ class Debugger:
         if isinstance(node, ast.BinOp):
             left  = self.evaluate(node.left)
             right = self.evaluate(node.right)
+            # BUGFIX: these must run BEFORE the try/except below — the
+            # generic `except Exception as e: self.error(f"Operation ...")`
+            # handler was catching the RuntimeError that self.error() itself
+            # raises (when inside a try/error block) and re-wrapping it with
+            # an unwanted "Operation '/' failed:" prefix, so a plain
+            # "Division by zero" never actually reached the user — it always
+            # showed as "Operation '/' failed: Division by zero" instead,
+            # diverging from the real compiler's plain message.
+            if node.op == "/" and right == 0:
+                self.error("Division by zero", highlight="/"); return None
+            if node.op == "*/" and left == 0:
+                self.error("Division by zero", highlight="*/"); return None
             try:
                 if node.op == "+":
                     if isinstance(left, str) or isinstance(right, str):
@@ -618,7 +713,6 @@ class Debugger:
                 if node.op == "-":   return left - right
                 if node.op == "*":   return left * right
                 if node.op == "/":
-                    if right == 0: self.error("Division by zero", highlight="/"); return None
                     if isinstance(left, int) and isinstance(right, int):
                         # Truncate toward zero (matches the compiler's sdiv),
                         # not Python's floor division.
@@ -628,10 +722,12 @@ class Debugger:
                 if node.op == "*/":
                     # n */ value -> value's n-th root (matches the unary
                     # `*/value` sqrt case, generalized to any degree).
-                    if left == 0: self.error("Division by zero", highlight="*/"); return None
                     return right ** (1.0 / left)
                 if node.op == "**":  return left ** right
-                if node.op == "%":   return left % right
+                if node.op == "%":
+                    if right == 0:
+                        self.error("Division by zero", highlight="%"); return None
+                    return left % right
                 if node.op == "and": return bool(left) and bool(right)
                 if node.op == "or":  return bool(left) or bool(right)
             except Exception as e:
@@ -717,11 +813,26 @@ class Debugger:
         args  = [self.evaluate(a) for a in node.args]
 
         # Built-ins
+        if fname == "random":
+            # BUGFIX/FEATURE: random(min, max, type) was entirely
+            # unimplemented — fell through every dispatch branch below
+            # (not a builtin match, not a user fn, not a class, not a
+            # declared variable) straight to `return None`, silently
+            # producing Null for any use of this builtin.
+            if len(args) >= 2:
+                lo, hi = args[0], args[1]
+                want_float = len(args) >= 3 and str(args[2]) in (
+                    "f32", "f64", "f128", "f256", "f512", "f1024", "f2048")
+                if want_float:
+                    return random.uniform(float(lo), float(hi))
+                return random.randint(int(lo), int(hi))
+            return None
         if fname == "print":
-            if args: print(args[0])
+            if args:
+                print(self._format_value(args[0]))
             return None
         if fname == "println":
-            if args: print(f"\r{args[0]}", end="")
+            if args: print(f"\r{self._format_value(args[0])}", end="")
             return None
         if fname == "input":
             return ""
@@ -767,10 +878,43 @@ class Debugger:
                             self.error(f"Index error on '{fname}': {e}")
                             return None
                     elif isinstance(col, dict):
-                        col = col.get(arg)
+                        # BUGFIX: dict.get() silently returns None for a
+                        # missing key — the real compiler raises a
+                        # catchable "key not found in collection" runtime
+                        # error instead, so try/error around an invalid
+                        # lookup actually catches something instead of
+                        # silently continuing with a bogus None/Null value.
+                        if arg not in col:
+                            self.error("collection access error" if self._try_depth > 0 else "key not found in collection")
+                            return None
+                        col = col[arg]
                     else:
                         return None
                 return col
+        elif node.name is not None:
+            # BUGFIX: node.name being non-string means this is either the
+            # existing chained-collection pattern (nested(0)(1) -> a nested
+            # FnCall as .name) or the new DynResolve node (runtime SY
+            # reflection) — both previously fell straight through to the
+            # `return None` below, since only the fname branch actually
+            # evaluated anything. Evaluate node.name itself to get the base
+            # collection, then apply the same indexing loop.
+            col = self.evaluate(node.name)
+            for arg in args:
+                if isinstance(col, list):
+                    try:
+                        col = col[int(arg)]
+                    except (IndexError, TypeError) as e:
+                        self.error(f"Index error: {e}")
+                        return None
+                elif isinstance(col, dict):
+                    if arg not in col:
+                        self.error("collection access error" if self._try_depth > 0 else "key not found in collection")
+                        return None
+                    col = col[arg]
+                else:
+                    return None
+            return col
 
         return None
 
@@ -779,7 +923,17 @@ class Debugger:
 
     def _eval_method_call(self, node):
         method = node.method
-        args   = [self.evaluate(a) for a in node.args]
+        # BUGFIX: `x.to(SY)` — SY here is a bare type-keyword argument (like
+        # i32/f64/etc are elsewhere), not a real variable reference, but the
+        # parser represents it the same as any other identifier (Var("SY")).
+        # The real compiler special-cases this at the type-conversion call
+        # site; evaluating it generically here crashed with "Variable 'SY'
+        # used before declaration" before even reaching the method-specific
+        # dispatch below (SY is never actually declared as a variable).
+        args = [
+            "SY" if isinstance(a, ast.Var) and a.name == "SY" else self.evaluate(a)
+            for a in node.args
+        ]
 
         # ── file.read()/write()/add()/writeln()/readln() as a plain
         # MethodCall (the parser only special-cases FileHandleMethod for
@@ -789,35 +943,33 @@ class Debugger:
             if info is not None and isinstance(info.get("value"), dict) and "path" in info["value"]:
                 return self._file_handle_op(node.obj.name, method, node.args)
 
-        # ── Special case: mutating method on a collection-element access ─────
+    # ── Special case: mutating method on a collection-element access ─────
         # e.g. my_list(0).set("val")   →  my_list[0] = "val"
         #      my_index("k").set("v")  →  my_index["k"] = "v"
         #      my_dict("key", 1).set(x) → my_dict["key"][1] = x
         if method == "set" and isinstance(node.obj, ast.FnCall):
-            fname = node.obj.name if isinstance(node.obj.name, str) else None
-            if fname:
-                info = self.scope.lookup(fname)
-                if info is not None:
-                    col      = info["value"]
-                    idx_args = [self.evaluate(a) for a in node.obj.args]
-                    new_val  = args[0] if args else None
-                    if isinstance(col, list) and len(idx_args) == 1:
+            col = self._resolve_collection_for_mutation(node.obj.name)
+            if col is not None:
+                fname = node.obj.name if isinstance(node.obj.name, str) else "<dynamic>"
+                idx_args = [self.evaluate(a) for a in node.obj.args]
+                new_val  = args[0] if args else None
+                if isinstance(col, list) and len(idx_args) == 1:
+                    try:
+                        col[int(idx_args[0])] = new_val
+                    except (IndexError, TypeError, ValueError) as e:
+                        self.error(f"'.set()' index error on '{fname}': {e}")
+                    return None
+                elif isinstance(col, dict) and len(idx_args) == 1:
+                    col[idx_args[0]] = new_val
+                    return None
+                elif isinstance(col, dict) and len(idx_args) == 2:
+                    sub = col.get(idx_args[0])
+                    if isinstance(sub, list):
                         try:
-                            col[int(idx_args[0])] = new_val
-                        except (IndexError, TypeError, ValueError) as e:
+                            sub[int(idx_args[1])] = new_val
+                        except (IndexError, TypeError) as e:
                             self.error(f"'.set()' index error on '{fname}': {e}")
-                        return None
-                    elif isinstance(col, dict) and len(idx_args) == 1:
-                        col[idx_args[0]] = new_val
-                        return None
-                    elif isinstance(col, dict) and len(idx_args) == 2:
-                        sub = col.get(idx_args[0])
-                        if isinstance(sub, list):
-                            try:
-                                sub[int(idx_args[1])] = new_val
-                            except (IndexError, TypeError) as e:
-                                self.error(f"'.set()' index error on '{fname}': {e}")
-                        return None
+                    return None
 
         # ── Special case: .add(val) on a dict key whose value is currently
         # Null (e.g. my_dict().add("new_key") then my_dict("new_key").add(99)).
@@ -827,15 +979,12 @@ class Debugger:
         # below, since a Null slot evaluates to None and would otherwise be
         # rejected as "method called on None".
         if method == "add" and isinstance(node.obj, ast.FnCall):
-            fname = node.obj.name if isinstance(node.obj.name, str) else None
-            if fname:
-                info = self.scope.lookup(fname)
-                if info is not None and isinstance(info.get("value"), dict):
-                    idx_args = [self.evaluate(a) for a in node.obj.args]
-                    col = info["value"]
-                    if len(idx_args) == 1 and idx_args[0] in col and col[idx_args[0]] is None:
-                        col[idx_args[0]] = [args[0]] if args else []
-                        return None
+            col = self._resolve_collection_for_mutation(node.obj.name)
+            if isinstance(col, dict):
+                idx_args = [self.evaluate(a) for a in node.obj.args]
+                if len(idx_args) == 1 and idx_args[0] in col and col[idx_args[0]] is None:
+                    col[idx_args[0]] = [args[0]] if args else []
+                    return None
 
         obj    = self.evaluate(node.obj)
         if obj is None:
@@ -859,6 +1008,24 @@ class Debugger:
 
         return result
 
+    def _resolve_collection_for_mutation(self, name_node):
+        """Given the .name of an FnCall used as an index/mutation target
+        (e.g. `quantities(sku).set(...)` -> name_node is "quantities"), return
+        the underlying mutable collection object — whether name_node is a
+        plain variable name (str) or a DynResolve node (runtime SY
+        reflection, e.g. `tmp(...).add(...)` where tmp is SY-typed).
+        Returns None if not resolvable. Python collections mutate in place,
+        so returning the live object is enough for callers to mutate
+        correctly regardless of which kind of name this was."""
+        if isinstance(name_node, str):
+            info = self.scope.lookup(name_node)
+            return info["value"] if info is not None else None
+        if isinstance(name_node, ast.DynResolve):
+            key_info = self.scope.lookup(name_node.holder_name)
+            key = key_info["value"] if key_info is not None else None
+            return self._dynvars.get(key) if key is not None else None
+        return None
+
     def _dispatch_method(self, obj, method, args):
 
         # ── Module stub — methods are no-ops in debug mode ───────────────────
@@ -872,12 +1039,16 @@ class Debugger:
                 for m in (cls.methods or []):
                     if m.name == method:
                         fn_scope = Scope(parent=self.scope)
-                        for fname, fval in obj.items():
-                            if fname != "__class__":
-                                fn_scope.declare(fname, {
-                                    "value": fval, "type": self.rub_type(fval),
-                                    "dropped": False, "mutable": True,
-                                })
+                        # BUGFIX: field names captured here so they can be
+                        # written back after the call (see below) — fields
+                        # are injected as fresh, independent scope entries,
+                        # not live references back into `obj`.
+                        field_names = [fname for fname in obj if fname != "__class__"]
+                        for fname in field_names:
+                            fn_scope.declare(fname, {
+                                "value": obj[fname], "type": self.rub_type(obj[fname]),
+                                "dropped": False, "mutable": True,
+                            })
                         for i, (pname, ptype) in enumerate(m.params):
                             fn_scope.declare(pname, {
                                 "value": args[i] if i < len(args) else None,
@@ -892,8 +1063,43 @@ class Debugger:
                             result = r.value
                         finally:
                             self.scope = saved
+                            # BUGFIX: `field = expr` inside a method body
+                            # (e.g. `health = health - amount`) only updated
+                            # fn_scope's own copy of "health", never `obj`
+                            # itself — the instance's field mutation was
+                            # silently discarded the moment the method
+                            # returned. Write back whatever fn_scope ended up
+                            # holding for each field name.
+                            for fname in field_names:
+                                info = fn_scope.vars.get(fname)
+                                if info is not None:
+                                    obj[fname] = info["value"]
                         return result
-            return obj.get(method)   # field access fallback
+            # BUGFIX: field access via call syntax (e.g. b.items(key), where
+            # "items" is a FIELD not a method) previously returned the raw
+            # field value completely ignoring any index args — so
+            # `b.items(key)` returned the whole dict instead of the value at
+            # `key`. Matches the same fix made in the real compiler for the
+            # identical pattern.
+            field_val = obj.get(method)
+            if args:
+                col = field_val
+                for a in args:
+                    if isinstance(col, list):
+                        try:
+                            col = col[int(a)]
+                        except (IndexError, TypeError, ValueError) as e:
+                            self.error(f"Index error on '{method}': {e}")
+                            return None
+                    elif isinstance(col, dict):
+                        if a not in col:
+                            self.error("collection access error" if self._try_depth > 0 else "key not found in collection")
+                            return None
+                        col = col[a]
+                    else:
+                        return None
+                return col
+            return field_val   # field access fallback (no index args)
 
         # ── str methods ───────────────────────────────────────────────────────
         if isinstance(obj, str):
@@ -969,6 +1175,17 @@ class Debugger:
             if method == "floor": import math; return math.floor(obj)
             if method == "ceil":  import math; return math.ceil(obj)
             if method == "sqrt":  import math; return math.sqrt(obj)
+            if method in ("to", "to_int"):
+                # BUGFIX: was entirely unhandled for int/float objects,
+                # always returning None — e.g. `x.to(SY)` (building a
+                # dynamic name via concatenation, like 'w' + x.to(SY)) had
+                # no implementation at all here.
+                t = args[0] if args else ""
+                if t == "SY":
+                    return str(int(obj))
+                if t in ("f32", "f64", "f128", "f256", "f512", "f1024", "f2048"):
+                    return float(obj)
+                return int(obj)
             return None
 
         return None
@@ -2177,7 +2394,11 @@ class Analyzer:
         name = node.name
         
         # Intercept native types passed as configuration/function args
-        if name in ALL_TYPES:
+        # BUGFIX: SY isn't part of ALL_TYPES (it's a reflection-specific
+        # pseudo-type, not a real value type), so `x.to(SY)` was flagged as
+        # a reference to an undeclared variable named "SY" — a false
+        # positive on entirely valid code.
+        if name in ALL_TYPES or name == "SY":
             return
 
         # Check scope first — a declared variable shadows a namespace with the same name.
@@ -2562,10 +2783,19 @@ def _token_syntax_check(tokens: list, source_lines: list) -> list:
             if j < n and tokens[j][0] == 'MUT':   j += 1
             if j < n and tokens[j][0] == 'LOCAL':  j += 1
             if j < n and tokens[j][0] not in ('IDENT', 'TYPE', 'FILE'):
-                found = tokens[j][1] if j < n else '?'
-                emit(tok[2], 'Missing Variable Name',
-                     f"Variable declaration is missing a name — found '{found}' instead",
-                     "let my_variable: type = value")
+                # BUGFIX: `let (name): type = ...` is valid SY-reflection
+                # syntax (the declared name is dynamically substituted from
+                # a previously-declared SY symbol) — LPAREN IDENT RPAREN,
+                # not a bare name token. Don't flag it as missing a name.
+                is_sy_reflection = (
+                    tokens[j][0] == 'LPAREN' and j + 2 < n and
+                    tokens[j + 1][0] == 'IDENT' and tokens[j + 2][0] == 'RPAREN'
+                )
+                if not is_sy_reflection:
+                    found = tokens[j][1] if j < n else '?'
+                    emit(tok[2], 'Missing Variable Name',
+                         f"Variable declaration is missing a name — found '{found}' instead",
+                         "let my_variable: type = value")
 
     # ── 7. 'if' / 'while' / 'for' body missing '{' ───────────────────────────
     # Track which tokens are condition-enders so we can spot missing braces.
