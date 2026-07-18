@@ -649,7 +649,6 @@ file.list("data/")                   # used like linux ls command
 try {
     open("missing.txt") as file {
         print(file.read())
-    }
 } error {
     print("File error: " + error)
 }
