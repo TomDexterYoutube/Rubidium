@@ -45,7 +45,7 @@ TOKEN_SPEC = [
     ("OR",       r"or\b"),
     ("NOT",      r"not\b"),
 
-    ("TYPE",     r"\bstr\+|\bSY\b|\b(?:i32|i64|i128|i256|i512|i1024|i2048|f32|f64|f128|f256|f512|f1024|f2048|str|bool|list|index|dict|Any)\b"),
+    ("TYPE",     r"\bstr\+|\bdict\+|\bSY\b|\b(?:i32|i64|i128|i256|i512|i1024|i2048|f32|f64|f128|f256|f512|f1024|f2048|str|bool|list|index|dict|Any)\b"),
     ("LOCAL",    r"\blocal\b"),
     ("OPEN",     r"\bopen\b"),
 

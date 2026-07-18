@@ -21,6 +21,13 @@ RUNTIME_C = r"""
 typedef struct { int type; long long i; double f; char* s; void* p; } Box;
 typedef struct { int magic; Box** items; int count; int cap; } RList;
 typedef struct { int magic; Box** keys; Box** vals; int count; int cap; } RDict;
+// FEATURE: dict+ reuses the exact same RDict layout as dict — the only
+// runtime difference is the magic number (4 instead of 2), used solely to
+// distinguish what `.add(newkey)` (empty path, 1 arg) should create as the
+// new key's default value: dict creates Null, dict+ creates an empty
+// nested dict+ (magic 4 again, recursively). Every other operation
+// (get/set/drop/len/iterate/print) treats magic 2 and 4 identically.
+#define IS_DICT_MAGIC(m) ((m) == 2 || (m) == 4)
 
 Box* _thread_results[1024]; 
 
@@ -123,7 +130,7 @@ void box_drop(Box* b) {
             RList* l = (RList*)b->p;
             for(int i=0; i<l->count; i++) box_drop(l->items[i]);
             free(l->items); free(l);
-        } else if (magic && *magic == 2) {
+        } else if (magic && IS_DICT_MAGIC(*magic)) {
             RDict* d = (RDict*)b->p;
             for(int i=0; i<d->count; i++) { box_drop(d->keys[i]); box_drop(d->vals[i]); }
             free(d->keys); free(d->vals); free(d);
@@ -320,6 +327,10 @@ Box* list_get(void* col, Box* idx) {
 }
 
 Box* make_dict() { RDict* d=malloc(sizeof(RDict)); d->magic=2; d->count=0; d->cap=8; d->keys=malloc(8*sizeof(Box*)); d->vals=malloc(8*sizeof(Box*)); return box_p(d); }
+// FEATURE: dict+ — identical to make_dict() except for the magic number
+// (see IS_DICT_MAGIC). Used for dict+ literals and for the empty nested
+// dict+ that collection_add1 creates as a new key's default value.
+Box* make_dictplus() { RDict* d=malloc(sizeof(RDict)); d->magic=4; d->count=0; d->cap=8; d->keys=malloc(8*sizeof(Box*)); d->vals=malloc(8*sizeof(Box*)); return box_p(d); }
 
 // Recursive content equality for any Box value, including nested list/index/dict
 // collections. Per spec: "Collection equality compares contents... checked
@@ -384,7 +395,7 @@ Box* box_deep_copy(Box* src) {
         for(int i=0;i<sl->count;i++) dl->items[i]=box_deep_copy(sl->items[i]);
         return box_p(dl);
     }
-    if(*magic==2) {
+    if(IS_DICT_MAGIC(*magic)) {
         RDict* sd = (RDict*)src->p;
         RDict* dd = malloc(sizeof(RDict));
         dd->magic=2; dd->count=sd->count; dd->cap=sd->count>0?sd->count:1;
@@ -407,7 +418,7 @@ int box_eq(Box* a, Box* b) {
 void dict_set(Box* dct, Box* k, Box* v) {
     if(!dct || dct->type != 3) return;
     RDict* d=dct->p;
-    if(!d || d->magic != 2) return; /* not a dict */
+    if(!d || !IS_DICT_MAGIC(d->magic)) return; /* not a dict/dict+ */
     for(int i=0;i<d->count;i++) if(box_eq(d->keys[i],k)) { 
         box_drop(d->vals[i]);
         d->vals[i]=v; 
@@ -440,6 +451,9 @@ void collection_add1(Box* col_box, Box* arg) {
     } else if (magic == 2) {
         Box* null_val = box_i(-2147483648LL);  // Rubidium Null sentinel
         dict_set(col_box, arg, null_val);
+    } else if (magic == 4) {
+        // dict+ : new key defaults to an empty nested dict+, not Null.
+        dict_set(col_box, arg, make_dictplus());
     }
 }
 Box* dict_get(void* col, Box* k) {
@@ -470,7 +484,7 @@ Box* collection_get(Box* col_box, Box* key) {
     if(!col) return box_i(0);
     int* magic = (int*)col;
     if (*magic == 1) return list_get(col, key);
-    if (*magic == 2) return dict_get(col, key);
+    if (IS_DICT_MAGIC(*magic)) return dict_get(col, key);
     return box_i(0);
 }
 
@@ -498,7 +512,7 @@ void collection_set(Box* col_box, Box* key, Box* val) {
         } else if (i == l->count) {
             list_append(col_box, val);
         }
-    } else if (*magic == 2) {
+    } else if (IS_DICT_MAGIC(*magic)) {
         dict_set(col_box, key, val);
     }
 }
@@ -514,7 +528,7 @@ void collection_drop(Box* col_box, Box* key) {
         box_drop(l->items[idx]);
         for (int j = (int)idx; j < l->count - 1; j++) l->items[j] = l->items[j+1];
         l->count--;
-    } else if (*magic == 2) {
+    } else if (IS_DICT_MAGIC(*magic)) {
         RDict* d = (RDict*)col_box->p;
         for (int j = 0; j < d->count; j++) {
             if (box_eq(d->keys[j], key)) {
@@ -535,7 +549,7 @@ int collection_len(Box* col_box) {
     if(!col) return 0;
     int* magic = (int*)col;
     if (*magic == 1) return ((RList*)col)->count;
-    if (*magic == 2) return ((RDict*)col)->count;
+    if (IS_DICT_MAGIC(*magic)) return ((RDict*)col)->count;
     return 0;
 }
 
@@ -555,7 +569,7 @@ int collection_has(Box* col, Box* needle) {
         RList* l = ptr;
         for(int i = 0; i < l->count; i++)
             if(box_eq(l->items[i], needle)) return 1;
-    } else if (*magic == 2) {
+    } else if (IS_DICT_MAGIC(*magic)) {
         RDict* d = ptr;
         for(int i = 0; i < d->count; i++)
             if(box_eq(d->keys[i], needle)) return 1;
@@ -578,7 +592,7 @@ Box* collection_get_at(Box* col_box, int idx) {
         RList* l = col;
         if(idx>=0 && idx<l->count) return l->items[idx];
     }
-    if (*magic == 2) {
+    if (IS_DICT_MAGIC(*magic)) {
         RDict* d = col;
         if(idx>=0 && idx<d->count) return d->keys[idx];
     }
@@ -674,7 +688,7 @@ char* box_to_cstr(Box* b) {
             }
             out[pos++] = ']'; out[pos] = '\0';
             free(buf); return out;
-        } else if(magic && *magic==2) {
+        } else if(magic && IS_DICT_MAGIC(*magic)) {
             // Dict → "{key: val, ...}"
             RDict* d = (RDict*)b->p;
             size_t cap = 256; char* out = malloc(cap); size_t pos = 0;

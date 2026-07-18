@@ -28,9 +28,16 @@ class ListExpr:
         self.elements = elements
 
 class DictExpr:
-    def __init__(self, pairs, is_index: bool = False):
+    def __init__(self, pairs, is_index: bool = False, is_dictplus: bool = False):
         self.pairs = pairs
         self.is_index = is_index  # True for [key: val] index literals, False for {key = val} dict literals
+        # FEATURE: dict+ — recursively-nestable dict where a value is either
+        # a list (leaf, same as regular dict) or another {..} block (deeper
+        # nesting). Same runtime RDict layout as dict, distinguished only by
+        # a different magic number (see IS_DICT_MAGIC in the C runtime) —
+        # this flag is what tells codegen to create it with that magic
+        # number instead of a regular dict's.
+        self.is_dictplus = is_dictplus
 
 class BinOp:
     def __init__(self, left, op, right):

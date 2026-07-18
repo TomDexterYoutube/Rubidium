@@ -32,6 +32,7 @@ declare %Box* @make_list()
 declare void @list_append(%Box*, %Box*)
 declare void @list_swap(%Box*, i32, i32)
 declare %Box* @make_dict()
+declare %Box* @make_dictplus()
 declare void @dict_set(%Box*, %Box*, %Box*)
 declare %Box* @collection_get(%Box*, %Box*)
 declare void @collection_set(%Box*, %Box*, %Box*)
@@ -241,7 +242,7 @@ class CodeGen:
         return min_v, max_v
 
     def rubi_type_to_ir(self, t):
-        if t in ("list", "index", "dict", "Any"): return "%Box*"
+        if t in ("list", "index", "dict", "dict+", "Any"): return "%Box*"
         if t == "bool":  return "i1"
         if t == "str":   return "i8*"
         if t == "str+":  return "i8*"  # bugs.log #3: str+ (big/multi-line string) uses the same representation as str
@@ -2602,8 +2603,15 @@ class CodeGen:
                 self.emit(f"  call void @list_append(%Box* {lst}, %Box* {eb})")
             return lst, "%Box*"
         if isinstance(node, DictExpr):
+            # FEATURE: dict+ — same underlying RDict layout as dict, just a
+            # different magic number (see IS_DICT_MAGIC in the C runtime),
+            # used solely to distinguish what `.add(newkey)` should create
+            # as a new key's default value (dict: Null, dict+: an empty
+            # nested dict+). node.is_dictplus is set recursively by the
+            # parser for every level of a `let x: dict+ = {...}` literal.
+            ctor = "make_dictplus" if node.is_dictplus else "make_dict"
             dct = self.new_tmp()
-            self.emit(f"  {dct} = call %Box* @make_dict()")
+            self.emit(f"  {dct} = call %Box* @{ctor}()")
             for k, v in node.pairs:
                 kv, kt = self.emit_expr(k); vv, vt = self.emit_expr(v)
                 kb = self.coerce_to_box(kv, kt); vb = self.coerce_to_box(vv, vt)

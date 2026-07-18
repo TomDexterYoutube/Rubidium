@@ -37,6 +37,20 @@ class Parser:
             self.line_no = self.tokens[self.pos][2] if len(self.tokens[self.pos]) > 2 else self.line_no
         self.pos += 1
 
+    def _mark_dictplus(self, node):
+        """FEATURE: dict+ — recursively mark a DictExpr (and any nested
+        DictExpr values within its pairs, to unlimited depth) as dict+,
+        so codegen knows to create each level with the dict+ magic number
+        instead of a regular dict's. Only the declaration site
+        (`let x: dict+ = {...}`) knows the intended type; nested `{...}`
+        blocks written directly inside that same literal are statically
+        known at parse time and marked here too."""
+        if not isinstance(node, DictExpr):
+            return
+        node.is_dictplus = True
+        for _, v in node.pairs:
+            self._mark_dictplus(v)
+
     def _resolve_sy_name(self):
         """BUGFIX/FEATURE (bugs.log #2): if the parser is sitting on
         `( IDENT )` where IDENT is a known SY symbol, consume all three
@@ -369,6 +383,8 @@ class Parser:
             # type, so the substitution has to happen here.
             if vtype == "index" and isinstance(value, ListExpr) and not value.elements:
                 value = DictExpr([], is_index=True)
+            if vtype == "dict+":
+                self._mark_dictplus(value)
             return DynVarDecl(dyn_holder, mut, is_local, vtype, value)
         # BUGFIX/FEATURE (bugs.log #2): `let (function_name)...` — this is
         # only still reachable for the STATIC (literal-valued) SY case here,
@@ -407,6 +423,8 @@ class Parser:
         # v)`-style key-value inserts crash at runtime.
         if vtype == "index" and isinstance(value, ListExpr) and not value.elements:
             value = DictExpr([], is_index=True)
+        if vtype == "dict+":
+            self._mark_dictplus(value)
         # BUGFIX/FEATURE (bugs.log #9): `let x: SY = <expr>` used to be a
         # pure compile-time mapping with NO runtime existence at all — fine
         # for a literal string, but any non-literal expression (e.g.
