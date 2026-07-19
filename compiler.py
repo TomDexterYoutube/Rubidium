@@ -6,7 +6,7 @@ import glob
 
 from lexer import tokenize
 from parser import Parser
-from rub_ast import Import, Use, VarDecl, FnDef, ClassDef, Assign, Drop, FFIBind
+from rub_ast import Import, Use, VarDecl, FnDef, ClassDef, Assign, Drop, FFIBind, If, While, For, Try, FileOpen, ClassDef
 from codegen import CodeGen, RubidiumTypeError, RubidiumNameError
 
 RUNTIME_C = r"""
@@ -828,15 +828,13 @@ void os_start(long long id) {
 
 // Run a command in the terminal, optionally sending `input` to stdin.
 // Returns all output as a heap-allocated string. Caller should free.
+// If command fails (non-zero exit), returns NULL and sets _rub_error_msg for try/error handler.
 char* os_run(long long id, const char* cmd, const char* input) {
     if(id<0||id>=1024||!_os_terminals[id].active) return strdup("");
 
     OsTerminal* t = &_os_terminals[id];
 
     // Write command + newline.
-    // When input is provided, use printf 'INPUT' | CMD so the child process
-    // gets a self-contained closed stdin — prevents it lingering and consuming
-    // subsequent os.run commands as its own stdin.
     if(input && strlen(input)>0) {
         size_t ilen = strlen(input);
         char* escaped = malloc(ilen*4+4);
@@ -856,12 +854,17 @@ char* os_run(long long id, const char* cmd, const char* input) {
         write(t->stdin_fd, "\n", 1);
     }
 
+    // Send exit code capture command
+    write(t->stdin_fd, "echo \"RUBIDIUM_EXIT_CODE:$?\"\n", 29);
+
     // Collect output with timeout
     char buf[4096];
     char* out = malloc(1);
     out[0]='\0';
     size_t out_len=0;
     int retries=30; // up to 1.5s total
+    int exit_code = 0;
+    int exit_code_found = 0;
     while(retries-->0) {
         usleep(50000);
         ssize_t n = read(t->stdout_fd, buf, sizeof(buf)-1);
@@ -871,10 +874,36 @@ char* os_run(long long id, const char* cmd, const char* input) {
             memcpy(out+out_len, buf, n);
             out_len+=n; out[out_len]='\0';
             retries=5; // got data, keep reading a bit more
+
+            // Check for exit code marker
+            char* marker = strstr(out, "RUBIDIUM_EXIT_CODE:");
+            if(marker) {
+                exit_code = atoi(marker + 19);
+                exit_code_found = 1;
+                // Remove the exit code line from output
+                char* newline = strchr(marker, '\n');
+                if(newline) {
+                    size_t before = marker - out;
+                    size_t after = out_len - (newline + 1 - out);
+                    memmove(marker, newline + 1, after + 1);
+                    out_len = before + after;
+                    out[out_len] = '\0';
+                }
+            }
         } else if(n<0 && errno==EAGAIN) {
             if(out_len>0 && retries<10) break; // got some output, we're done
         }
     }
+
+    // If command failed, return NULL and set error message for try/error handler
+    if(exit_code_found && exit_code != 0) {
+        char* err_msg = malloc(out_len + 128);
+        sprintf(err_msg, "Command failed (exit %d): %s", exit_code, out);
+        free(out);
+        _rub_error_msg = err_msg;
+        return NULL;
+    }
+
     return out; // caller must free
 }
 
@@ -1290,7 +1319,8 @@ def parse_file(filepath, parsed_files, combined_ast, is_main=False, mod_name_ove
     # Package imports (`xeon <name>`) override this: every package's main file
     # is literally named pkg.rub, so deriving the prefix from the filename
     # would collide across packages — use the package name instead.
-    mod_name = mod_name_override or os.path.splitext(os.path.basename(filepath))[0]
+    # Sanitize: replace hyphens with underscores for valid LLVM identifiers
+    mod_name = (mod_name_override or os.path.splitext(os.path.basename(filepath))[0]).replace("-", "_")
     
     try:
         with open(filepath, "r") as f:
@@ -1302,9 +1332,15 @@ def parse_file(filepath, parsed_files, combined_ast, is_main=False, mod_name_ove
     tokens = tokenize(code)
     ast = Parser(tokens).parse()
     
-    # First pass: prefix all names (only for imported files, not main)
+    # Collect local function names BEFORE prefixing (for _prefix_fn_calls)
+    local_fns_original = set()
     for node in ast:
-        if not is_main:
+        if isinstance(node, FnDef):
+            local_fns_original.add(node.name)  # Original name before prefixing
+    
+    # First pass: prefix all names (only for imported files, not main)
+    if not is_main:
+        for node in ast:
             if isinstance(node, (VarDecl, FnDef, ClassDef)):
                 node.name = f"{mod_name}_{node.name}"
             elif isinstance(node, Assign) and not node.name.startswith(mod_name + "_"):
@@ -1313,12 +1349,6 @@ def parse_file(filepath, parsed_files, combined_ast, is_main=False, mod_name_ove
                 node.name = f"{mod_name}_{node.name}"
             elif isinstance(node, FFIBind) and not node.handle_name.startswith(mod_name + "_"):
                 node.handle_name = f"{mod_name}_{node.handle_name}"
-    
-    # Collect local function names BEFORE prefixing (for _prefix_fn_calls)
-    local_fns_original = set()
-    for node in ast:
-        if isinstance(node, FnDef):
-            local_fns_original.add(node.name)  # This is the ORIGINAL name before prefixing
     
     # Collect local function names AFTER prefixing (for CodeGen)
     local_fns_prefixed = set()
@@ -1333,7 +1363,35 @@ def parse_file(filepath, parsed_files, combined_ast, is_main=False, mod_name_ove
                 for stmt in node.body:
                     _prefix_fn_calls(stmt, mod_name, local_fns_original)
     
-    for node in ast:
+    def _find_imports(stmts):
+        """Recursively find Import nodes in a list of statements (including nested in functions)."""
+        imports = []
+        for stmt in stmts:
+            if isinstance(stmt, Import):
+                imports.append(stmt)
+            elif isinstance(stmt, FnDef):
+                imports.extend(_find_imports(stmt.body))
+            elif isinstance(stmt, If):
+                imports.extend(_find_imports(stmt.then_body))
+                imports.extend(_find_imports(stmt.else_body or []))
+            elif isinstance(stmt, While):
+                imports.extend(_find_imports(stmt.body))
+            elif isinstance(stmt, For):
+                imports.extend(_find_imports(stmt.body))
+            elif isinstance(stmt, Try):
+                imports.extend(_find_imports(stmt.try_body))
+                imports.extend(_find_imports(stmt.error_body))
+            elif isinstance(stmt, FileOpen):
+                imports.extend(_find_imports(stmt.body))
+            elif isinstance(stmt, ClassDef):
+                for m in stmt.methods:
+                    imports.extend(_find_imports(m.body))
+        return imports
+
+    # Find all Import nodes (including those nested in function bodies)
+    all_imports = _find_imports(ast)
+    
+    for node in all_imports:
         if isinstance(node, Import):
             if node.is_xeon_pkg:
                 pkg_dir = os.path.join(os.path.expanduser("~"), ".xeon", "packages", node.module_name)
@@ -1359,8 +1417,21 @@ def parse_file(filepath, parsed_files, combined_ast, is_main=False, mod_name_ove
             continue
     
     combined_ast.extend(ast)
-    
+
 def compile_files(source_files, output=None, shared_lib=False):
+    def _find_imports_in_ast(ast_nodes):
+        """Recursively find Import nodes in AST (including nested in functions)."""
+        imports = []
+        for node in ast_nodes:
+            if isinstance(node, Import):
+                imports.append(node)
+            elif isinstance(node, FnDef):
+                imports.extend(_find_imports_in_ast(node.body))
+            elif isinstance(node, ClassDef):
+                for m in node.methods:
+                    imports.extend(_find_imports_in_ast(m.body))
+        return imports
+
     try:
         parsed_files = set()
         combined_ast = []
@@ -1368,9 +1439,12 @@ def compile_files(source_files, output=None, shared_lib=False):
         for i, source_file in enumerate(source_files):
             parse_file(source_file, parsed_files, combined_ast, is_main=(i == 0))
 
+        # Find all Import nodes in the combined AST (including nested in functions)
+        all_imports = _find_imports_in_ast(combined_ast)
+        
         gen = CodeGen(import_aliases={
-            node.alias: os.path.splitext(os.path.basename(node.module_name.replace(".", os.sep)))[0]
-            for node in combined_ast
+            node.alias: os.path.splitext(os.path.basename(node.module_name.replace(".", os.sep)))[0].replace("-", "_")
+            for node in all_imports
             if isinstance(node, Import) and getattr(node, 'alias', None)
         }, shared_lib=shared_lib)
         ir_code = gen.gen(combined_ast)

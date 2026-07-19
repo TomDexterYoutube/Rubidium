@@ -18,7 +18,7 @@ declare double @fabs(double)
 declare double @floor(double)
 declare double @ceil(double)
 declare double @round(double)
-%Box = type opaque
+%Box = type { i32, i64, double, i8*, i8* }
 declare %Box* @box_i(i64)
 declare %Box* @box_f(double)
 declare %Box* @box_s(i8*)
@@ -105,6 +105,7 @@ class CodeGen:
         self.loop_end_stack = []
         self.loop_cond_stack = []  # continue target labels
         self.linked_to = {}  # bugs.log #5: name -> target name for scalar `link` aliasing
+        self.element_types = {}  # bugs.log #2: var_name -> element_type for collection type enforcement
         self.cur_class    = None
         self._alloca_emitted = set()  # local var names that already have an alloca in current fn
         self._try_error_label = None  # set while inside a try body for div-by-zero guards
@@ -479,6 +480,8 @@ class CodeGen:
                 self.functions[original_name] = s
 
         self._register_implicit_class_fields()
+        # Initialize local_vars_stack for _collect_global which uses it for global vars
+        self.local_vars_stack = [{}]
         self.collect_globals(stmts)
         for cls in self.class_defs.values(): self.emit_class_type(cls)
 
@@ -711,6 +714,13 @@ class CodeGen:
             if obj_name in self._file_handle_vars:
                 if node.method in ("read", "readln"): return "i8*"
                 return "i64"
+            # Check import aliases (e.g., xeon config-wiz as cf -> cf.read maps to config-wiz_read)
+            if obj_name in self.import_aliases:
+                resolved_name = self.import_aliases[obj_name]
+                target_name = f"{resolved_name}_{node.method}"
+                if target_name in self.functions:
+                    fn_obj = self.functions[target_name]
+                    return self.rubi_type_to_ir(fn_obj.ret_type) if fn_obj.ret_type else "i64"
             
             raise RubidiumNameError(f"Cannot infer type for method call '{node.method}' on object '{obj_name}'")
 
@@ -815,9 +825,14 @@ class CodeGen:
                         # sensitive elsewhere; _infer_type's fallback checks
                         # both.
                         self._prescan_instances.setdefault(node.name, raw_cn)
-                        continue  # class instances aren't part of scalar polymorphism tracking
+                        # Still track the class type for polymorphism detection
+                        ir_t = f"{self.class_ir_type(raw_cn)}*"
+                        type_map.setdefault(node.name, set()).add(ir_t)
+                        continue
                     if f"main_{raw_cn}" in self.class_defs:
                         self._prescan_instances.setdefault(node.name, f"main_{raw_cn}")
+                        ir_t = f"{self.class_ir_type(f'main_{raw_cn}')}*"
+                        type_map.setdefault(node.name, set()).add(ir_t)
                         continue
                 ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
                 type_map.setdefault(node.name, set()).add(ir_t)
@@ -846,7 +861,7 @@ class CodeGen:
         if isinstance(node, DynVarDecl):
             return  # bugs.log #9: dynamic hash-map entry, no named global to pre-declare
         if isinstance(node, VarDecl):
-            # Local variables are function-scoped, not global
+# Local variables are function-scoped, not global
             if node.is_local:
                 return
             cn = None
@@ -857,14 +872,20 @@ class CodeGen:
             
             if cn:
                 ir_t = f"{self.class_ir_type(cn)}*"
+                # Check if this name was declared with different types (polymorphic)
+                if node.name in getattr(self, "_polymorphic_globals", ()):
+                    ir_t = "%Box*"
                 self.declare_global(node.name, ir_t)
                 self.instances[node.name] = cn
             else:
                 ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
-                if node.name in getattr(self, "_polymorphic_globals", ()):
+                if node.name in getattr(self, "_local_polymorphic", ()):
                     ir_t = "%Box*"
-                self.declare_global(node.name, ir_t)
-            if node.mutable: self.mutable_vars.add(node.name)
+                self.local_vars_stack[-1][node.name] = ir_t
+                # Track element type for collection type enforcement (bugs.log #2)
+                if node.element_type:
+                    self.element_types[node.name] = node.element_type
+                if node.mutable: self.mutable_vars.add(node.name)
         elif isinstance(node, FFIBind):
             # Pre-register the bound symbol so calls resolve in collect pass.
             # Use the 'as' alias when provided (e.g. fn lib rb_sin(...) -> f64 as sin  → "sin")
@@ -1116,6 +1137,9 @@ class CodeGen:
                 if node.name in getattr(self, "_local_polymorphic", ()):
                     ir_t = "%Box*"
                 self.local_vars_stack[-1][node.name] = ir_t
+                # Track element type for collection type enforcement (bugs.log #2)
+                if node.element_type:
+                    self.element_types[node.name] = node.element_type
                 if node.mutable: self.mutable_vars.add(node.name)
                 ptr_str = f"%ptr_{node.name}"
                 if node.name not in self._alloca_emitted:
@@ -1184,6 +1208,9 @@ class CodeGen:
                 if node.name in getattr(self, "_local_polymorphic", ()):
                     ir_t = "%Box*"
                 self.local_vars_stack[-1][node.name] = ir_t
+                # Track element type for collection type enforcement (bugs.log #2)
+                if node.element_type:
+                    self.element_types[node.name] = node.element_type
                 if node.mutable: self.mutable_vars.add(node.name)
                 ptr_str = f"%ptr_{node.name}"
                 if node.name not in self._alloca_emitted:
@@ -1212,8 +1239,11 @@ class CodeGen:
                         self.emit_class_init(f"@{ir_name}", cn, init_args)
                     return False
                 ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
-                if node.mutable: self.mutable_vars.add(node.name)
+                if node.mutable: self.mutable_vars.add(node.mutable)
                 self.declare_global(node.name, ir_t)
+                # Track element type for collection type enforcement (bugs.log #2)
+                if node.element_type:
+                    self.element_types[node.name] = node.element_type
                 # Use the AUTHORITATIVE type the global was actually declared with
                 # (may be %Box* if this name was re-declared elsewhere with a
                 # different type — see collect_globals's polymorphism detection).
@@ -1231,10 +1261,9 @@ class CodeGen:
                         self.global_decls.append(f"{slot} = global i64 -1")
                     self.emit(f"  store i64 {val}, i64* {slot}")
                 return False
-
-            
+ 
         elif isinstance(node, Assign):
-            if node.name in self.dropped_vars: raise RubidiumNameError(f"Var '{node.name}' is dropped")
+            if node.name in self.dropped_vars: raise RubidiumNameError(f"Var '{node.name}'")
             
             # --- FIX: Check for Field Assignment ---
             # BUGFIX (bugs.log #15): same precedence fix as the Var read path
@@ -1254,7 +1283,8 @@ class CodeGen:
                     ptr_str, ir_t = self.get_var_ptr(node.name)
                 val, val_t = self.emit_expr(node.value)
                 val = self.coerce(val, val_t, ir_t)
-                val = self._deep_copy_if_var(val, val_t, node.value)
+                # Deep copy only if the COERCED value is a Box* (collection), not the original value
+                val = self._deep_copy_if_var(val, ir_t, node.value)
                 self.emit(f"  store {ir_t} {val}, {ir_t}* {ptr_str}")
                 
         elif isinstance(node, FieldAssign): self.emit_field_assign(node)
@@ -1402,6 +1432,66 @@ class CodeGen:
             if name not in self.mutable_vars:
                 raise RubidiumTypeError(f"Cannot modify '{name}': collection is not declared 'mut'")
 
+    def _check_element_type(self, base_var_name, val_b):
+        """Check if the value being added to a collection matches the declared element type (bugs.log #2)."""
+        if base_var_name and base_var_name in self.element_types:
+            expected_type = self.element_types[base_var_name]
+            # Get the actual type of the value being added
+            # We need to unbox and check the type at runtime
+            # For now, we'll emit a runtime check
+            self._emit_element_type_check(base_var_name, expected_type, val_b)
+
+    def _emit_element_type_check(self, base_var_name, expected_type, val_b):
+        """Emit IR to check if the value being added matches the expected element type."""
+        # Map Rubidium element types to Box type tags
+        # Box type tags: 0=int, 1=float, 2=string, 3=collection, 4=bool
+        type_tag_map = {
+            "i32": 0, "i64": 0, "i128": 0, "i256": 0, "i512": 0, "i1024": 0, "i2048": 0,
+            "f32": 1, "f64": 1, "f128": 1, "f256": 1, "f512": 1, "f1024": 1, "f2048": 1,
+            "str": 2,
+            "bool": 4,
+        }
+        expected_tag = type_tag_map.get(expected_type)
+        if expected_tag is None:
+            return  # Unknown type, skip check
+        
+        # Get the box's type field (field 0 of Box struct)
+        type_field = self.new_tmp()
+        self.emit(f"  {type_field} = getelementptr inbounds %Box, %Box* {val_b}, i32 0, i32 0")
+        actual_tag = self.new_tmp()
+        self.emit(f"  {actual_tag} = load i32, i32* {type_field}")
+        
+        # Compare with expected tag
+        cmp_result = self.new_tmp()
+        self.emit(f"  {cmp_result} = icmp eq i32 {actual_tag}, {expected_tag}")
+        
+        # Branch to error or continue
+        error_label = self.new_label("type_err")
+        ok_label = self.new_label("type_ok")
+        self.emit(f"  br i1 {cmp_result}, label %{ok_label}, label %{error_label}")
+        
+        # Error block: throw type error
+        self.emit(f"{error_label}:")
+        error_lbl, error_len = self.intern_str(f"Type error: expected {expected_type} for collection '{base_var_name}', got different type")
+        error_ptr = self.new_tmp()
+        self.emit(f"  {error_ptr} = getelementptr [{error_len} x i8], [{error_len} x i8]* {error_lbl}, i64 0, i64 0")
+        self.emit(f"  store i8* {error_ptr}, i8** @_rub_error_msg")
+        self.emit(f"  call void @rub_throw(i8* {error_ptr})")
+        self.emit(f"  unreachable")
+        
+        # OK block: continue
+        self.emit(f"{ok_label}:")
+    
+    def _check_os_run_error(self, res):
+        """Check if os_run returned NULL (command failed) and branch to try error handler."""
+        if self._try_error_label:
+            is_null = self.new_tmp()
+            self.emit(f"  {is_null} = icmp eq i8* {res}, null")
+            ok_l = self.new_label("osrunok")
+            self.emit(f"  br i1 {is_null}, label %{self._try_error_label}, label %{ok_l}")
+            self.emit(f"{ok_l}:")
+            # The error message is already in _rub_error_msg set by os_run C function
+    
     def emit_guarded_collection_get(self, col_b, key_b, err_msg="collection access error"):
         """Emit a collection_get with a try-block null-check guard if inside a try."""
         if self._try_error_label:
@@ -1554,10 +1644,16 @@ class CodeGen:
         
         keys = []
         curr = access_node
+        base_var_name = None
         while isinstance(curr, (FnCall, MethodCall)):
             if curr.args:
                 keys = curr.args + keys
             curr = curr.obj if isinstance(curr, MethodCall) else curr.name
+        # Get the base variable name for element type checking
+        if isinstance(curr, Var):
+            base_var_name = curr.name
+        elif isinstance(curr, str):
+            base_var_name = curr
         
         self._check_collection_mutable(curr)
         # Handle Var that is a class field (e.g., scores inside a class method)
@@ -1582,12 +1678,16 @@ class CodeGen:
             if len(val_nodes) == 1:
                 val_v, val_t = self.emit_expr(val_nodes[0])
                 val_b = self.coerce_to_box(val_v, val_t)
+                # Check element type constraint if declared (bugs.log #2)
+                self._check_element_type(base_var_name, val_b)
                 self.emit(f"  call void @collection_add1(%Box* {col_b}, %Box* {val_b})")
             elif len(val_nodes) == 2:
                 key_v, key_t = self.emit_expr(val_nodes[0])
                 val_v, val_t = self.emit_expr(val_nodes[1])
                 key_b = self.coerce_to_box(key_v, key_t)
                 val_b = self.coerce_to_box(val_v, val_t)
+                # Check element type constraint for the value (bugs.log #2)
+                self._check_element_type(base_var_name, val_b)
                 self.emit(f"  call void @dict_set(%Box* {col_b}, %Box* {key_b}, %Box* {val_b})")
         
         return "0", "i64"
@@ -2420,6 +2520,8 @@ class CodeGen:
             # id is not needed for struct form — use terminal 0 by default
             res = self.new_tmp()
             self.emit(f"  {res} = call i8* @os_run(i64 0, i8* {cmd_s}, i8* {input_s})")
+            # Check for NULL return (command failed) and branch to try error handler
+            self._check_os_run_error(res)
             return res, "i8*"
         else:
             id_v, id_t = self.emit_expr(node.id_expr)
@@ -2433,6 +2535,8 @@ class CodeGen:
                 inp_s = null_ptr
             res = self.new_tmp()
             self.emit(f"  {res} = call i8* @os_run(i64 {id_v}, i8* {cmd_s}, i8* {inp_s})")
+            # Check for NULL return (command failed) and branch to try error handler
+            self._check_os_run_error(res)
             return res, "i8*"
 
     def emit_os_run(self, node):
@@ -3555,20 +3659,12 @@ class CodeGen:
                 return self.coerce_to_string(obj_val, obj_t), "i8*"
             return self.coerce(obj_val, obj_t, target_ir), target_ir
         
-        # Collection .has() check — must come before string dispatch
-        if obj_t == "%Box*" and node.method == "has" and node.args:
-            needle_v, needle_t = self.emit_expr(node.args[0])
-            needle_b = self.coerce_to_box(needle_v, needle_t)
-            tmp = self.new_tmp()
-            self.emit(f"  {tmp} = call i1 @collection_has(%Box* {obj_val}, %Box* {needle_b})")
-            return tmp, "i1"
-        
-        # Collection .len() check
+# Collection .len() check
         if obj_t == "%Box*" and node.method == "len" and not node.args:
             tmp = self.new_tmp()
             self.emit(f"  {tmp} = call i32 @collection_len(%Box* {obj_val})")
             return tmp, "i32"
-
+        
         # Collection .combine() — join all items as a string
         if obj_t == "%Box*" and node.method == "combine" and not node.args:
             tmp = self.new_tmp()
@@ -3591,6 +3687,20 @@ class CodeGen:
             unboxed = self.new_tmp()
             self.emit(f"  {unboxed} = call i8* @box_to_cstr(%Box* {obj_val})")
             return self.emit_string_method(unboxed, node.method, node.args)
+        
+        # Collection .has() check — must come AFTER string dispatch since strings can be Box*
+        if obj_t == "%Box*" and node.method == "has" and node.args:
+            needle_v, needle_t = self.emit_expr(node.args[0])
+            needle_b = self.coerce_to_box(needle_v, needle_t)
+            tmp = self.new_tmp()
+            self.emit(f"  {tmp} = call i1 @collection_has(%Box* {obj_val}, %Box* {needle_b})")
+            return tmp, "i1"
+        
+        # Collection .combine() — join all items as a string
+        if obj_t == "%Box*" and node.method == "combine" and not node.args:
+            tmp = self.new_tmp()
+            self.emit(f"  {tmp} = call i8* @list_combine(%Box* {obj_val})")
+            return tmp, "i8*"
         
         if obj_t == "i8*":
             # Emit as string method; raises a clear RubidiumNameError on unknown methods
@@ -3818,13 +3928,20 @@ class CodeGen:
                 tmp = self.new_tmp()
                 self.emit(f"  {tmp} = call %Box* @box_add(%Box* {l}, %Box* {r})")
                 return tmp, "%Box*"
-        # For non-string arithmetic, unbox Box* to i64/double
-        if lt == "%Box*" and node.op not in ("+",) :
-            l = self.coerce(l, lt, "i64"); lt = "i64"
+            # Handle Box* + float / float + Box* — unbox to float for arithmetic
+            elif lt == "%Box*" and rt in self._FLOAT_IR_SET:
+                l = self.coerce(l, lt, rt); lt = rt
+            elif rt == "%Box*" and lt in self._FLOAT_IR_SET:
+                r = self.coerce(r, rt, lt); rt = lt
+        # For non-string arithmetic, unbox Box* to i64/double based on the other operand's type
+        if lt == "%Box*" and node.op not in ("+",):
+            target_t = "double" if rt in self._FLOAT_IR_SET else "i64"
+            l = self.coerce(l, lt, target_t); lt = target_t
         if rt == "%Box*" and node.op not in ("+",):
-            r = self.coerce(r, rt, "i64"); rt = "i64"
-        # After unboxing, re-check: if both are now i64 and op is +, it's numeric add (correct)
-        # If one is still Box* after + special-casing above, unbox to i64
+            target_t = "double" if lt in self._FLOAT_IR_SET else "i64"
+            r = self.coerce(r, rt, target_t); rt = target_t
+        # After unboxing, if either is still Box* (both were Box* and op is not +),
+        # default to i64 unboxing
         if lt == "%Box*": l = self.coerce(l, lt, "i64"); lt = "i64"
         if rt == "%Box*": r = self.coerce(r, rt, "i64"); rt = "i64"
 

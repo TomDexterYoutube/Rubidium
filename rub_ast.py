@@ -57,12 +57,14 @@ class Compare:
         self.right = right
 
 class VarDecl:
-    def __init__(self, name, mutable, is_local, vtype, value):
+    def __init__(self, name, mutable, is_local, vtype, value, element_type=None):
         self.name = name
         self.mutable = mutable
         self.is_local = is_local
         self.vtype = vtype
         self.value = value
+        self.element_type = element_type
+        self.element_type = element_type
 
 class Assign:
     def __init__(self, name, value):

@@ -177,10 +177,22 @@ class Parser:
 
     def import_stmt(self, is_xeon_pkg=False):
         self.match("XEON" if is_xeon_pkg else "IMPORT")
-        name = self.match("IDENT")
-        while self.peek() and self.peek()[0] == "DOT":
-            self.match("DOT")
-            name += "." + self.match("IDENT")
+        # For xeon packages, allow hyphens in package names (e.g. config-wiz)
+        if is_xeon_pkg:
+            # Build package name allowing hyphens
+            parts = [self.match("IDENT")]
+            while self.peek() and self.peek()[0] in ("DOT", "OP"):
+                op = self.match(self.peek()[0])
+                if op == "-":
+                    parts.append(op + self.match("IDENT"))
+                else:
+                    parts.append(op + self.match("IDENT"))
+            name = "".join(parts)
+        else:
+            name = self.match("IDENT")
+            while self.peek() and self.peek()[0] == "DOT":
+                self.match("DOT")
+                name += "." + self.match("IDENT")
         alias = None
         if self.peek() and self.peek()[0] == "AS":
             self.match("AS")
@@ -262,7 +274,8 @@ class Parser:
         if self.peek() and self.peek()[0] == "LPAREN":
             self.match("LPAREN")
             while self.peek() and self.peek()[0] != "RPAREN":
-                pname = self.match("IDENT")
+                # Parameter name can be an identifier or a keyword (like file, var, etc.)
+                pname = self.match("IDENT") or self.match("TYPE") or self.match("FILE") or self.match("VAR")
                 self.match("COLON")
                 # BUGFIX (bugs.log #18): see the identical fix in the FFI
                 # binding branch above — class-typed parameters are
@@ -410,11 +423,10 @@ class Parser:
         elif self.peek() and self.peek()[0] == "TYPE":
             vtype = self.match("TYPE")
         # Optional element-type annotation for collections: let x: list: i32 = [0,10,32]
-        # The element type is informational only (collections are dynamically boxed
-        # at runtime regardless), but the syntax must still parse correctly.
+        element_type = None
         if vtype in ("list", "index", "dict") and self.peek() and self.peek()[0] == "COLON":
             self.match("COLON")
-            self.match("TYPE")
+            element_type = self.match("TYPE")
         self.match("OP")
         value = self.expr()
         # BUGFIX (bugs.log #13): see the identical fix in the DynVarDecl path
@@ -441,8 +453,8 @@ class Parser:
             self.sy_names.add(name)
             if isinstance(value, Str):
                 self.sy_table[name] = value.value
-            return VarDecl(name, mut, is_local, "str", value)
-        return VarDecl(name, mut, is_local, vtype, value)
+            return VarDecl(name, mut, is_local, "str", value, element_type=element_type)
+        return VarDecl(name, mut, is_local, vtype, value, element_type=element_type)
 
     def print_stmt(self):
         self.match("PRINT")
@@ -797,7 +809,11 @@ class Parser:
             pairs = []
             while self.peek() and self.peek()[0] != "RBRACE":
                 k = self.expr()
-                self.match("OP")
+                # Match either OP (=) or COLON (:) as key-value separator
+                if self.peek() and self.peek()[0] in ("OP", "COLON"):
+                    self.advance()
+                else:
+                    raise SyntaxError("Expected '=' or ':' in dict literal")
                 v = self.expr()
                 pairs.append((k, v))
                 if self.peek() and self.peek()[0] == "COMMA":
@@ -954,6 +970,39 @@ class Parser:
             node = self.file_global_stmt_list()
             if node is not None:
                 return node
+            # Not a file module operation — treat as regular variable name
+            self.advance()
+            name = tok[1]
+            res = Var(name)
+            # Check for method calls on the variable
+            while self.peek():
+                if self.peek()[0] == "DOT":
+                    self.match("DOT")
+                    attr = self.match_attr()
+                    if self.peek() and self.peek()[0] == "LPAREN":
+                        self.match("LPAREN")
+                        args = []
+                        while self.peek() and self.peek()[0] != "RPAREN":
+                            args.append(self.expr())
+                            if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
+                        self.match("RPAREN")
+                        res = MethodCall(res, attr, args)
+                    else:
+                        res = FieldAccess(res, attr)
+                elif self.peek()[0] == "LPAREN":
+                    self.match("LPAREN")
+                    args = []
+                    while self.peek() and self.peek()[0] != "RPAREN":
+                        args.append(self.expr())
+                        if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
+                    self.match("RPAREN")
+                    res = FnCall(name, args)
+                    if self.peek() and self.peek()[0] == "DOT":
+                        continue
+                    break
+                else:
+                    break
+            return res
         # TYPE tokens used as arguments (e.g. "404".to(i32) — i32 appears as TYPE token)
         # Also handle TYPE tokens used as variable names (e.g., "list" is a type but can be a variable)
         if tok[0] == "TYPE":
