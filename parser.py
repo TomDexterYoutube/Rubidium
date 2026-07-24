@@ -827,6 +827,11 @@ class Parser:
             # emit it directly at fp128 precision when it has more
             # significant digits than a double can hold exactly.
             if '.' in tok[1]: res = Number(float(tok[1]), raw=tok[1])
+            # OPEN-8: hex/binary/octal literals (0x.., 0b.., 0o..) — int()
+            # with base 0 auto-detects the prefix; plain decimal keeps base 10
+            # (base 0 would reject a leading-zero decimal like `03`).
+            elif len(tok[1]) > 1 and tok[1][0] == '0' and tok[1][1] in 'xXbBoO':
+                res = Number(int(tok[1], 0))
             else: res = Number(int(tok[1]))
             # BUGFIX (bugs.log #10): allow method chaining on number literals
             # (e.g. `0.to(SY)`), matching what STRING literals already

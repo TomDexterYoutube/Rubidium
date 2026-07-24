@@ -1,7 +1,11 @@
 import re
 
 TOKEN_SPEC = [
-    ("NUMBER",   r"\d+\.\d+|\d+"),
+    # OPEN-8 root cause: hex/binary/octal literals must be matched BEFORE the
+    # decimal rules, or `0x03` lexes as NUMBER `0` + NAME `x03` and the real
+    # value is silently lost (everything hex read back as 0). Order in the
+    # alternation matters: prefixed bases first, then float, then plain int.
+    ("NUMBER",   r"0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|\d+\.\d+|\d+"),
     ("ISTRING_PLACEHOLDER", r"i\"PLACEHOLDER\""),  # placeholder — handled below
     # BUGFIX (bugs.log #3): triple-quoted multi-line strings (used for the `str+`
     # type) must be matched BEFORE the single-quote STRING rule below, or a

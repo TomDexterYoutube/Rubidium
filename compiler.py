@@ -160,13 +160,33 @@ Box* box_null(void) { Box* b=malloc(sizeof(Box)); b->type=6; b->i=-2147483648LL;
 // bugs.log OPEN-9: boxed class instance — p is the raw struct pointer,
 // class_id identifies which class it is (see codegen's self.class_ids).
 Box* box_class(void* p, long long class_id) { Box* b=malloc(sizeof(Box)); b->type=5; b->p=p; b->class_id=class_id; return b; }
+Box* box_deep_copy(Box* src);  // OPEN-9: forward decl (defined later)
 Box* box_copy(Box* src) {
     if(!src) return box_i(0);
     if(src->type==0) return box_i(src->i);
     if(src->type==1) return box_f(src->f);
     if(src->type==2) return box_s(src->s);
     if(src->type==4) return box_b(src->i);
-    return src; /* collections/class instances: return same pointer, caller must not drop */
+    if(src->type==6) return box_null();
+    // OPEN-9 (SIGSEGV / heap-use-after-free): a collection (type 3) used to be
+    // returned by SHARED POINTER here — but every caller of box_copy takes
+    // ownership of the result and later box_drop()s it (the for-loop's per-
+    // iteration loop variable, indexed element reads `coll(i)`, and .random()).
+    // box_drop on a collection recursively frees its storage, so dropping the
+    // "copy" freed the ORIGINAL collection's memory out from under it. Confirmed
+    // via AddressSanitizer: iterating a `list` of `index`/`dict` values a second
+    // time read freed memory. Deep-copy the collection so the caller owns a
+    // fully independent structure that is safe to drop (also the spec's
+    // deep-copy-on-read/assign semantics, which these call sites already
+    // *intended* per their comments — box_copy just never delivered it).
+    if(src->type==3) return box_deep_copy(src);
+    // Class instance (type 5): keep reference semantics to the underlying
+    // instance data (->p is shared, not cloned — a generic deep copy isn't
+    // possible without per-class layout knowledge), but hand back a FRESH Box
+    // wrapper so a caller's box_drop frees only this wrapper, never the
+    // original element's wrapper (same double-free class of bug as above).
+    if(src->type==5) { Box* b=malloc(sizeof(Box)); *b=*src; return b; }
+    return src;
 }
 
 long long unbox_i(Box* b) { return b ? b->i : 0; }
