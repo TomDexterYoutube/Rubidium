@@ -105,6 +105,8 @@ let score = 100
 
 # Global variables can be accessed anywhere.
 # Local variables must be declared explicitly.
+# Full syntax (mut is optional, only needed if reassigning later):
+#   let mut local name: type = value
 
 let local temp = 100
 
@@ -634,7 +636,9 @@ open("data.txt") as file {
     }
 }
 
-# If the file does not exist then open will give a error make the file then continue
+# If the file does not exist, open() creates it, raises a
+# (non-fatal, catchable) error, and then continues.
+
 # File utility functions (used outside of open blocks):
 
 file.exists("data.txt")              # returns bool
@@ -649,9 +653,13 @@ file.list("data/")                   # used like linux ls command
 try {
     open("missing.txt") as file {
         print(file.read())
+    }
 } error {
     print("File error: " + error)
 }
+
+# missing.txt is created either way — the try/error block
+# just lets you catch and handle the "file did not exist" error.
 
 # =========================================
 # MEMORY — DROPPING VARIABLES
@@ -899,6 +907,24 @@ try {
 
 # try/error works with file operations too (see FILES section).
 
+# Use raise to manually trigger a runtime error with a custom message.
+# If raise runs inside a try block — directly, or inside a function called
+# from within that try — the nearest enclosing try's error handler catches
+# it (the message becomes the `error` variable). Outside of any try, raise
+# halts the program with the message.
+
+fn check(n: i32) {
+    if n < 0 {
+        raise "n must not be negative"
+    }
+}
+
+try {
+    check(-1)
+} error {
+    print("Error: " + error)   # Error: n must not be negative
+}
+
 # =========================================
 # CLASSES
 # =========================================
@@ -1038,7 +1064,7 @@ fn run() {
 
 # Threading creates a scope with special rules.
 
-fn task_one(x) {
+fn task_worker(x) {
     let local y = 10
     print("done")
 }
@@ -1046,8 +1072,8 @@ fn task_one(x) {
 let z = 10
 
 fn main() {
-    thread(task_one(1), 1)
-    thread(task_one(1), 2)
+    thread(task_worker(1), 1)
+    thread(task_worker(1), 2)
 }
 
 # y is local, so each thread shares z but
@@ -1288,8 +1314,10 @@ print(sin(0.5))
 
 # Foreign functions can be wrapped normally.
 
+fn math_lib rb_sqrt(x: f64) -> f64 as raw_sqrt
+
 fn sqrt(value: f64) -> f64 {
-    return math_lib.sqrt(value)
+    return math_lib.raw_sqrt(value)
 }
 
 # -----------------------------------------
@@ -1379,8 +1407,10 @@ xeon math_tools
 
 print(math_tools.pi)
 
-# Packages are the same as import even tho they work different
-# You can use Xeon to download a large amount of different packages
+# From the caller's side, a package is used just like an import —
+# same namespace-based access. The difference is where the code
+# comes from: import loads a local .rub file, while Xeon downloads
+# and manages the package for you.
 # If you want to learn more use the command Xeon pkg help
 
 # -----------------------------------------
@@ -1641,12 +1671,11 @@ print(math_tools.pi)
 #   - Follow normal mutability rules
 
 # Integer Overflow:
-#   - Integer overflow does not stop program execution
-#   - When an operation exceeds the maximum value of a type,
-#     the result is clamped to the maximum value
-#   - When an operation exceeds the minimum value of a type,
-#     the result is clamped to the minimum value
-#   - An overflow runtime error is raised
-#   - Program execution continues after the error
-#   - Overflow errors are reported once per operation
-#   - The clamped result is stored before execution continues
+#   - When an operation exceeds the maximum or minimum value of a
+#     type, the value stays clamped at that max/min — it does not
+#     wrap around.
+#   - A non-fatal runtime error is raised to flag this, but unlike
+#     other runtime errors, it does NOT require a try/error block —
+#     the program always keeps running with the clamped value.
+#   - Overflow errors are reported once per operation.
+#   - The clamped result is stored before execution continues.

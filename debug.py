@@ -4,6 +4,7 @@ import argparse
 import copy
 import shutil
 import random
+import subprocess
 
 _dir = os.path.dirname(os.path.abspath(__file__))
 if _dir not in sys.path:
@@ -154,6 +155,7 @@ class Debugger:
         self._lmap          = {}      # ('var'|'fn'|'class'|'for', name) -> line
         self._try_depth     = 0       # >0 means inside a try block; errors raise instead of print
         self._dynvars       = {}      # runtime SY reflection backing store — see DynResolve/DynVarDecl
+        self._os_active     = set()   # open os.start(id) session ids — see OsStart/OsRun/OsDrop
         if tokens:
             self._build_lmap(tokens)
 
@@ -273,14 +275,26 @@ class Debugger:
             # link target, so reads/writes to EITHER name see the same
             # underlying storage — until this name is reassigned directly
             # (see the Assign branch below), which unlinks it.
+            # BUGFIX (bugs.log OPEN-10 debugger-parity follow-up): the
+            # exclusion below for list/dict targets assumed Python's natural
+            # mutable-reference sharing would keep a linked collection in
+            # sync on its own — true only if the value is never actually
+            # copied. But falling through skips straight to
+            # `_deep_copy_value(...)` a few lines down, which DOES copy it,
+            # silently breaking `link` for every collection: `let y = link x`
+            # then `x(0).set(99)` never showed up through `y`. Alias
+            # collections the exact same way as scalars (share the info
+            # dict) instead of special-casing them out.
             if isinstance(node.value, ast.LinkArg) and isinstance(node.value.expr, ast.Var):
                 target_info = self.scope.lookup(node.value.expr.name)
-                if target_info is not None and not isinstance(target_info["value"], (list, dict)):
+                if target_info is not None:
                     target = self.scope if node.is_local else self._root_scope
                     target.declare(node.name, target_info)
                     target.linked_names.add(node.name)
                     return
             value = self._deep_copy_value(self.evaluate(node.value))
+            if node.vtype:
+                value = self._clamp_int(value, node.vtype)
             # Per spec: 'let' without 'local' enters the global memory pool.
             target = self.scope if node.is_local else self._root_scope
             target.declare(node.name, {
@@ -334,14 +348,39 @@ class Debugger:
                 info = dict(info)
                 owning_scope.linked_names.discard(node.name)
                 owning_scope.declare(node.name, info)
-            info["value"] = self._deep_copy_value(self.evaluate(node.value))
-            info["type"]  = self.rub_type(info["value"])
+            declared_type = info.get("type")
+            new_value = self._deep_copy_value(self.evaluate(node.value))
+            if declared_type in self._INT_BOUNDS:
+                # Reassignment keeps the variable's originally declared sized
+                # type (Rubidium requires same-type reassignment) — clamp to
+                # that width and preserve the declared type, rather than
+                # re-inferring a generic "i64" from the raw Python value.
+                info["value"] = self._clamp_int(new_value, declared_type)
+                info["type"]  = declared_type
+            else:
+                info["value"] = new_value
+                info["type"]  = self.rub_type(new_value)
 
         # ── Field Assignment ──────────────────────────────────────────────────
         elif isinstance(node, ast.FieldAssign):
             obj = self.evaluate(node.obj) if hasattr(node, 'obj') else None
             if isinstance(obj, dict):
-                obj[node.field] = self.evaluate(node.value)
+                val = self.evaluate(node.value)
+                obj[node.field] = val
+                # BUGFIX (bugs.log OPEN-8 follow-up): _dispatch_method also
+                # seeds a bare-name mirror of each field into fn_scope (so
+                # `health = health - amount`, without `self.`, works) and
+                # blindly writes THAT snapshot back into obj at the end of
+                # the call. If this method instead used `self.field = value`
+                # directly (as here), that end-of-call write-back would
+                # clobber it with the stale pre-call value. Keep the mirror
+                # in sync immediately so whichever style is used, the other
+                # doesn't undo it.
+                self_info = self.scope.lookup("__self")
+                if self_info is not None and self_info.get("value") is obj:
+                    mirror = self.scope.lookup(node.field)
+                    if mirror is not None:
+                        mirror["value"] = val
 
         # ── Element Drop: items(1).drop() — remove-and-shift, not Null ────────
         elif isinstance(node, ast.ElementDrop):
@@ -481,11 +520,26 @@ class Debugger:
                 self.scope.declare(alias, {"value": {"__module__": mod}, "type": "module",
                                            "mutable": False, "dropped": False})
 
-        # ── Stubs: OS / FFI / Threads (still not simulated in debug mode) ────
+        # ── Threads (bugs.log OPEN-7): actually run the task function's body
+        # synchronously — the debugger is single-threaded, so this is an
+        # approximation of concurrency, but it means real prints/side
+        # effects/runtime errors from the task surface during a debug run,
+        # instead of the task silently never running at all. ──────────────
+        elif isinstance(node, ast.ThreadCall):
+            self.evaluate(node.func_call)
+
+        # ── Stubs: FFI / Thread wait-bookkeeping (still not simulated) ──
+        # BUGFIX (bugs.log OPEN-7): OsStart/OsRun/OsDrop used to be stubbed
+        # out here as no-ops, which meant os.start(1) (a bare statement)
+        # never actually reached evaluate()'s real implementation below —
+        # only os.run() did (since it's usually used as an expression, via
+        # VarDecl/Assign calling evaluate() directly), so os.run() always
+        # errored with "no os.start() was seen first" even right after a
+        # real os.start() call. Removed from the stub list so all three
+        # fall through to the real evaluate()-based implementation.
         elif isinstance(node, (
             ast.FFILoad, ast.FFIBind,
-            ast.ThreadCall, ast.ThreadWait, ast.ThreadRunning,
-            ast.OsStart, ast.OsRun, ast.OsDrop,
+            ast.ThreadWait, ast.ThreadRunning,
         )):
             pass   # not executed in debug mode
 
@@ -794,6 +848,50 @@ class Debugger:
         if isinstance(node, (ast.MethodCall, ast.CollectionMethodCall)):
             return self._eval_method_call(node)
 
+        if isinstance(node, ast.OsStart):
+            id_ = self.evaluate(node.id_expr)
+            self._os_active.add(id_)
+            return None
+
+        if isinstance(node, ast.OsDrop):
+            id_ = self.evaluate(node.id_expr)
+            self._os_active.discard(id_)
+            return None
+
+        if isinstance(node, ast.OsRun):
+            # BUGFIX (bugs.log OPEN-7): OsStart/OsRun/OsDrop had no runtime
+            # handling at all — os.run() always fell through to `return
+            # None`, printing "Null" instead of the command's real output
+            # (diverging from the real compiler, which actually forks a
+            # shell and captures it). Mirrors that behavior via subprocess.
+            if node.struct_args is not None:
+                fields = node.struct_args
+                cmd = self.evaluate(fields.get("cmd"))
+                if "args" in fields:
+                    arg_list = self.evaluate(fields["args"]) or []
+                    cmd = " ".join([str(cmd)] + [str(a) for a in arg_list])
+                inp = self.evaluate(fields["input"]) if fields.get("input") is not None else None
+                id_ = 0
+                self._os_active.add(0)  # struct form auto-starts session 0
+            else:
+                id_ = self.evaluate(node.id_expr) if node.id_expr is not None else None
+                cmd = self.evaluate(node.cmd_expr)
+                inp = self.evaluate(node.input_expr) if node.input_expr is not None else None
+
+            if id_ is not None and id_ not in self._os_active:
+                self.error(f"os.run() used ID {id_}, but no os.start({id_}) was seen first.")
+                return None
+            try:
+                proc = subprocess.run(
+                    ["bash", "-c", str(cmd) if cmd is not None else ""],
+                    input=(str(inp) if inp else None),
+                    capture_output=True, text=True, timeout=10,
+                )
+                return proc.stdout + proc.stderr
+            except Exception as e:
+                self.error(f"os.run() failed: {e}")
+                return None
+
         if isinstance(node, ast.ClassInstantiate):
             cls = self._class_defs.get(node.class_name)
             if cls:
@@ -863,6 +961,14 @@ class Debugger:
             instance = {"__class__": fname}
             for f in (cls.fields or []):
                 instance[f.name] = self.evaluate(f.value) if hasattr(f, 'value') else None
+            # BUGFIX (bugs.log OPEN-8): mirror the compiler's constructor fix —
+            # if the class declares an __init__ method and constructor args
+            # were passed, run it (via the normal method dispatch, which
+            # already binds fields + "__self" into scope) so field values set
+            # inside __init__ actually take effect, instead of always leaving
+            # every field at its bare declared-default value.
+            if args and any(m.name == "__init__" for m in (cls.methods or [])):
+                self._dispatch_method(instance, "__init__", args)
             return instance
 
         # Collection index access: name is a declared variable  e.g. my_list(0)
@@ -934,6 +1040,37 @@ class Debugger:
             "SY" if isinstance(a, ast.Var) and a.name == "SY" else self.evaluate(a)
             for a in node.args
         ]
+
+        # ── random.shuffle()/choice()/seed() — the `random` module has no
+        # dedicated AST node (unlike os.*/time.*'s OsStart/OsRun/OsDrop), so
+        # `random.choice(nums)` parses as an ordinary MethodCall on
+        # Var("random"). `use random` only declares a generic module stub
+        # dict in scope (see the ast.Use branch in execute()), which the
+        # generic `_dispatch_method` below doesn't know "choice"/"shuffle"/
+        # "seed" on — it silently returned None (printed as Null), diverging
+        # from the real compiled binary. BUGFIX (bugs.log): intercept here,
+        # before the generic obj/dispatch path.
+        if (isinstance(node.obj, ast.Var) and node.obj.name == "random"
+                and method in ("shuffle", "choice", "seed")):
+            if method == "seed":
+                if args: random.seed(args[0])
+                return None
+            if method == "shuffle":
+                # args[0] is the SAME live list object stored in scope
+                # (evaluate(Var) returns info["value"] directly, no copy),
+                # so an in-place Python shuffle mutates the real variable —
+                # matching the spec's "shuffle a list in place".
+                if args and isinstance(args[0], list):
+                    random.shuffle(args[0])
+                return None
+            if method == "choice":
+                if args:
+                    coll = args[0]
+                    if isinstance(coll, list) and coll:
+                        return random.choice(coll)
+                    if isinstance(coll, dict) and coll:
+                        return random.choice(list(coll.values()))
+                return None
 
         # ── file.read()/write()/add()/writeln()/readln() as a plain
         # MethodCall (the parser only special-cases FileHandleMethod for
@@ -1049,6 +1186,18 @@ class Debugger:
                                 "value": obj[fname], "type": self.rub_type(obj[fname]),
                                 "dropped": False, "mutable": True,
                             })
+                        # BUGFIX (bugs.log OPEN-8 follow-up): `self.field` reads/
+                        # writes inside a method body need a live "__self" binding
+                        # pointing at the actual instance dict (FieldAccess/
+                        # FieldAssign are already generic over any dict-valued
+                        # obj expression) — previously nothing declared "__self"
+                        # here at all, so `self.field` raised an undefined-
+                        # variable error in a debug run even though the same
+                        # code now works in the real compiled binary.
+                        fn_scope.declare("__self", {
+                            "value": obj, "type": obj.get("__class__"),
+                            "dropped": False, "mutable": True,
+                        })
                         for i, (pname, ptype) in enumerate(m.params):
                             fn_scope.declare(pname, {
                                 "value": args[i] if i < len(args) else None,
@@ -1242,20 +1391,55 @@ class Debugger:
         if method == "read":
             with open(path, "r") as f: return f.read()
         if method == "readln":
-            idx = int(arg_vals[0]) if arg_vals else 1
+            # BUGFIX (bugs.log): syntax file says "Line indexing starts at
+            # 0" (and the real compiler's file_readln/file_writeln in
+            # compiler.py are explicitly 0-based) — this was 1-based
+            # (`idx-1`/`0 < idx <= len`), an off-by-one that returned the
+            # WRONG line for every call (e.g. readln(1) returned line 0
+            # instead of line 1) instead of erroring outright, so it was
+            # never caught until file I/O actually got exercised.
+            idx = int(arg_vals[0]) if arg_vals else 0
             with open(path, "r") as f: lines = f.readlines()
-            return lines[idx-1].rstrip("\n") if 0 < idx <= len(lines) else ""
+            return lines[idx].rstrip("\n") if 0 <= idx < len(lines) else ""
         if method == "writeln":
             if len(arg_vals) < 2: return None
             line_num, data = int(arg_vals[0]), str(arg_vals[1])
             lines = []
             if os.path.exists(path):
                 with open(path, "r") as f: lines = f.readlines()
-            while len(lines) < line_num: lines.append("\n")
-            lines[line_num - 1] = data + "\n"
+            while len(lines) <= line_num: lines.append("\n")
+            lines[line_num] = data + "\n"
             with open(path, "w") as f: f.writelines(lines)
             return None
         return None
+
+    # BUGFIX (bugs.log): sized-integer overflow was never clamped in the
+    # interpreter — arithmetic used raw unbounded Python ints, so a value
+    # that overflows a declared type's range (e.g. i32 max + 1) diverged
+    # from the real compiled binary, which clamps to the type's min/max and
+    # prints a non-fatal "Runtime Warning" (see rub_overflow_check in
+    # compiler.py / the narrowing-coerce clamp in codegen.py). Mirrors that
+    # exact bound/message here so debug runs match compiled behavior.
+    _INT_BOUNDS = {
+        "i32":   (-(2**31),    2**31 - 1),
+        "i64":   (-(2**63),    2**63 - 1),
+        "i128":  (-(2**127),   2**127 - 1),
+        "i256":  (-(2**255),   2**255 - 1),
+        "i512":  (-(2**511),   2**511 - 1),
+        "i1024": (-(2**1023),  2**1023 - 1),
+        "i2048": (-(2**2047),  2**2047 - 1),
+    }
+
+    def _clamp_int(self, value, vtype):
+        bounds = self._INT_BOUNDS.get(vtype)
+        if bounds is None or not isinstance(value, int) or isinstance(value, bool):
+            return value
+        lo, hi = bounds
+        if value > hi or value < lo:
+            print(f"Runtime Warning: integer overflow — value clamped to {vtype} range",
+                  file=sys.stderr)
+            return hi if value > hi else lo
+        return value
 
     def rub_type(self, value):
         if isinstance(value, bool):  return "bool"
@@ -1325,6 +1509,7 @@ class Analyzer:
         self._global_scope: Scope | None = None   # set in analyze(); used by _var_decl
         self._try_depth: int = 0    # >0: inside a try block; vars scoped locally, not globally
         self._fn_depth:  int = 0    # >0: inside a fn/method; allow re-decl of existing globals
+        self._sy_holder_names: set = set()  # names declared `let x: SY = ...` — see _collect_sy_names
 
     def _emit(self, severity: str, line, category: str,
               message: str, suggestion: str = ''):
@@ -1387,6 +1572,14 @@ class Analyzer:
         if isinstance(node, ast.ListExpr):
             return 'list'
         if isinstance(node, ast.DictExpr):
+            # BUGFIX (bugs.log): a dict+ literal (`let x: dict+ = {...}`) is
+            # parsed as a plain DictExpr with `is_dictplus` set by the
+            # parser — this never checked that flag, so it always inferred
+            # 'dict', which then falsely flagged every dict+ declaration
+            # (straight from the syntax file's own example) as a Type Error
+            # and blocked compilation.
+            if getattr(node, 'is_dictplus', False):
+                return 'dict+'
             return 'index' if getattr(node, 'is_index', False) else 'dict'
         if isinstance(node, ast.ClassInstantiate):
             return node.class_name
@@ -1548,8 +1741,37 @@ class Analyzer:
             if isinstance(node, ast.FnDef):
                 _scan_body(node.body)
 
+    def _collect_sy_names(self, tokens: list) -> set:
+        """BUGFIX (bugs.log): `let x: SY = <expr>` is rewritten by the parser
+        into a plain `VarDecl(..., vtype='str', ...)` (SY is a compile-time
+        flavor of str, not a distinct runtime type — see parser.py's
+        var_decl SY branch), so by the time debug.py sees the AST there is
+        no way to tell "this is a SY holder" from vtype alone. Token names
+        declared as `let (mut/local) NAME : SY = ...` are collected here so
+        the unused-variable check can exempt them — a SY holder used only
+        via `fn (name)() {...}` (parse-time name substitution, spec example
+        in the syntax file's SY section) leaves no AST trace of being read,
+        and would otherwise always be a false "Unused Variable" positive."""
+        names = set()
+        n = len(tokens)
+        for i, tok in enumerate(tokens):
+            if tok[0] != 'LET':
+                continue
+            j = i + 1
+            while j < n and tokens[j][0] in ('MUT', 'LOCAL'):
+                j += 1
+            if j < n and tokens[j][0] == 'IDENT':
+                nm = tokens[j][1]
+                j += 1
+                if j < n and tokens[j][0] == 'COLON':
+                    j += 1
+                    if j < n and tokens[j][0] == 'TYPE' and tokens[j][1] == 'SY':
+                        names.add(nm)
+        return names
+
     def analyze(self, nodes: list, tokens: list):
         self._build_line_map(tokens)
+        self._sy_holder_names = self._collect_sy_names(tokens)
         self._pre_pass(nodes)
         global_scope = Scope()
         self._global_scope = global_scope   # non-local 'let' inside functions targets this
@@ -1623,9 +1845,23 @@ class Analyzer:
                                f"Add statements inside 'fn {node.name}()' or remove it.")
                 else:
                     if node.ret_type and not self._any_path_returns(node.body):
-                        self._emit('ERROR', ln, 'Missing Return Statement',
+                        # BUGFIX (bugs.log): verified against the real compiler
+                        # (codegen.py) that a function which doesn't return on
+                        # every path does NOT fail to compile and does NOT
+                        # produce garbage/undefined output — it deterministically
+                        # returns a type-appropriate default (e.g. 0 for i32)
+                        # on the path with no explicit return. Flagging this as
+                        # a hard ERROR made debug.py report "COMPILATION
+                        # BLOCKED" for code that the real compiler accepts and
+                        # runs correctly. Still worth surfacing as a lint (the
+                        # implicit default is easy to trip over unintentionally),
+                        # so downgraded to a non-blocking WARNING instead of
+                        # removing it outright.
+                        self._emit('WARNING', ln, 'Missing Return Statement',
                                    f"Function '{node.name}' declares return type "
-                                   f"'{node.ret_type}' but may not return on all paths.",
+                                   f"'{node.ret_type}' but may not return on all paths "
+                                   f"(the real compiler falls back to a type default, "
+                                   f"e.g. 0/Null, on paths with no explicit return).",
                                    f"Add 'return <{node.ret_type} value>' before the "
                                    f"end of '{node.name}'.")
                     self._stx_stmts(node.body, in_loop=False, in_fn=node.name)
@@ -1735,9 +1971,22 @@ class Analyzer:
         elif t is ast.FFIBind:
             pass  
         elif t is ast.FileOpen:
+            # BUGFIX (bugs.log): the file handle (`open(...) as f { ... }`)
+            # was never declared into any scope here, so any plain
+            # reference to it inside the block — e.g. `let data = f.read()`,
+            # which the parser doesn't special-case as FileHandleMethod the
+            # way `f.write(...)`/`f.add(...)` are — hit the generic
+            # "Unknown Variable" check and blocked compilation for entirely
+            # valid, spec-documented file I/O code (test.rub had no file
+            # I/O coverage before, so this was never exercised).
             self._expr(node.path_expr, scope)
+            file_scope = Scope(parent=scope)
+            file_scope.declare(node.var_name, {
+                'mutable': True, 'vtype': 'file', 'dropped': False, 'used': True,
+                'is_heap': False, 'line': None, 'drop_line': None, 'possibly_null': False,
+            })
             for s in node.body:
-                self._node(s, scope, in_loop)
+                self._node(s, file_scope, in_loop)
         elif t in (ast.FileHandleStmt, ast.FileHandleMethod):
             for a in node.args:
                 self._expr(a, scope)
@@ -1810,6 +2059,16 @@ class Analyzer:
                 self._expr(part, scope)
         elif t is ast.TypeCast:
             self._expr(node.expr, scope)
+
+        elif t is ast.DynResolve:
+            # BUGFIX (bugs.log): `(holder_name)` — runtime SY reflection —
+            # reads the holder variable's current value to resolve the real
+            # target, but this walker never touched it, so every SY holder
+            # only ever used through dynamic resolution (its entire purpose)
+            # was flagged as an "Unused Variable" false positive.
+            info = scope.lookup(node.holder_name)
+            if info is not None:
+                scope.mark_used(node.holder_name)
 
         elif t in (ast.FileExists, ast.FileNew, ast.FileDelete):
             self._expr(node.path_expr, scope)
@@ -2081,7 +2340,13 @@ class Analyzer:
         for vname, vinfo in fn_scope.vars.items():
             if vname in param_names:
                 continue
-            if not vinfo.get('used'):
+            # BUGFIX (bugs.log): a SY holder used only as `fn (name)() {...}`
+            # is substituted into the function's name at PARSE time (a pure
+            # compile-time string operation — see parser.py's fn_def) and
+            # leaves no AST trace the usage-tracking walker can see, so it
+            # was always flagged "unused" even for the syntax file's own SY
+            # example. SY variables are exempt from this check.
+            if not vinfo.get('used') and vname not in self._sy_holder_names:
                 self._emit('INFO', vinfo.get('line'), 'Unused Variable',
                            f"Unused variable: {vname}")
             if vinfo.get('is_heap') and not vinfo.get('dropped'):
@@ -2212,7 +2477,7 @@ class Analyzer:
 
         for method in node.methods:
             method_scope = Scope(parent=scope)
-            method_scope.declare('self', {
+            method_scope.declare('__self', {
                 'mutable': True, 'vtype': node.name, 'dropped': False,
                 'used': True, 'is_heap': False, 'line': None,
                 'drop_line': None, 'possibly_null': False,
@@ -2326,6 +2591,13 @@ class Analyzer:
     def _fn_call(self, node: ast.FnCall, scope: Scope):
         name = node.name if isinstance(node.name, str) else None
         if name is None:
+            # node.name is itself a node here — either a chained-collection
+            # FnCall (e.g. nested(0)(1)) or a DynResolve (`(fn_name)()`,
+            # runtime SY function reflection). BUGFIX (bugs.log): this used
+            # to only walk the call args, never node.name itself, so a SY
+            # holder used solely to call a dynamically-named function was
+            # never marked used — a false "Unused Variable" positive.
+            self._expr(node.name, scope)
             for a in node.args:
                 self._expr(a, scope)
             return
@@ -2572,7 +2844,9 @@ class Analyzer:
                 self._emit('INFO', finfo.get('line'), 'Unused Function',
                            f"Unused function: {fname}()")
         for vname, vinfo in global_scope.vars.items():
-            if not vinfo.get('used'):
+            # BUGFIX (bugs.log): see the identical SY exemption in the
+            # per-function unused-variable check above.
+            if not vinfo.get('used') and vname not in self._sy_holder_names:
                 self._emit('INFO', vinfo.get('line'), 'Unused Variable',
                            f"Unused variable: {vname}")
         # Unused class definitions
@@ -2739,10 +3013,18 @@ def _token_syntax_check(tokens: list, source_lines: list) -> list:
                          f"for {var_name} in <list or range(0, n)> {{ ... }}")
 
     # ── 3. 'fn' missing a name ────────────────────────────────────────────────
+    # BUGFIX (bugs.log): `fn (function_name)() { ... }` — the SY dynamic
+    # function-name form documented in the syntax file (SY section) — was
+    # flagged as "Missing Function Name" here, since it also starts with
+    # `FN LPAREN`. This check only meant to catch a genuinely nameless
+    # `fn(...)`; the SY form is `FN LPAREN IDENT RPAREN`, distinguishable by
+    # the single bare identifier immediately inside the parens.
     for i, tok in enumerate(tokens):
         if tok[0] == 'FN':
             j = i + 1
-            if j < n and tokens[j][0] == 'LPAREN':
+            if (j < n and tokens[j][0] == 'LPAREN'
+                    and not (j + 2 < n and tokens[j + 1][0] == 'IDENT'
+                             and tokens[j + 2][0] == 'RPAREN')):
                 emit(tok[2], 'Missing Function Name',
                      "Function definition is missing a name",
                      "fn my_function(param: type) -> return_type { ... }")

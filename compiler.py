@@ -18,7 +18,12 @@ RUNTIME_C = r"""
 #include <time.h>
 #include <pthread.h>
 
-typedef struct { int type; long long i; double f; char* s; void* p; } Box;
+// class_id (bugs.log OPEN-9): only meaningful when type==5 (a boxed class
+// instance) — lets a value retrieved from a generic collection remember
+// which class it was, since the compiler's normal method-call resolution
+// is static/name-based and a %Box* alone has no such information. (Tag 4
+// is already used for bool — see box_b below.)
+typedef struct { int type; long long i; double f; char* s; void* p; long long class_id; } Box;
 typedef struct { int magic; Box** items; int count; int cap; } RList;
 typedef struct { int magic; Box** keys; Box** vals; int count; int cap; } RDict;
 // FEATURE: dict+ reuses the exact same RDict layout as dict — the only
@@ -146,19 +151,35 @@ Box* box_f(double f) { Box* b=malloc(sizeof(Box)); b->type=1; b->f=f; return b; 
 Box* box_s(char* s) { Box* b=malloc(sizeof(Box)); b->type=2; b->s=strdup(s); return b; }
 Box* box_p(void* p) { Box* b=malloc(sizeof(Box)); b->type=3; b->p=p; return b; }
 Box* box_b(long long i) { Box* b=malloc(sizeof(Box)); b->type=4; b->i=i; return b; }
+// OPEN-4: Null gets its own real Box type tag (6) instead of being encoded
+// as a type==0 int holding the INT32_MIN sentinel value — a genuine boxed
+// int that happens to equal INT32_MIN is no longer misidentified as Null.
+// `i` is still set to the old sentinel as a defensive fallback for any
+// code path that unboxes via unbox_i()/->i without checking type==6 first.
+Box* box_null(void) { Box* b=malloc(sizeof(Box)); b->type=6; b->i=-2147483648LL; b->f=0.0; b->s=NULL; b->p=NULL; b->class_id=-1; return b; }
+// bugs.log OPEN-9: boxed class instance — p is the raw struct pointer,
+// class_id identifies which class it is (see codegen's self.class_ids).
+Box* box_class(void* p, long long class_id) { Box* b=malloc(sizeof(Box)); b->type=5; b->p=p; b->class_id=class_id; return b; }
 Box* box_copy(Box* src) {
     if(!src) return box_i(0);
     if(src->type==0) return box_i(src->i);
     if(src->type==1) return box_f(src->f);
     if(src->type==2) return box_s(src->s);
     if(src->type==4) return box_b(src->i);
-    return src; /* collections: return same pointer, caller must not drop */
+    return src; /* collections/class instances: return same pointer, caller must not drop */
 }
 
 long long unbox_i(Box* b) { return b ? b->i : 0; }
 double unbox_f(Box* b) { return b ? b->f : 0.0; }
 char* unbox_s(Box* b) { return (b && b->type==2) ? b->s : ""; }
-void* unbox_p(Box* b) { return (b && b->type==3) ? b->p : NULL; }
+// bugs.log OPEN-9: accept type==5 (boxed class instance) too, not just the
+// generic type==3 pointer/collection tag — every EXISTING static-type
+// pointer coercion (e.g. `let x: Item = d("k1")`) already goes through
+// unbox_p, so a boxed class instance must unbox the same way a plain boxed
+// pointer does; only the NEW dynamic-dispatch path additionally needs the
+// class_id alongside it (see unbox_class_id below).
+void* unbox_p(Box* b) { return (b && (b->type==3 || b->type==5)) ? b->p : NULL; }
+long long unbox_class_id(Box* b) { return (b && b->type==5) ? b->class_id : -1; }
 
 // ── Rubidium runtime error mechanism ──────────────────────────────────────
 // try/error uses explicit IR branches (no setjmp/longjmp). Collection errors
@@ -273,22 +294,130 @@ char* i128_to_str(__int128 v) {
     memmove(out, &out[i + 1], 47 - i);
     return out;
 }
+
+// OPEN-6: true bignum decimal conversion for i256/i512/i1024/i2048, which
+// have no native C integer type to build a print path on (unlike i128,
+// via Clang's __int128 above) — this operates directly on the raw LLVM
+// bit pattern instead, passed as a little-endian array of 64-bit limbs
+// (limbs[0] is the LEAST significant 64 bits — matches how x86 stores a
+// wide integer in memory, so codegen just allocas the value and bitcasts
+// the pointer to i64* to call this).
+//
+// Algorithm: repeated divide-by-10 across the whole limb array, using
+// __int128 for each step's (remainder<<64 | limb) intermediate so a
+// single 64-bit division instruction-equivalent handles it correctly —
+// this is the standard bignum/small-divisor technique, just applied one
+// decimal digit at a time (simplicity over speed; only used for
+// occasional print/string-interpolation calls, never a hot loop).
+static unsigned long long _bignum_divmod10(unsigned long long* limbs, int n) {
+    unsigned __int128 rem = 0;
+    for (int i = n - 1; i >= 0; i--) {
+        unsigned __int128 cur = (rem << 64) | limbs[i];
+        limbs[i] = (unsigned long long)(cur / 10);
+        rem = cur % 10;
+    }
+    return (unsigned long long)rem;
+}
+static int _bignum_is_zero(unsigned long long* limbs, int n) {
+    for (int i = 0; i < n; i++) if (limbs[i] != 0) return 0;
+    return 1;
+}
+// Shared core: negates (two's complement, in place) if the top bit is set
+// and the caller wants signed interpretation, then converts the
+// (now-unsigned) magnitude to decimal digits into `digits` (written
+// most-significant-first), returning the digit count. `*out_negative` is
+// set to whether the original value was negative.
+static int _bignum_magnitude_digits(unsigned long long* limbs, int n, char* digits, int* out_negative) {
+    int negative = (limbs[n - 1] >> 63) ? 1 : 0;
+    *out_negative = negative;
+    if (negative) {
+        unsigned __int128 carry = 1;
+        for (int i = 0; i < n; i++) {
+            unsigned __int128 v = (unsigned __int128)(~limbs[i]) + carry;
+            limbs[i] = (unsigned long long)v;
+            carry = v >> 64;
+        }
+    }
+    if (_bignum_is_zero(limbs, n)) { digits[0] = '0'; return 1; }
+    int pos = 0;
+    while (!_bignum_is_zero(limbs, n)) {
+        digits[pos++] = '0' + (int)_bignum_divmod10(limbs, n);
+    }
+    // digits were collected least-significant-first — reverse in place
+    for (int a = 0, b = pos - 1; a < b; a++, b--) {
+        char t = digits[a]; digits[a] = digits[b]; digits[b] = t;
+    }
+    return pos;
+}
+// Rubidium's Null sentinel (see bugs.log OPEN-4) sign-extends -2147483648
+// to every width, so a bignum Null's negated magnitude is EXACTLY
+// 2147483648 with every other limb zero — checked before the digit buffer
+// (which the digit-extraction above would otherwise have destroyed) is
+// examined, same convention print_int_or_null/print_i128_or_null use.
+static int _bignum_is_null_sentinel(unsigned long long* limbs, int n) {
+    if (!(limbs[n - 1] >> 63)) return 0;  // must be negative
+    unsigned long long copy[32];
+    for (int i = 0; i < n; i++) copy[i] = limbs[i];
+    unsigned __int128 carry = 1;
+    for (int i = 0; i < n; i++) {
+        unsigned __int128 v = (unsigned __int128)(~copy[i]) + carry;
+        copy[i] = (unsigned long long)v;
+        carry = v >> 64;
+    }
+    if (copy[0] != 2147483648ULL) return 0;
+    for (int i = 1; i < n; i++) if (copy[i] != 0) return 0;
+    return 1;
+}
+void print_bignum_or_null(unsigned long long* limbs, int num_limbs) {
+    if (_bignum_is_null_sentinel(limbs, num_limbs)) { printf("Null\n"); fflush(stdout); return; }
+    char digits[700];  // 2048 bits ~= 617 decimal digits, +sign, +margin
+    int negative, len;
+    // digits are written starting at index 1, reserving index 0 for '-' —
+    // null terminator always goes at index (len+1) regardless of sign.
+    len = _bignum_magnitude_digits(limbs, num_limbs, digits + 1, &negative);
+    digits[len + 1] = '\0';
+    if (negative) { digits[0] = '-'; printf("%s\n", digits); }
+    else { printf("%s\n", digits + 1); }
+    fflush(stdout);
+}
+char* bignum_to_str(unsigned long long* limbs, int num_limbs) {
+    char digits[700];
+    int negative, len;
+    len = _bignum_magnitude_digits(limbs, num_limbs, digits + 1, &negative);
+    char* out = (char*)malloc(len + 2);
+    if (negative) { out[0] = '-'; memcpy(out + 1, digits + 1, len); out[len + 1] = '\0'; }
+    else { memcpy(out, digits + 1, len); out[len] = '\0'; }
+    return out;
+}
+
 double _rubidium_pow(double base, double exp) { return pow(base, exp); }
 
 Box* make_list() { RList* l=malloc(sizeof(RList)); l->magic=1; l->count=0; l->cap=8; l->items=malloc(8*sizeof(Box*)); return box_p(l); }
-void list_append(Box* lst, Box* b) { 
+// OPEN-4 follow-up: unconditional append, no .add()-specific special casing.
+// Used for LITERAL list construction ([Null, 1, 2] must keep every element
+// verbatim) — list_append below (used by the actual .add() method) is NOT
+// safe for this, since its singleton-Null-replace rule would otherwise fire
+// mid-construction on any literal that starts with a Null element.
+void list_append_raw(Box* lst, Box* b) {
     if(!lst || lst->type != 3) return;
-    RList* l=lst->p; 
+    RList* l=lst->p;
+    if(!l || l->magic != 1) return; /* not a list */
+    if(l->count==l->cap){l->cap*=2; l->items=realloc(l->items,l->cap*sizeof(Box*));}
+    l->items[l->count++]=b;
+}
+void list_append(Box* lst, Box* b) {
+    if(!lst || lst->type != 3) return;
+    RList* l=lst->p;
     if(!l || l->magic != 1) return; /* not a list */
     // Spec: [Null].add(x) -> [x]  (single null is replaced, not appended to)
     // [1, Null].add(x) -> [1, Null, x]  (null in non-singleton list is kept)
-    if (l->count == 1 && l->items[0] && l->items[0]->type == 0 && l->items[0]->i == -2147483648LL) {
+    if (l->count == 1 && l->items[0] && l->items[0]->type == 6) {
         box_drop(l->items[0]);
         l->items[0] = b;
         return;
     }
-    if(l->count==l->cap){l->cap*=2; l->items=realloc(l->items,l->cap*sizeof(Box*));} 
-    l->items[l->count++]=b; 
+    if(l->count==l->cap){l->cap*=2; l->items=realloc(l->items,l->cap*sizeof(Box*));}
+    l->items[l->count++]=b;
 }
 // Split a string by a delimiter — returns a Box* list of string Box* parts.
 Box* str_split(char* src, char* delim) {
@@ -343,6 +472,19 @@ int box_equal(Box* a, Box* b) {
     switch (a->type) {
         case 0: return a->i == b->i;
         case 1: return a->f == b->f;
+        // OPEN-4: Null == Null is True (per spec), and both are type==6
+        // here already (a->type != b->type would have returned 0 above).
+        case 6: return 1;
+        // BUGFIX (found while implementing bugs.log OPEN-9): bool (type==4)
+        // had no case here at all, so two equal-valued-but-distinct bool
+        // boxes fell through every case and hit the final `return 0` below
+        // — comparing two boxed `True` values would incorrectly say unequal.
+        case 4: return a->i == b->i;
+        // bugs.log OPEN-9: class instances compare equal only if they're
+        // the same underlying instance (and, redundantly but harmlessly,
+        // the same class) — field-by-field structural equality isn't
+        // possible generically without per-class layout knowledge.
+        case 5: return a->p == b->p && a->class_id == b->class_id;
         case 2:
             if (!a->s || !b->s) return a->s == b->s;
             return strcmp(a->s, b->s) == 0;
@@ -378,6 +520,22 @@ int box_equal(Box* a, Box* b) {
     return 0;
 }
 
+// Numeric ordering compare for two boxed scalars (bugs.log OPEN-10 follow-up):
+// used when a variable was promoted to %Box* by the polymorphic-global
+// mechanism and is compared with <, >, <=, >= against another boxed scalar.
+// Reads each box's own type tag so an int-tagged box and a float-tagged box
+// compare correctly against each other. Returns -1 / 0 / 1.
+int box_compare_num(Box* a, Box* b) {
+    if (!a || !b) return 0;
+    // OPEN-4: Null (type==6) is genuinely -infinity here, rather than
+    // relying on it coincidentally holding the smallest representable int.
+    double av = (a->type == 6) ? -INFINITY : (a->type == 1) ? a->f : (double)a->i;
+    double bv = (b->type == 6) ? -INFINITY : (b->type == 1) ? b->f : (double)b->i;
+    if (av < bv) return -1;
+    if (av > bv) return 1;
+    return 0;
+}
+
 // Recursive deep copy — creates a fully independent clone of any Box value.
 // Called on every variable assignment to satisfy the spec's deep-copy semantics.
 Box* box_deep_copy(Box* src) {
@@ -385,7 +543,24 @@ Box* box_deep_copy(Box* src) {
     if(src->type==0) return box_i(src->i);
     if(src->type==1) return box_f(src->f);
     if(src->type==2) return box_s(src->s ? src->s : "");
-    if(src->type!=3 || !src->p) { Box* b=malloc(sizeof(Box)); b->type=0; b->i=0; return b; }
+    // BUGFIX (found while implementing bugs.log OPEN-9): bool (type==4) was
+    // falling through to the `type!=3` branch below, which resets it to a
+    // plain int 0 — silently destroying a boxed bool's value/type on every
+    // deep-copy (e.g. a bool stored in a collection or a polymorphic global).
+    if(src->type==4) return box_b(src->i);
+    // OPEN-4: Null (type==6) must copy as Null, not silently fall through to
+    // the generic "reset to int 0" fallback below (which would turn a Null
+    // in a collection into a real 0 on the very next deep-copy/assignment).
+    if(src->type==6) return box_null();
+    if(src->type!=3 || !src->p) {
+        // bugs.log OPEN-9: class instances (type==5) use reference
+        // semantics here, same as collections just below — deep-copying
+        // an arbitrary class struct generically isn't possible in the C
+        // runtime without per-class field-layout knowledge, which only
+        // codegen has.
+        if(src->type==5) return src;
+        Box* b=malloc(sizeof(Box)); b->type=0; b->i=0; return b;
+    }
     int* magic = (int*)src->p;
     if(*magic==1) {
         RList* sl = (RList*)src->p;
@@ -413,6 +588,7 @@ int box_eq(Box* a, Box* b) {
     if(a->type==0) return a->i==b->i;
     if(a->type==1) return a->f==b->f;
     if(a->type==2) return strcmp(a->s,b->s)==0;
+    if(a->type==6) return 1;  // OPEN-4: Null == Null
     return a->p==b->p;
 }
 void dict_set(Box* dct, Box* k, Box* v) {
@@ -435,7 +611,7 @@ void collection_add1(Box* col_box, Box* arg) {
     // Null sentinel: auto-promote to a list and append in-place.
     // The box is heap-allocated and parent collections hold a pointer to it,
     // so mutating type+p is visible through all references.
-    if (col_box && col_box->type == 0 && col_box->i == -2147483648LL) {
+    if (col_box && col_box->type == 6) {
         RList* l = malloc(sizeof(RList));
         l->magic = 1; l->count = 0; l->cap = 8;
         l->items = malloc(8 * sizeof(Box*));
@@ -449,7 +625,7 @@ void collection_add1(Box* col_box, Box* arg) {
     if (magic == 1) {
         list_append(col_box, arg);
     } else if (magic == 2) {
-        Box* null_val = box_i(-2147483648LL);  // Rubidium Null sentinel
+        Box* null_val = box_null();  // OPEN-4: was box_i(-2147483648LL)
         dict_set(col_box, arg, null_val);
     } else if (magic == 4) {
         // dict+ : new key defaults to an empty nested dict+, not Null.
@@ -490,7 +666,7 @@ Box* collection_get(Box* col_box, Box* key) {
 
 void collection_set(Box* col_box, Box* key, Box* val) {
     // Null sentinel: auto-promote to a dict and set the key in-place.
-    if (col_box && col_box->type == 0 && col_box->i == -2147483648LL) {
+    if (col_box && col_box->type == 6) {
         RDict* d = malloc(sizeof(RDict));
         d->magic = 2; d->count = 0; d->cap = 8;
         d->keys = malloc(8 * sizeof(Box*)); d->vals = malloc(8 * sizeof(Box*));
@@ -599,6 +775,29 @@ Box* collection_get_at(Box* col_box, int idx) {
     return box_i(0);
 }
 
+void collection_set_at(Box* col_box, int idx, Box* val) {
+    if (!col_box || col_box->type != 3) return;
+    void* col = col_box->p;
+    if(!col) return;
+    int* magic = (int*)col;
+    if (*magic == 1) {
+        RList* l = col;
+        if(idx>=0 && idx<l->count) {
+            Box* copy = box_copy(val);
+            if (l->items[idx]) box_drop(l->items[idx]);
+            l->items[idx] = copy;
+        }
+    }
+    if (IS_DICT_MAGIC(*magic)) {
+        RDict* d = col;
+        if(idx>=0 && idx<d->count) {
+            Box* copy = box_copy(val);
+            if (d->vals[idx]) box_drop(d->vals[idx]);
+            d->vals[idx] = copy;
+        }
+    }
+}
+
 // Timer functions
 void time_timer_start(int tid, double type_hint) {
     if(tid >= 0 && tid < 1024) {
@@ -665,10 +864,11 @@ void print_boxed(Box* b) {
 char* box_to_cstr(Box* b) {
     if(!b) { char* r = malloc(5); strcpy(r,"null"); return r; }
     char* buf = malloc(64);
-    if(b->type==0) {
-        if(b->i == -2147483648LL) { snprintf(buf, 64, "Null"); }  // sentinel
-        else { snprintf(buf, 64, "%lld", b->i); }
-    }
+    if(b->type==0) { snprintf(buf, 64, "%lld", b->i); }
+    // OPEN-4: Null is now its own real Box type (6), so a genuine boxed int
+    // that happens to equal the old sentinel value (INT32_MIN) is no longer
+    // misprinted as "Null" — only an actual box_null() prints "Null" here.
+    else if(b->type==6) { snprintf(buf, 64, "Null"); }
     else if(b->type==4) { snprintf(buf, 64, "%s", b->i ? "True" : "False"); }
     else if(b->type==1) { snprintf(buf, 64, "%g",   b->f); }
     else if(b->type==2) { free(buf); return strdup(b->s ? b->s : ""); }

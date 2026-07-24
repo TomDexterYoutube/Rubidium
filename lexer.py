@@ -135,6 +135,21 @@ def tokenize(code):
         if kind == "MISMATCH":
             raise SyntaxError(f"Line {line_no}: Unexpected character: {value!r}")
 
+        # BUGFIX (bugs.log OPEN-8 follow-up): 'self' inside a class method must
+        # refer to the same instance-parameter name codegen registers
+        # (method params are prepended with ("__self", class_name), and
+        # _emit_class_method registers self.instances["__self"] = class_name).
+        # The parser has no special-casing for the word "self" at all — it's
+        # just tokenized as an ordinary IDENT — so every Var/FieldAccess/
+        # FieldAssign/MethodCall built from a literal "self" reference never
+        # matched "__self" in codegen's instance-name lookups: reads raised
+        # "'self' is not an instance" and writes (self.field = value) were
+        # silently dropped as a no-op. Canonicalizing at the token level fixes
+        # every one of those call sites at once, instead of patching each
+        # spot in the parser/codegen individually.
+        if kind == "IDENT" and value == "self":
+            value = "__self"
+
         tokens.append((kind, value, line_no))
         if kind == "STRING3":
             line_no += value.count("\n")

@@ -1,6 +1,13 @@
 class Number:
-    def __init__(self, value):
+    def __init__(self, value, raw=None):
         self.value = value
+        # OPEN-5: original source text for a float literal, preserved
+        # alongside the already-lossy Python `float(value)`. Only codegen
+        # needs this — to emit a literal directly at fp128 precision (via
+        # LLVM IR's decimal-constant parsing, which uses APFloat rather
+        # than going through a double intermediate) when the literal has
+        # more significant digits than a double can represent exactly.
+        self.raw = raw
 
 class Bool:
     def __init__(self, value):

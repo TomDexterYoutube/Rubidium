@@ -823,7 +823,10 @@ class Parser:
 
         if tok[0] == "NUMBER":
             self.advance()
-            if '.' in tok[1]: res = Number(float(tok[1]))
+            # OPEN-5: preserve the raw literal text for floats so codegen can
+            # emit it directly at fp128 precision when it has more
+            # significant digits than a double can hold exactly.
+            if '.' in tok[1]: res = Number(float(tok[1]), raw=tok[1])
             else: res = Number(int(tok[1]))
             # BUGFIX (bugs.log #10): allow method chaining on number literals
             # (e.g. `0.to(SY)`), matching what STRING literals already
