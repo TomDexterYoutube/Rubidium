@@ -162,6 +162,16 @@ class CodeGen:
         self.linked_to = {}  # bugs.log #5: name -> target name for scalar `link` aliasing
         self.indexed_links = {}  # bugs.log OPEN-1: name -> (collection_var, index_expr) for indexed `link` aliasing
         self.element_types = {}  # bugs.log #2: var_name -> element_type for collection type enforcement
+        # OPEN-4 (scalar Null): names of scalar-int variables whose CURRENT value
+        # is an explicit Null literal. A raw i32/i64 stores Null as INT32_MIN, which
+        # is indistinguishable at runtime from a genuine value that computed/clamped
+        # to the type's true minimum — so `print` can't decide "Null" vs the real
+        # min from the bits alone. Per the language owner's rule ("a value at the
+        # bottom limit is just the bottom limit, it does not become Null"), only a
+        # value KNOWN at compile time to be an explicit Null prints as "Null";
+        # everything else prints its real number. This set tracks that knowledge,
+        # updated on every scalar VarDecl/Assign.
+        self.null_valued = set()
         self.cur_class    = None
         self._alloca_emitted = set()  # local var names that already have an alloca in current fn
         self._try_error_label = None  # set while inside a try body for div-by-zero guards
@@ -558,6 +568,9 @@ class CodeGen:
             "declare i8* @i128_to_str(i128)",
             "declare void @print_bignum_or_null(i64*, i32)",
             "declare i8* @bignum_to_str(i64*, i32)",
+            "declare void @print_int_plain(i64)",       # OPEN-4: no Null-sentinel check
+            "declare void @print_i128_plain(i128)",
+            "declare void @print_bignum_plain(i64*, i32)",
             "declare i8* @malloc(i64)", "declare void @free(i8*)", "declare i64 @strlen(i8*)",
             "declare i32 @scanf(i8*, ...)", "declare i8* @fgets(i8*, i32, i8*)",
             "declare i8* @strcpy(i8*, i8*)", "declare i32 @strcmp(i8*, i8*)",
@@ -672,6 +685,31 @@ class CodeGen:
                 patched.append("_rub_init_ok_l:")
                 injected = True
         self.fn_lines = patched
+
+    def _is_known_null(self, node):
+        """OPEN-4 (scalar Null): True iff `node` is known AT COMPILE TIME to be an
+        explicit Null — either the `Null` literal itself, or a scalar variable
+        whose current value was tracked as Null (see self.null_valued). Used so
+        `print` shows "Null" only for a genuine Null, and shows the real number
+        for any value that merely computed/clamped to the type's minimum."""
+        if isinstance(node, None_):
+            return True
+        if isinstance(node, Var) and node.name in self.null_valued:
+            return True
+        return False
+
+    def _track_null_valued(self, name, value_node):
+        """OPEN-4 (scalar Null): keep self.null_valued in sync on scalar
+        VarDecl/Assign — a name becomes Null-valued only when assigned an explicit
+        Null (directly, or copied from another currently-Null scalar), and loses
+        that status on any other assignment. Conservative by design: anything the
+        compiler can't prove is Null (a function return, a param, a conditionally
+        assigned value) is treated as a normal number, matching the rule that a
+        bottom-limit value is just the bottom limit, not Null."""
+        if self._is_known_null(value_node):
+            self.null_valued.add(name)
+        else:
+            self.null_valued.discard(name)
 
     def _deep_copy_if_var(self, val, val_t, source_node):
         """Deep copy a %Box* value when the source is an existing variable (not a fresh allocation).
@@ -1232,6 +1270,7 @@ class CodeGen:
             return
         if isinstance(node, VarDecl):
             if node.name in self.dropped_vars: self.dropped_vars.discard(node.name)
+            self._track_null_valued(node.name, node.value)  # OPEN-4 scalar Null
 
             # BUGFIX (bugs.log #5): `let [mut] b = link a` for a SCALAR source
             # (collections already work via shared %Box* pointers, see
@@ -1309,8 +1348,18 @@ class CodeGen:
                     self.emit(f"  {ptr_str} = alloca {ir_t}")
                     self._alloca_emitted.add(node.name)
                 val, val_t = self.emit_expr(node.value)
-                val = self.coerce(val, val_t, ir_t)
+                # OPEN-10: deep-copy the %Box* BEFORE coercing, not after. The
+                # old order coerced first (e.g. %Box* -> i8* via unbox_s, which
+                # REASSIGNS val to a raw string pointer) and THEN called
+                # _deep_copy_if_var with the STALE val_t="%Box*", so it ran
+                # box_deep_copy on what was now an i8* — treating a char* as a
+                # Box* and producing garbage (`let w: str = <loop var>` lost its
+                # value entirely). Copying the box first also makes the unboxed
+                # string an independent strdup'd buffer, so it survives the
+                # source box being dropped (e.g. a for-loop variable freed at
+                # end of iteration).
                 val = self._deep_copy_if_var(val, val_t, node.value)
+                val = self.coerce(val, val_t, ir_t)
                 self.emit(f"  store {ir_t} {val}, {ir_t}* {ptr_str}")
                 return False
             if self.cur_fn is not None and self.cur_fn != "_rubidium_init" and self.cur_class is not None:
@@ -1342,8 +1391,10 @@ class CodeGen:
                 self.emit(f"  {inst_ptr} = load {struct_t}*, {struct_t}** {self_ptr_str}")
                 self.emit(f"  {fptr} = getelementptr {struct_t}, {struct_t}* {inst_ptr}, i32 0, i32 {idx}")
                 val, val_t = self.emit_expr(node.value)
-                val = self.coerce(val, val_t, field_ir_t)
+                # OPEN-10: copy the %Box* before coercing (see the detailed note
+                # at the is_local branch above — same stale-val_t bug otherwise).
                 val = self._deep_copy_if_var(val, val_t, node.value)
+                val = self.coerce(val, val_t, field_ir_t)
                 self.emit(f"  store {field_ir_t} {val}, {field_ir_t}* {fptr}")
                 if isinstance(node.value, FFILoad):
                     slot = f"@_ffi_slot_{node.name}"
@@ -1380,8 +1431,10 @@ class CodeGen:
                     self.emit(f"  {ptr_str} = alloca {ir_t}")
                     self._alloca_emitted.add(node.name)
                 val, val_t = self.emit_expr(node.value)
-                val = self.coerce(val, val_t, ir_t)
+                # OPEN-10: copy the %Box* before coercing (see the detailed note
+                # at the is_local branch above — same stale-val_t bug otherwise).
                 val = self._deep_copy_if_var(val, val_t, node.value)
+                val = self.coerce(val, val_t, ir_t)
                 self.emit(f"  store {ir_t} {val}, {ir_t}* {ptr_str}")
                 if isinstance(node.value, FFILoad):
                     slot = f"@_ffi_slot_{node.name}"
@@ -1414,8 +1467,10 @@ class CodeGen:
                 # the wrong type/size against the real global, corrupting memory.
                 actual_t = self.global_vars.get(node.name, ir_t)
                 val, val_t = self.emit_expr(node.value)
-                val = self.coerce(val, val_t, actual_t)
+                # OPEN-10: copy the %Box* before coercing (see the detailed note
+                # at the is_local branch above — same stale-val_t bug otherwise).
                 val = self._deep_copy_if_var(val, val_t, node.value)
+                val = self.coerce(val, val_t, actual_t)
                 ir_name = f"_var_{node.name}" if node.name in ("pow", "sin", "cos", "tan", "sqrt", "log", "log10", "exp", "fabs", "floor", "ceil", "round") else node.name
                 self.emit(f"  store {actual_t} {val}, {actual_t}* @{ir_name}")
                 if isinstance(node.value, FFILoad):
@@ -1427,7 +1482,9 @@ class CodeGen:
  
         elif isinstance(node, Assign):
             if node.name in self.dropped_vars: raise RubidiumNameError(f"Var '{node.name}'")
-            
+            if isinstance(node.name, str):
+                self._track_null_valued(node.name, node.value)  # OPEN-4 scalar Null
+
             # Handle indexed link assignment: let b = link a(i); b = val -> a(i).set(val)
             if node.name in self.indexed_links:
                 coll_name, index_expr = self.indexed_links[node.name]
@@ -2106,6 +2163,19 @@ class CodeGen:
             self.emit(f"  {ptr} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
             self.emit(f"  call i32 (i8*, ...) @printf(i8* {ptr})")
             return
+        # OPEN-4 (scalar Null): only a value the compiler KNOWS is an explicit
+        # Null prints as "Null". A raw scalar that merely computed/clamped to the
+        # type's minimum prints its real number (handled by the plain-int print
+        # paths below), per the rule "a bottom-limit value is just the bottom
+        # limit, not Null". Boxed Null (type==6) still prints "Null" via
+        # print_boxed and is unaffected by this scalar-only path.
+        if self._is_known_null(value):
+            nl_lbl, nl_len = self.intern_str("Null\n")
+            nptr = self.new_tmp()
+            self.emit(f"  {nptr} = getelementptr [{nl_len} x i8], [{nl_len} x i8]* {nl_lbl}, i64 0, i64 0")
+            self.emit(f"  call i32 (i8*, ...) @printf(i8* {nptr})")
+            self.emit(f"  call i32 @fflush(i8* null)")
+            return
         val, val_t = self.emit_expr(value)
         if val_t == "%Box*":
             self.emit(f"  call void @print_boxed(%Box* {val})")  # print_boxed already calls fflush
@@ -2123,15 +2193,21 @@ class CodeGen:
             # BUGFIX (bugs.log #17): was narrowed to i64 first (clamping
             # anything outside i64's range), so print() couldn't verify
             # correctly-computed i128 arithmetic beyond 64 bits.
-            self.emit(f'  call void @print_i128_or_null(i128 {val})')
+            # OPEN-4: plain (no sentinel check) — an explicit Null was already
+            # handled above; a raw min value prints as its real number.
+            self.emit(f'  call void @print_i128_plain(i128 {val})')
         elif val_t in ("i256", "i512", "i1024", "i2048"):
             # OPEN-6: true bignum printing — was narrowed to i64 (clamping
             # anything outside i64's range) before this fix.
+            # OPEN-4: plain (no sentinel check) — see i128 note above.
             ptr64, n = self._emit_bignum_ptr(val, val_t)
-            self.emit(f'  call void @print_bignum_or_null(i64* {ptr64}, i32 {n})')
+            self.emit(f'  call void @print_bignum_plain(i64* {ptr64}, i32 {n})')
         elif val_t in ("i32", "i64"):
+            # OPEN-4: plain number print (no sentinel/Null check) — an explicit
+            # Null was already handled above; a value at the type minimum prints
+            # as its real number, not "Null".
             cv = self.coerce(val, val_t, "i64")
-            self.emit(f'  call void @print_int_or_null(i64 {cv})')
+            self.emit(f'  call void @print_int_plain(i64 {cv})')
         elif val_t in ("float", "double", "fp128"):
             fmt, flen = self.intern_str("%g\n")
             ptr = self.new_tmp()

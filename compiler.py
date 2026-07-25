@@ -275,6 +275,15 @@ void print_int_or_null(long long v) {
     fflush(stdout);
 }
 
+// OPEN-4 (scalar Null): plain integer print with NO Null-sentinel check —
+// codegen now decides "Null" vs a real number at COMPILE TIME (only an
+// explicit Null literal / statically-Null variable prints "Null"), so the
+// runtime must print the true value even when it equals INT32_MIN. This is
+// what makes "a value at the bottom limit is just the bottom limit, not Null"
+// actually hold for computed/clamped minimums. print_int_or_null is kept for
+// any legacy path but the print() codegen path uses this now.
+void print_int_plain(long long v) { printf("%lld\n", v); fflush(stdout); }
+
 // BUGFIX/FEATURE (bugs.log #17): print() used to always narrow to i64
 // before printing, so even correctly-computed i128 arithmetic (see the
 // codegen-side promote_type fix) couldn't actually be verified/displayed
@@ -287,6 +296,19 @@ void print_int_or_null(long long v) {
 // string conversion on top of that — out of scope here, still clamps.
 void print_i128_or_null(__int128 v) {
     if (v == -2147483648LL) { printf("Null\n"); fflush(stdout); return; }
+    char buf[48];
+    int i = 46;
+    buf[47] = '\0';
+    int neg = v < 0;
+    unsigned __int128 uv = neg ? (unsigned __int128)(-v) : (unsigned __int128)v;
+    if (uv == 0) buf[i--] = '0';
+    while (uv > 0) { buf[i--] = '0' + (int)(uv % 10); uv /= 10; }
+    if (neg) buf[i--] = '-';
+    printf("%s\n", &buf[i + 1]);
+    fflush(stdout);
+}
+// OPEN-4: plain i128 print, no Null-sentinel check (see print_int_plain).
+void print_i128_plain(__int128 v) {
     char buf[48];
     int i = 46;
     buf[47] = '\0';
@@ -394,6 +416,16 @@ void print_bignum_or_null(unsigned long long* limbs, int num_limbs) {
     int negative, len;
     // digits are written starting at index 1, reserving index 0 for '-' —
     // null terminator always goes at index (len+1) regardless of sign.
+    len = _bignum_magnitude_digits(limbs, num_limbs, digits + 1, &negative);
+    digits[len + 1] = '\0';
+    if (negative) { digits[0] = '-'; printf("%s\n", digits); }
+    else { printf("%s\n", digits + 1); }
+    fflush(stdout);
+}
+// OPEN-4: plain bignum print, no Null-sentinel check (see print_int_plain).
+void print_bignum_plain(unsigned long long* limbs, int num_limbs) {
+    char digits[700];
+    int negative, len;
     len = _bignum_magnitude_digits(limbs, num_limbs, digits + 1, &negative);
     digits[len + 1] = '\0';
     if (negative) { digits[0] = '-'; printf("%s\n", digits); }
@@ -628,6 +660,19 @@ void dict_set(Box* dct, Box* k, Box* v) {
 // dict.add(new_key) -> create a new top-level key with value Null (per spec).
 // null sentinel.add(val) -> auto-promote null to a list, append val in-place.
 void collection_add1(Box* col_box, Box* arg) {
+    // OPEN-10 (SIGSEGV / `<obj>` corruption): the collection must store its OWN
+    // independent DEEP COPY of the added value, not the caller's box by
+    // reference. Per the spec's deep-copy-on-insert rule, and — concretely —
+    // because the caller frequently owns `arg` and frees it right after adding
+    // (the classic case: a `for`-loop variable, which the loop body adds to a
+    // list and the loop then box_drop()s at the end of each iteration; also a
+    // local `str`/`index` reassigned or dropped after the add). Storing `arg`
+    // directly left the collection holding a dangling pointer: reading it back
+    // later saw freed/garbage memory — a wrong type tag ("<obj>"), lost string
+    // content (""), or, in the real app, a garbage `->s` that box_deep_copy
+    // then strdup()'d into a hard SIGSEGV. box_deep_copy makes the collection's
+    // copy fully self-owned so the caller's later free never touches it.
+    Box* owned = box_deep_copy(arg);
     // Null sentinel: auto-promote to a list and append in-place.
     // The box is heap-allocated and parent collections hold a pointer to it,
     // so mutating type+p is visible through all references.
@@ -637,19 +682,19 @@ void collection_add1(Box* col_box, Box* arg) {
         l->items = malloc(8 * sizeof(Box*));
         col_box->type = 3;
         col_box->p = l;
-        list_append(col_box, arg);
+        list_append(col_box, owned);
         return;
     }
     if (!col_box || col_box->type != 3 || !col_box->p) return;
     int magic = *(int*)col_box->p;
     if (magic == 1) {
-        list_append(col_box, arg);
+        list_append(col_box, owned);
     } else if (magic == 2) {
         Box* null_val = box_null();  // OPEN-4: was box_i(-2147483648LL)
-        dict_set(col_box, arg, null_val);
+        dict_set(col_box, owned, null_val);
     } else if (magic == 4) {
         // dict+ : new key defaults to an empty nested dict+, not Null.
-        dict_set(col_box, arg, make_dictplus());
+        dict_set(col_box, owned, make_dictplus());
     }
 }
 Box* dict_get(void* col, Box* k) {
