@@ -1401,7 +1401,17 @@ class CodeGen:
                 self.emit(f"  store {field_ir_t} {val}, {field_ir_t}* {fptr}")
                 if isinstance(node.value, FFILoad):
                     slot = f"@_ffi_slot_{node.name}"
-                    if not any(d.startswith(slot) for d in self.global_decls):
+                    # BUG-1 (RIG report): `d.startswith(slot)` is a substring
+                    # check against the WHOLE declaration line, not an exact
+                    # global-name check — "@_ffi_slot_glfw = global i64 -1"
+                    # starts with "@_ffi_slot_gl" too, so declaring `gl` after
+                    # `glfw` false-positived as "already declared" and skipped
+                    # emitting @_ffi_slot_gl entirely, leaving a later `store`
+                    # into it referencing an undefined global (LLVM codegen
+                    # error). Match the exact declaration prefix ("slot =")
+                    # instead, so a name that happens to be a prefix of an
+                    # earlier one is never mistaken for it.
+                    if not any(d.startswith(f"{slot} =") for d in self.global_decls):
                         self.global_decls.append(f"{slot} = global i64 -1")
                     self.emit(f"  store i64 {val}, i64* {slot}")
             elif self.cur_fn is not None and self.cur_fn != "_rubidium_init":
@@ -1441,7 +1451,17 @@ class CodeGen:
                 self.emit(f"  store {ir_t} {val}, {ir_t}* {ptr_str}")
                 if isinstance(node.value, FFILoad):
                     slot = f"@_ffi_slot_{node.name}"
-                    if not any(d.startswith(slot) for d in self.global_decls):
+                    # BUG-1 (RIG report): `d.startswith(slot)` is a substring
+                    # check against the WHOLE declaration line, not an exact
+                    # global-name check — "@_ffi_slot_glfw = global i64 -1"
+                    # starts with "@_ffi_slot_gl" too, so declaring `gl` after
+                    # `glfw` false-positived as "already declared" and skipped
+                    # emitting @_ffi_slot_gl entirely, leaving a later `store`
+                    # into it referencing an undefined global (LLVM codegen
+                    # error). Match the exact declaration prefix ("slot =")
+                    # instead, so a name that happens to be a prefix of an
+                    # earlier one is never mistaken for it.
+                    if not any(d.startswith(f"{slot} =") for d in self.global_decls):
                         self.global_decls.append(f"{slot} = global i64 -1")
                     self.emit(f"  store i64 {val}, i64* {slot}")
             else:
@@ -1478,7 +1498,17 @@ class CodeGen:
                 self.emit(f"  store {actual_t} {val}, {actual_t}* @{ir_name}")
                 if isinstance(node.value, FFILoad):
                     slot = f"@_ffi_slot_{node.name}"
-                    if not any(d.startswith(slot) for d in self.global_decls):
+                    # BUG-1 (RIG report): `d.startswith(slot)` is a substring
+                    # check against the WHOLE declaration line, not an exact
+                    # global-name check — "@_ffi_slot_glfw = global i64 -1"
+                    # starts with "@_ffi_slot_gl" too, so declaring `gl` after
+                    # `glfw` false-positived as "already declared" and skipped
+                    # emitting @_ffi_slot_gl entirely, leaving a later `store`
+                    # into it referencing an undefined global (LLVM codegen
+                    # error). Match the exact declaration prefix ("slot =")
+                    # instead, so a name that happens to be a prefix of an
+                    # earlier one is never mistaken for it.
+                    if not any(d.startswith(f"{slot} =") for d in self.global_decls):
                         self.global_decls.append(f"{slot} = global i64 -1")
                     self.emit(f"  store i64 {val}, i64* {slot}")
                 return False
@@ -2943,7 +2973,12 @@ class CodeGen:
         # Using the slot (not a local alloca) means the wrapper always finds it.
         slot_name = f"@_ffi_slot_{node.handle_name}"
         # Declare the slot if not yet declared (collect pass may run before emit_ffi_bind)
-        if not any(d.startswith(slot_name) for d in self.global_decls):
+        # BUG-1 (RIG report): exact-match the declaration prefix, not a bare
+        # substring check — see the matching fix/comment at the VarDecl sites
+        # above for the full explanation (a name that's a prefix of an
+        # earlier-declared one, e.g. "gl" after "glfw", false-positived as
+        # already-declared and silently skipped emitting its own global).
+        if not any(d.startswith(f"{slot_name} =") for d in self.global_decls):
             self.global_decls.append(f"@_ffi_slot_{node.handle_name} = global i64 -1")
         handle_var_v = f"%ffi_h_{self.new_tmp()[1:]}"
         pending.append(f"  {handle_var_v} = load i64, i64* {slot_name}")
@@ -4088,7 +4123,12 @@ class CodeGen:
                 args_ir.append(f"{t} {v}")
                 arg_types.append(t)
             params_def = ", ".join(f"{t} %a{i}" for i, t in enumerate(arg_types))
-            stub_key = f"define weak i64 @{ext_name}"
+            # BUG-1 class (RIG report, same root cause): anchor with the "("
+            # that always follows an LLVM function name in a `define` line, so
+            # an ext_name that's a prefix of another stub's name (e.g. "gl" vs
+            # "glfw_init") can't false-positive as "already defined" via a bare
+            # substring check and get silently skipped.
+            stub_key = f"define weak i64 @{ext_name}("
             if not any(stub_key in d for d in self.global_decls):
                 self.global_decls.append(
                     f"define weak i64 @{ext_name}({params_def}) {{\n"
