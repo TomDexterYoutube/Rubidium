@@ -590,7 +590,7 @@ class CodeGen:
             "@_thread_handles = global [1024 x i64] zeroinitializer",
             "@_thread_results = external global [1024 x %Box*]", # <--- ADD THIS LINE
             "declare void @os_start(i64)",
-            "declare i8* @os_run(i64, i8*, i8*)",
+            "declare i8* @os_run(i64, i8*, i8*, i64)",  # OPEN-13: 4th arg = absolute timeout in ms (<=0 => default)
             "declare void @os_terminal_drop(i64)",
             "declare i64 @ffi_load(i8*)",
             "declare i64 @ffi_sym(i64, i8*)",
@@ -2861,9 +2861,18 @@ class CodeGen:
             if "input" in fields:
                 inp_v, inp_t = self.emit_expr(fields["input"])
                 input_s = self.coerce(inp_v, inp_t, "i8*")
+            # OPEN-13: optional `timeout` field (in SECONDS) → absolute ms ceiling.
+            # Absent → 0, which os_run() maps to its generous default.
+            if "timeout" in fields:
+                to_v, to_t = self.emit_expr(fields["timeout"])
+                to_s = self.coerce(to_v, to_t, "i64")
+                to_ms = self.new_tmp()
+                self.emit(f"  {to_ms} = mul i64 {to_s}, 1000")
+            else:
+                to_ms = "0"
             # id is not needed for struct form — use terminal 0 by default
             res = self.new_tmp()
-            self.emit(f"  {res} = call i8* @os_run(i64 0, i8* {cmd_s}, i8* {input_s})")
+            self.emit(f"  {res} = call i8* @os_run(i64 0, i8* {cmd_s}, i8* {input_s}, i64 {to_ms})")
             # Check for NULL return (command failed) and branch to try error handler
             self._check_os_run_error(res)
             return res, "i8*"
@@ -2877,8 +2886,10 @@ class CodeGen:
                 inp_s = self.coerce(inp_v, inp_t, "i8*")
             else:
                 inp_s = null_ptr
+            # OPEN-13: positional form has no timeout slot (3rd arg is `input`);
+            # pass 0 so os_run() uses its generous default absolute ceiling.
             res = self.new_tmp()
-            self.emit(f"  {res} = call i8* @os_run(i64 {id_v}, i8* {cmd_s}, i8* {inp_s})")
+            self.emit(f"  {res} = call i8* @os_run(i64 {id_v}, i8* {cmd_s}, i8* {inp_s}, i64 0)")
             # Check for NULL return (command failed) and branch to try error handler
             self._check_os_run_error(res)
             return res, "i8*"
@@ -3974,11 +3985,21 @@ class CodeGen:
             resolved_name = self.import_aliases.get(obj_name, obj_name)
             target_name = f"{resolved_name}_{node.method}"
             if target_name in self.functions:
-                args_ir = []
-                for a in node.args:
-                    v, t = self.emit_expr(a); args_ir.append(f"{t} {v}")
-                tmp = self.new_tmp()
                 fn_obj = self.functions[target_name]
+                # OPEN-12: coerce each arg to the callee's declared param type
+                # (same class of bug as OPEN-11, here on the module-namespaced
+                # function-call path — `tb.show(wrap_line)`). Without this, a
+                # %Box*-typed value such as a `str` bound to a for-loop variable
+                # was passed straight into an i8* parameter, arriving empty at
+                # the callee (rendered as nothing).
+                param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_obj.params] if fn_obj.params else []
+                args_ir = []
+                for i, a in enumerate(node.args):
+                    v, t = self.emit_expr(a)
+                    if i < len(param_types):
+                        v = self.coerce(v, t, param_types[i]); t = param_types[i]
+                    args_ir.append(f"{t} {v}")
+                tmp = self.new_tmp()
                 fn_ret = fn_obj.ret_type
                 ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else "i64"
                 # BUGFIX (bugs.log #1): call the real emitted symbol (fn_obj.name).
@@ -4012,11 +4033,17 @@ class CodeGen:
             attr_name = node.obj.field
             for target in (f"{ns_name}_{attr_name}_{node.method}", f"{ns_name}_{node.method}", node.method):
                 if target in self.functions:
-                    args_ir = []
-                    for a in node.args:
-                        v, t = self.emit_expr(a); args_ir.append(f"{t} {v}")
-                    tmp = self.new_tmp()
                     fn_obj = self.functions[target]
+                    # OPEN-12: coerce args to declared param types (see the
+                    # module-function path above — same fix).
+                    param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_obj.params] if fn_obj.params else []
+                    args_ir = []
+                    for i, a in enumerate(node.args):
+                        v, t = self.emit_expr(a)
+                        if i < len(param_types):
+                            v = self.coerce(v, t, param_types[i]); t = param_types[i]
+                        args_ir.append(f"{t} {v}")
+                    tmp = self.new_tmp()
                     fn_ret = fn_obj.ret_type
                     ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else "i64"
                     self.emit(f"  {tmp} = call {ret_ir} @{fn_obj.name}({', '.join(args_ir)})")

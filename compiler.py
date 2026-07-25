@@ -1042,6 +1042,7 @@ char* list_combine(Box* col_box) {
 #include <errno.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <poll.h>   // OPEN-13: wait on child stdout instead of fixed-usleep polling
 
 typedef struct {
     pid_t pid;
@@ -1094,7 +1095,7 @@ void os_start(long long id) {
 // Run a command in the terminal, optionally sending `input` to stdin.
 // Returns all output as a heap-allocated string. Caller should free.
 // If command fails (non-zero exit), returns NULL and sets _rub_error_msg for try/error handler.
-char* os_run(long long id, const char* cmd, const char* input) {
+char* os_run(long long id, const char* cmd, const char* input, long long timeout_ms) {
     if(id<0||id>=1024||!_os_terminals[id].active) return strdup("");
 
     OsTerminal* t = &_os_terminals[id];
@@ -1122,25 +1123,42 @@ char* os_run(long long id, const char* cmd, const char* input) {
     // Send exit code capture command
     write(t->stdin_fd, "echo \"RUBIDIUM_EXIT_CODE:$?\"\n", 29);
 
-    // Collect output with timeout
+    // OPEN-13: collect output by WAITING FOR ACTUAL COMPLETION, not a fixed
+    // quiet-period heuristic. The old loop gave up after ~250ms of silence
+    // between the command's writes (and a hard 1.5s ceiling), silently
+    // truncating any slow/bursty command — e.g. an LLM stream with >250ms gaps
+    // between tokens came back cut off with no error. Instead: block on poll()
+    // for the child's stdout and keep reading until the appended
+    // RUBIDIUM_EXIT_CODE marker appears (true completion) or an absolute safety
+    // timeout elapses. An idle gap of any length no longer ends collection
+    // early. timeout_ms is the absolute ceiling (a positive value overrides;
+    // <=0 falls back to a generous default) so a genuinely hung command can't
+    // block forever.
     char buf[4096];
     char* out = malloc(1);
     out[0]='\0';
     size_t out_len=0;
-    int retries=30; // up to 1.5s total
     int exit_code = 0;
     int exit_code_found = 0;
-    while(retries-->0) {
-        usleep(50000);
+    long long deadline_ms = timeout_ms > 0 ? timeout_ms : 300000; // default 5 min
+    struct timespec start_ts; clock_gettime(CLOCK_MONOTONIC, &start_ts);
+    while(!exit_code_found) {
+        struct timespec now_ts; clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        long long elapsed = (long long)(now_ts.tv_sec - start_ts.tv_sec) * 1000
+                          + (now_ts.tv_nsec - start_ts.tv_nsec) / 1000000;
+        if(elapsed >= deadline_ms) break;               // absolute safety ceiling
+        struct pollfd pfd; pfd.fd = t->stdout_fd; pfd.events = POLLIN; pfd.revents = 0;
+        int pr = poll(&pfd, 1, (int)(deadline_ms - elapsed));
+        if(pr == 0) break;                              // no data within remaining budget
+        if(pr < 0) { if(errno==EINTR) continue; break; }
         ssize_t n = read(t->stdout_fd, buf, sizeof(buf)-1);
         if(n>0) {
             buf[n]='\0';
             out = realloc(out, out_len+n+1);
             memcpy(out+out_len, buf, n);
             out_len+=n; out[out_len]='\0';
-            retries=5; // got data, keep reading a bit more
 
-            // Check for exit code marker
+            // Check for exit code marker (true completion)
             char* marker = strstr(out, "RUBIDIUM_EXIT_CODE:");
             if(marker) {
                 exit_code = atoi(marker + 19);
@@ -1155,8 +1173,10 @@ char* os_run(long long id, const char* cmd, const char* input) {
                     out[out_len] = '\0';
                 }
             }
-        } else if(n<0 && errno==EAGAIN) {
-            if(out_len>0 && retries<10) break; // got some output, we're done
+        } else if(n==0) {
+            break; // EOF — child closed its stdout
+        } else if(n<0 && errno!=EAGAIN && errno!=EWOULDBLOCK) {
+            break; // genuine read error (EAGAIN just means "poll lied"/retry)
         }
     }
 

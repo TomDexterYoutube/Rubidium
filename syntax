@@ -1267,6 +1267,21 @@ let output = os.run(1, "echo hello")
 
 let result = os.run(1, "sudo apt update", "y")
 
+# os.run waits for the command to actually finish before returning, so
+# slow or bursty output (e.g. a streaming download) is captured in full,
+# not truncated. There is a generous default safety limit (5 minutes) so a
+# hung command cannot block forever.
+
+# The struct form accepts an optional `timeout` (in SECONDS) to override
+# that safety limit — useful to bound a command you don't want to wait on:
+
+let data = os.run({cmd: "curl -s https://example.com", timeout: 30})
+
+# The struct form also supports `args` (a list appended to the command) and
+# `input` (sent to the command's stdin), and defaults to terminal 0:
+
+let listing = os.run({cmd: "ls", args: ["-l", "/tmp"]})
+
 # Drop a terminal session to free its resources:
 
 os(1).drop()
