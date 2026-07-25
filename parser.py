@@ -919,6 +919,16 @@ class Parser:
                     return FnCall(sy_name, args)
                 return Var(sy_name)
             self.advance(); e = self.expr(); self.match("RPAREN")
+            # FEATURE (typed math block): `(expr): TYPE` computes the whole
+            # bracketed expression at TYPE's precision (see MathBlock / codegen's
+            # _math_block_type). Only triggers when a COLON+TYPE immediately
+            # follows the closing paren — normal grouped exprs are unaffected.
+            _nxt = self.tokens[self.pos + 1] if self.pos + 1 < len(self.tokens) else None
+            if (self.peek() and self.peek()[0] == "COLON"
+                    and _nxt and _nxt[0] == "TYPE"):
+                self.match("COLON")
+                block_type = self.match("TYPE")
+                e = MathBlock(e, block_type)
             # BUGFIX (bugs.log #10): postfix `.method()`/field chaining was
             # only wired up for specific primary-expression shapes (bare
             # IDENT, SY reflection, TYPE-as-varname) individually, each with

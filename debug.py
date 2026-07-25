@@ -154,6 +154,7 @@ class Debugger:
         self._source_lines  = source_lines or []
         self._lmap          = {}      # ('var'|'fn'|'class'|'for', name) -> line
         self._try_depth     = 0       # >0 means inside a try block; errors raise instead of print
+        self._math_block_type = None  # typed math block `(expr): TYPE` — governs division/result type
         self._dynvars       = {}      # runtime SY reflection backing store — see DynResolve/DynVarDecl
         self._os_active     = set()   # open os.start(id) session ids — see OsStart/OsRun/OsDrop
         if tokens:
@@ -767,6 +768,11 @@ class Debugger:
                 if node.op == "-":   return left - right
                 if node.op == "*":   return left * right
                 if node.op == "/":
+                    # Typed math block with a float type: compute at that
+                    # precision, i.e. float division even if both operands are
+                    # ints (matches the compiler's _math_block_type override).
+                    if self._math_block_type and self._math_block_type[0] == 'f':
+                        return left / right
                     if isinstance(left, int) and isinstance(right, int):
                         # Truncate toward zero (matches the compiler's sdiv),
                         # not Python's floor division.
@@ -822,6 +828,28 @@ class Debugger:
                 if t == "bool":  return bool(val)
             except Exception as e:
                 self.error(f"Type cast to '{t}' failed: {e}")
+            return val
+
+        if isinstance(node, ast.MathBlock):
+            # FEATURE (typed math block): compute the inner expression at
+            # node.vtype's kind. While it's active, division inside is float
+            # division if the block type is a float (see the BinOp `/` case),
+            # matching the compiler's "compute the whole block at that type".
+            prev = self._math_block_type
+            self._math_block_type = node.vtype
+            try:
+                val = self.evaluate(node.expr)
+            finally:
+                self._math_block_type = prev
+            if val is None:
+                return None
+            try:
+                if node.vtype and node.vtype[0] == 'f':  # float type -> float result
+                    return float(val)
+                if node.vtype and node.vtype[0] == 'i':  # int type -> int result
+                    return int(val)
+            except Exception:
+                pass
             return val
 
         if isinstance(node, ast.ListExpr):
@@ -1595,6 +1623,8 @@ class Analyzer:
             return 'bool'
         if isinstance(node, ast.TypeCast):
             return node.target_type
+        if isinstance(node, ast.MathBlock):
+            return node.vtype
         if isinstance(node, ast.FFILoad):
             return 'i64'
         if isinstance(node, ast.FnCall):
@@ -2058,6 +2088,12 @@ class Analyzer:
             for part in node.parts:
                 self._expr(part, scope)
         elif t is ast.TypeCast:
+            self._expr(node.expr, scope)
+
+        elif t is ast.MathBlock:
+            # typed math block `(expr): TYPE` — walk the inner expression so
+            # variable-usage / null-arith analysis still sees inside it.
+            self._null_arith(node.expr, scope)
             self._expr(node.expr, scope)
 
         elif t is ast.DynResolve:

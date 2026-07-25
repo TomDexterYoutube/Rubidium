@@ -249,6 +249,41 @@ let h = (1 + 2) * 3  # 9
 let x = 10
 let y = -x           # -10
 
+# -------------------------------
+# TYPED MATH BLOCKS
+# -------------------------------
+
+# A parenthesised math expression can be given a result type with `: TYPE`
+# right after the closing bracket. The WHOLE expression inside is then
+# computed at that type's precision — not just the final value cast.
+
+let r = (10 / 3): f64        # 3.3333...  (division done as f64, not int)
+
+# This is the difference from a plain group: `(10 / 3)` alone divides two
+# integers and gives 3; `(10 / 3): f64` computes the division at f64.
+
+# Per-operand `as` casts still apply — they convert each operand first,
+# then the block type governs every operation's result:
+
+let s = (10 as i32 / 3 as i32): f2048   # operands are i32 (10, 3), but the
+                                        # division runs at f2048 -> 3.3333...
+
+# Use a wide float type for high-precision math:
+
+let big = (22 / 7): f2048    # pi approximation computed at f2048 precision
+
+# An integer block type keeps integer arithmetic:
+
+let d = (10 / 3): i32        # 3
+
+# Normal BODMAS precedence still applies inside the block:
+
+let e = (1 + 2 * 3): f64     # 7.0
+
+# Blocks can nest; each block's type governs its own operations:
+
+let n = ((10 / 3): f64 + 1): f2048   # 4.3333...
+
 # =========================================
 # COMPARISON & LOGIC
 # =========================================

@@ -174,6 +174,7 @@ class CodeGen:
         self.null_valued = set()
         self.cur_class    = None
         self._alloca_emitted = set()  # local var names that already have an alloca in current fn
+        self._math_block_type = None  # typed math block `(expr): TYPE` — forces every arithmetic op inside to compute at this IR type
         self._try_error_label = None  # set while inside a try body for div-by-zero guards
         self._fn_error_exit_label = None  # OPEN-7: per-function block that returns a default value to propagate an uncaught error to the caller
         self._pending_trampolines = []  # trampoline fn_lines to emit after current function
@@ -908,6 +909,7 @@ class CodeGen:
             if node.op == "not": return "i1"
             return self._infer_type(node.value)
         if isinstance(node, TypeCast): return self.rubi_type_to_ir(node.target_type)
+        if isinstance(node, MathBlock): return self.rubi_type_to_ir(node.vtype)
         if isinstance(node, Var):
             # Look for variable in the innermost scope first
             for scope in reversed(self.local_vars_stack):
@@ -3186,6 +3188,7 @@ class CodeGen:
             return tmp, ir_t
             
         if isinstance(node, FieldAccess): return self.emit_field_access(node.obj, node.field)
+        if isinstance(node, MathBlock): return self.emit_math_block(node)
         if isinstance(node, BinOp): return self.emit_binop(node)
         if isinstance(node, Compare): return self.emit_compare(node)
         if isinstance(node, UnaryOp):
@@ -4415,6 +4418,22 @@ class CodeGen:
             return self.coerce(t2, "i64", to_t), to_t
         return val, to_t
 
+    def emit_math_block(self, node):
+        """FEATURE: `(expr): TYPE` — compute the whole bracketed expression at
+        TYPE's precision. Sets the _math_block_type override so every arithmetic
+        op emitted while the inner expression is generated computes at that type
+        (see emit_binop), then coerces the final result to it (covers the case
+        where the inner expr has no arithmetic, e.g. `(5): f2048`). Save/restore
+        makes nested typed blocks work: the inner block's type applies to its own
+        ops, the outer's resumes afterward."""
+        block_ir = self.rubi_type_to_ir(node.vtype)
+        prev = self._math_block_type
+        self._math_block_type = block_ir
+        val, vt = self.emit_expr(node.expr)
+        self._math_block_type = prev
+        val = self.coerce(val, vt, block_ir)
+        return val, block_ir
+
     def emit_binop(self, node):
         l, lt = self.emit_expr(node.left); r, rt = self.emit_expr(node.right)
 
@@ -4498,6 +4517,14 @@ class CodeGen:
         # precision. promote_type() (previously built but never actually
         # wired in anywhere) picks the widest of the two operand types.
         common = self.promote_type(lt, rt)
+        # FEATURE (typed math block `(expr): TYPE`): inside such a block every
+        # arithmetic operation is computed AT the block's type/precision, not the
+        # promoted operand type. So `(10 as i32 / 3 as i32): f2048` narrows each
+        # operand to i32 (10, 3) but then runs the division at f2048 -> 3.333...,
+        # rather than i32's integer division -> 3. Only reached for numeric
+        # arithmetic (string-concat `+` paths above already returned).
+        if self._math_block_type is not None:
+            common = self._math_block_type
         is_int = common in self._INT_IR_SET
         l = self.coerce(l, lt, common); r = self.coerce(r, rt, common)
         tmp = self.new_tmp()
