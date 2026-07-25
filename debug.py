@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import argparse
 import copy
 import shutil
@@ -2809,9 +2810,39 @@ class Analyzer:
     def _ffi_load(self, node: ast.FFILoad, scope: Scope):
         if isinstance(node.path_expr, ast.Str):
             path = node.path_expr.value.strip('"')
-            if not os.path.exists(path):
-                self._emit('WARNING', None, 'Library Not Found',
-                           f"Library not found: {path}")
+            if os.path.exists(path):
+                return
+            # GLFW/FFI bundling report: a BARE library name (no '/' — the
+            # common case, e.g. FFI("libglfw.so")) is resolved by the dynamic
+            # linker's OWN search paths at runtime (system lib dirs, or the
+            # project's bundled build/lib/ — see ffi_load()'s runtime fallback
+            # in compiler.py), never literally relative to the debugger's
+            # current directory. Checking only os.path.exists() against a bare
+            # name is almost always a false positive for a real, correctly-
+            # installed system library (e.g. libglfw.so.3 via apt) — it warned
+            # on every clean build regardless of whether the library was
+            # actually findable. Also try ctypes.util.find_library, which
+            # mirrors how the system's own linker would resolve it, before
+            # warning.
+            if '/' not in path:
+                # Strip a trailing version suffix first (e.g. "libglfw.so.3"
+                # -> "libglfw.so" — .so.N/.so.N.N is the normal versioned-
+                # shared-object naming on Linux), then the extension itself.
+                bare = re.sub(r'\.so(\.\d+)*$', '', path)
+                for suffix in ('.dll', '.dylib'):
+                    if bare.endswith(suffix):
+                        bare = bare[: -len(suffix)]
+                        break
+                # find_library wants the bare name without a leading "lib" too
+                lookup_name = bare[3:] if bare.startswith('lib') else bare
+                try:
+                    import ctypes.util
+                    if ctypes.util.find_library(lookup_name):
+                        return
+                except Exception:
+                    pass
+            self._emit('WARNING', None, 'Library Not Found',
+                       f"Library not found: {path}")
 
     def _null_arith(self, node, scope: Scope):
         if self._is_null_node(node):

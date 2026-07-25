@@ -157,6 +157,7 @@ class CodeGen:
         self._prescan_instances = {}
         self.cur_fn       = None
         self.functions    = {}
+        self.ffi_functions = set()  # names of FFI-bound functions — their calls must use _ffi_type_to_ir (Any->i64), matching emit_ffi_bind's define, not rubi_type_to_ir (Any->%Box*)
         self.loop_end_stack = []
         self.loop_cond_stack = []  # continue target labels
         self.linked_to = {}  # bugs.log #5: name -> target name for scalar `link` aliasing
@@ -2930,6 +2931,7 @@ class CodeGen:
 
         # Register immediately so calls in the same scope resolve
         self.functions[fn_name] = FnDef(safe_name, node.params, node.ret_type, [])
+        self.ffi_functions.add(fn_name)
 
         # Buffer the wrapper — flush after current function closes (like trampolines)
         # so we don't emit a define inside another define
@@ -3473,27 +3475,40 @@ class CodeGen:
                     f"(pass it in as a parameter instead)"
                 )
             fn_obj = self.functions[target_name]
-            # OPEN-11: coerce each argument to the callee's declared parameter
-            # type. Previously the arg was appended with its OWN type unchanged
-            # (`{t} {v}`), so a %Box* value (e.g. a `str` read out of a
-            # collection via coll(i), which is typed %Box*) was passed straight
-            # into an `i8*` string parameter with no unbox — the callee then read
-            # the Box struct's first field (the int type tag == 2) as the string,
-            # yielding a 1-char 0x02 (STX) value. Coercing here unboxes it
-            # properly, matching every other call path (class-method, module-fn,
-            # etc.) which already coerced. A bare-name arg that is actually a
-            # collection index-read `f(x)` still resolves as before via emit_expr.
-            param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_obj.params] if fn_obj.params else []
+            # BUG (GLFW FFI report): FFI-bound functions (`fn lib symbol(...) as
+            # name`) are DEFINED by emit_ffi_bind using _ffi_type_to_ir, which
+            # maps `Any` to i64 (a raw pointer-sized integer — correct ABI for a
+            # foreign function that knows nothing about Rubidium's Box struct).
+            # But this call site used rubi_type_to_ir, which maps `Any` to
+            # %Box* — a signature mismatch with the actual `define`. Worse,
+            # coercing a `Null` argument to %Box* produced an actual heap
+            # pointer (box_null()'s allocation), not a null pointer — so
+            # `glfwCreateWindow(..., Null, Null)` passed GLFW two garbage
+            # non-null "monitor"/"share" pointers instead of NULL, corrupting
+            # the call. Use _ffi_type_to_ir for an FFI function's signature,
+            # matching its actual `define`.
+            is_ffi = target_name in self.ffi_functions
+            type_map = self._ffi_type_to_ir if is_ffi else self.rubi_type_to_ir
+            param_types = [type_map(pt) for _, pt in fn_obj.params] if fn_obj.params else []
+            param_rubi_types = [pt for _, pt in fn_obj.params] if fn_obj.params else []
             args_ir = []
             for i, a in enumerate(node.args):
                 v, t = self.emit_expr(a)
                 if i < len(param_types):
-                    v = self.coerce(v, t, param_types[i])
-                    t = param_types[i]
+                    target_t = param_types[i]
+                    # An explicit `Null` passed for an `Any` FFI parameter means
+                    # the actual C NULL pointer (0), not Rubidium's %Box*
+                    # Null-sentinel value — an FFI signature has no `%Box*` to
+                    # even coerce into correctly.
+                    if is_ffi and param_rubi_types[i] == "Any" and isinstance(a, None_):
+                        v = "0"
+                    else:
+                        v = self.coerce(v, t, target_t)
+                    t = target_t
                 args_ir.append(f"{t} {v}")
             tmp = self.new_tmp()
             fn_ret = fn_obj.ret_type
-            ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else "i64"
+            ret_ir = type_map(fn_ret) if fn_ret else "i64"
             # BUGFIX (bugs.log #1): call fn_obj.name, the actual emitted symbol,
             # which differs from target_name only for reserved-C-symbol collisions.
             self.emit(f"  {tmp} = call {ret_ir} @{fn_obj.name}({', '.join(args_ir)})")
@@ -4018,7 +4033,14 @@ class CodeGen:
                     v, t = self.emit_expr(a)
                     if i < len(fn_def.params):
                         target_t = self._ffi_type_to_ir(fn_def.params[i][1])
-                        v = self.coerce(v, t, target_t)
+                        # GLFW FFI report: an explicit Null for an `Any` FFI
+                        # param means the real NULL pointer (0), not a boxed
+                        # Null-sentinel value (see the PRIORITY-3 call site's
+                        # matching fix for the full explanation).
+                        if fn_def.params[i][1] == "Any" and isinstance(a, None_):
+                            v = "0"
+                        else:
+                            v = self.coerce(v, t, target_t)
                         t = target_t
                     args_ir.append(f"{t} {v}")
                 tmp = self.new_tmp()

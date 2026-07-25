@@ -1212,9 +1212,35 @@ void os_terminal_drop(long long id) {
 static void* _ffi_handles[1024];
 static int _ffi_handle_count = 0;
 
+// GLFW/FFI bundling report (Bug 1): `xeon build` copies a project's .so files
+// into build/lib/ next to the compiled binary, but a bare dlopen("libx.so")
+// only searches the SYSTEM's standard paths (LD_LIBRARY_PATH, rpath baked in
+// at link time, ld.so.cache, /lib, /usr/lib, ...) — none of which include the
+// bundled build/lib/ directory, so the binary can't find its own bundled
+// library unless the user manually sets LD_LIBRARY_PATH first. Fix: if the
+// plain dlopen() fails for a BARE filename (no '/' in it — an explicit
+// relative/absolute path is left exactly as given, since the caller already
+// knows where the library is), retry next to the RUNNING EXECUTABLE's own
+// directory, in a `lib/` subdirectory — exactly where xeon bundles it.
+static void _exe_dir(char* out, size_t out_sz) {
+    ssize_t n = readlink("/proc/self/exe", out, out_sz - 1);
+    if(n <= 0) { out[0] = '\0'; return; }
+    out[n] = '\0';
+    char* slash = strrchr(out, '/');
+    if(slash) *slash = '\0'; else out[0] = '\0';
+}
 // Load a shared library, return a slot index (used as the "handle" in Rubidium)
 long long ffi_load(const char* path) {
     void* h = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+    if(!h && !strchr(path, '/')) {
+        char exe_dir[4096];
+        _exe_dir(exe_dir, sizeof(exe_dir));
+        if(exe_dir[0]) {
+            char candidate[4096];
+            snprintf(candidate, sizeof(candidate), "%s/lib/%s", exe_dir, path);
+            h = dlopen(candidate, RTLD_LAZY | RTLD_LOCAL);
+        }
+    }
     if(!h) {
         fprintf(stderr, "[FFI] dlopen failed: %s\n", dlerror());
         return -1;
