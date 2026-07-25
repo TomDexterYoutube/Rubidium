@@ -3458,11 +3458,26 @@ class CodeGen:
                     f"functions outside the class are not accessible from inside it "
                     f"(pass it in as a parameter instead)"
                 )
-            args_ir = []
-            for a in node.args:
-                v, t = self.emit_expr(a); args_ir.append(f"{t} {v}")
-            tmp = self.new_tmp()
             fn_obj = self.functions[target_name]
+            # OPEN-11: coerce each argument to the callee's declared parameter
+            # type. Previously the arg was appended with its OWN type unchanged
+            # (`{t} {v}`), so a %Box* value (e.g. a `str` read out of a
+            # collection via coll(i), which is typed %Box*) was passed straight
+            # into an `i8*` string parameter with no unbox — the callee then read
+            # the Box struct's first field (the int type tag == 2) as the string,
+            # yielding a 1-char 0x02 (STX) value. Coercing here unboxes it
+            # properly, matching every other call path (class-method, module-fn,
+            # etc.) which already coerced. A bare-name arg that is actually a
+            # collection index-read `f(x)` still resolves as before via emit_expr.
+            param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_obj.params] if fn_obj.params else []
+            args_ir = []
+            for i, a in enumerate(node.args):
+                v, t = self.emit_expr(a)
+                if i < len(param_types):
+                    v = self.coerce(v, t, param_types[i])
+                    t = param_types[i]
+                args_ir.append(f"{t} {v}")
+            tmp = self.new_tmp()
             fn_ret = fn_obj.ret_type
             ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else "i64"
             # BUGFIX (bugs.log #1): call fn_obj.name, the actual emitted symbol,
