@@ -442,6 +442,160 @@ char* bignum_to_str(unsigned long long* limbs, int num_limbs) {
     return out;
 }
 
+// ---- fp128 EXACT decimal conversion (float precision-display fix) ----
+// print()/string-interpolation of an f128+ value used to narrow it to
+// `double` and format with printf's default "%g" (6 significant digits),
+// silently discarding all the extra precision a typed math block
+// `(expr): f2048` (or any f128+ arithmetic) actually computed. This is the
+// same class of gap the i256+ bignum printing fix (OPEN-6) closed for wide
+// INTEGERS, done here for wide FLOATS: convert the raw IEEE-754 binary128
+// bit pattern to its EXACT decimal representation directly — no double
+// intermediate, so nothing is lost.
+//
+// How: any binary float M * 2^E (M an integer significand) has an EXACT,
+// finite decimal representation (unlike decimal->binary, binary->decimal
+// always terminates) because 2^E for E<0 equals 5^(-E) / 10^(-E) — so
+// multiplying the integer significand by 5, |E| times, and placing the
+// decimal point |E| digits from the right gives the exact value with no
+// rounding at all.
+
+// Multiply a decimal-digit string (ASCII '0'-'9', most-significant first) by
+// 5 in place; the buffer must have room for one extra leading digit.
+static int _fp128_digits_mul5(char* digits, int len, int cap) {
+    int carry = 0;
+    for (int i = len - 1; i >= 0; i--) {
+        int v = (digits[i] - '0') * 5 + carry;
+        digits[i] = '0' + (v % 10);
+        carry = v / 10;
+    }
+    while (carry > 0 && len < cap) {
+        memmove(digits + 1, digits, len);
+        digits[0] = '0' + (carry % 10);
+        carry /= 10;
+        len++;
+    }
+    return len;
+}
+
+// Left-shift an unsigned integer (given as 2 64-bit limbs, lo/hi) by `shift`
+// bits, growing into as many 64-bit limbs as needed. Returns a malloc'd
+// little-endian limb array and sets *out_n to its length; caller frees.
+static unsigned long long* _u128_shl_grow(unsigned long long lo, unsigned long long hi, int shift, int* out_n) {
+    int n = 2 + shift / 64 + 1;
+    unsigned long long* limbs = calloc(n, sizeof(unsigned long long));
+    limbs[0] = lo; limbs[1] = hi;
+    int word_shift = shift / 64, bit_shift = shift % 64;
+    if (word_shift > 0) {
+        for (int i = n - 1; i >= word_shift; i--) limbs[i] = limbs[i - word_shift];
+        for (int i = 0; i < word_shift && i < n; i++) limbs[i] = 0;
+    }
+    if (bit_shift > 0) {
+        for (int i = n - 1; i > 0; i--) limbs[i] = (limbs[i] << bit_shift) | (limbs[i-1] >> (64 - bit_shift));
+        limbs[0] <<= bit_shift;
+    }
+    *out_n = n;
+    return limbs;
+}
+
+// limbs (little-endian, n words) -> decimal digit string, most-significant
+// first. Destroys `limbs`. Unsigned only (sign handled by the caller).
+static int _unsigned_limbs_to_digits(unsigned long long* limbs, int n, char* digits, int cap) {
+    if (_bignum_is_zero(limbs, n)) { digits[0] = '0'; return 1; }
+    int pos = 0;
+    while (!_bignum_is_zero(limbs, n) && pos < cap) {
+        digits[pos++] = '0' + (int)_bignum_divmod10(limbs, n);
+    }
+    for (int a = 0, b = pos - 1; a < b; a++, b--) { char t = digits[a]; digits[a] = digits[b]; digits[b] = t; }
+    return pos;
+}
+
+// Takes the raw 128-bit IEEE-754 binary128 bit pattern as (lo, hi) — the same
+// little-endian limb convention as the OPEN-6 bignum functions, matching how
+// codegen allocas the fp128 value and bitcasts the pointer to i64* — and
+// returns a malloc'd, exact decimal string.
+char* fp128_to_exact_decimal_str(unsigned long long lo, unsigned long long hi) {
+    int sign = (int)(hi >> 63) & 1;
+    int biased_exp = (int)((hi >> 48) & 0x7FFF);
+    unsigned long long mant_hi = hi & 0xFFFFFFFFFFFFULL; // top 48 bits of the 112-bit explicit mantissa
+    unsigned long long mant_lo = lo;                      // low 64 bits
+
+    if (biased_exp == 0x7FFF) { // Inf/NaN
+        if (mant_hi == 0 && mant_lo == 0) return strdup(sign ? "-Infinity" : "Infinity");
+        return strdup("NaN");
+    }
+    if (biased_exp == 0 && mant_hi == 0 && mant_lo == 0) return strdup(sign ? "-0" : "0");
+
+    int implicit, unbiased_exp;
+    if (biased_exp == 0) { implicit = 0; unbiased_exp = 1 - 16383; } // subnormal
+    else { implicit = 1; unbiased_exp = biased_exp - 16383; }
+
+    unsigned long long M_lo = mant_lo;
+    unsigned long long M_hi = mant_hi | ((unsigned long long)implicit << 48);
+    int shift = unbiased_exp - 112; // value = M * 2^shift
+
+    char* result;
+    if (shift >= 0) {
+        // Exact integer: M << shift, then straight decimal conversion.
+        int n;
+        unsigned long long* limbs = _u128_shl_grow(M_lo, M_hi, shift, &n);
+        int cap = n * 20 + 8;
+        char* digits = malloc(cap);
+        int len = _unsigned_limbs_to_digits(limbs, n, digits, cap);
+        free(limbs);
+        result = malloc(len + 2);
+        int p = 0;
+        if (sign) result[p++] = '-';
+        memcpy(result + p, digits, len); p += len;
+        result[p] = '\0';
+        free(digits);
+    } else {
+        // Fractional: value = M / 2^k = (M * 5^k) with the decimal point k
+        // digits from the right, k = -shift.
+        int k = -shift;
+        unsigned long long limbs2[2] = { M_lo, M_hi };
+        int cap = k + 40; // room to grow by ~k*log10(5) digits plus margin
+        char* digits = malloc(cap);
+        int len = _unsigned_limbs_to_digits(limbs2, 2, digits, cap);
+        for (int i = 0; i < k; i++) len = _fp128_digits_mul5(digits, len, cap);
+        // Place the decimal point k digits from the right; pad with leading
+        // zeros if the digit string is shorter than k (value < 1).
+        int int_len = len - k;
+        char* frac_buf = malloc(cap + 4);
+        int fp = 0;
+        if (int_len <= 0) {
+            frac_buf[fp++] = '0'; frac_buf[fp++] = '.';
+            for (int z = 0; z < -int_len; z++) frac_buf[fp++] = '0';
+            memcpy(frac_buf + fp, digits, len); fp += len;
+        } else {
+            memcpy(frac_buf, digits, int_len); fp = int_len;
+            frac_buf[fp++] = '.';
+            memcpy(frac_buf + fp, digits + int_len, k); fp += k;
+        }
+        frac_buf[fp] = '\0';
+        free(digits);
+        // Trim trailing zeros after the decimal point (exact value is
+        // unchanged — trailing zeros past the point are not significant),
+        // and drop a bare trailing '.' if the fraction was all zeros.
+        int end = fp;
+        while (end > 0 && frac_buf[end-1] == '0') end--;
+        if (end > 0 && frac_buf[end-1] == '.') end--;
+        frac_buf[end] = '\0';
+        result = malloc(end + 2);
+        int p = 0;
+        if (sign) result[p++] = '-';
+        memcpy(result + p, frac_buf, end); p += end;
+        result[p] = '\0';
+        free(frac_buf);
+    }
+    return result;
+}
+void print_fp128_exact(unsigned long long lo, unsigned long long hi) {
+    char* s = fp128_to_exact_decimal_str(lo, hi);
+    printf("%s\n", s);
+    free(s);
+    fflush(stdout);
+}
+
 double _rubidium_pow(double base, double exp) { return pow(base, exp); }
 
 Box* make_list() { RList* l=malloc(sizeof(RList)); l->magic=1; l->count=0; l->cap=8; l->items=malloc(8*sizeof(Box*)); return box_p(l); }

@@ -173,6 +173,7 @@ class CodeGen:
         # everything else prints its real number. This set tracks that knowledge,
         # updated on every scalar VarDecl/Assign.
         self.null_valued = set()
+        self.index_typed_vars = set()  # names declared `let x: index = ...` — see _check_index_values_are_scalar
         self.cur_class    = None
         self._alloca_emitted = set()  # local var names that already have an alloca in current fn
         self._math_block_type = None  # typed math block `(expr): TYPE` — forces every arithmetic op inside to compute at this IR type
@@ -573,6 +574,8 @@ class CodeGen:
             "declare void @print_int_plain(i64)",       # OPEN-4: no Null-sentinel check
             "declare void @print_i128_plain(i128)",
             "declare void @print_bignum_plain(i64*, i32)",
+            "declare void @print_fp128_exact(i64, i64)",  # float precision fix: raw fp128 bits (lo, hi)
+            "declare i8* @fp128_to_exact_decimal_str(i64, i64)",
             "declare i8* @malloc(i64)", "declare void @free(i8*)", "declare i64 @strlen(i8*)",
             "declare i32 @scanf(i8*, ...)", "declare i8* @fgets(i8*, i32, i8*)",
             "declare i8* @strcpy(i8*, i8*)", "declare i32 @strcmp(i8*, i8*)",
@@ -712,6 +715,36 @@ class CodeGen:
             self.null_valued.add(name)
         else:
             self.null_valued.discard(name)
+
+    def _check_index_values_are_scalar(self, dict_expr_node, var_name):
+        """`index` is a key -> SINGLE SCALAR VALUE map (per the language
+        owner) — never a list/index/dict/dict+. Rejects any pair whose value
+        is written DIRECTLY as a collection literal (`"A": [...]`,
+        `"A": {...}`). Scoped to literal values only — a variable that holds
+        a collection isn't (yet) traced back to its declared type here, so
+        `"A": some_list_var` isn't caught by this check."""
+        for k, v in dict_expr_node.pairs:
+            if isinstance(v, (ListExpr, DictExpr)):
+                key_desc = f"'{k.value}'" if isinstance(k, Str) else "a key"
+                kind = "list" if isinstance(v, ListExpr) else ("index" if getattr(v, "is_index", False) else "dict")
+                raise RubidiumTypeError(
+                    f"index '{var_name}': value for {key_desc} is a {kind}, not a scalar — "
+                    f"`index` holds exactly one scalar value per key. Use `dict` instead if a "
+                    f"key needs to hold a collection of values."
+                )
+
+    def _check_index_add_value_scalar(self, base_var_name, value_node):
+        """Same rule as _check_index_values_are_scalar, applied to a runtime
+        `.add(key, value)` / `.set(value)` call on a variable declared
+        `index`. Only fires for a literal collection value, same scoping
+        caveat as the literal check."""
+        if base_var_name in self.index_typed_vars and isinstance(value_node, (ListExpr, DictExpr)):
+            kind = "list" if isinstance(value_node, ListExpr) else ("index" if getattr(value_node, "is_index", False) else "dict")
+            raise RubidiumTypeError(
+                f"index '{base_var_name}': value is a {kind}, not a scalar — "
+                f"`index` holds exactly one scalar value per key. Use `dict` instead if a "
+                f"key needs to hold a collection of values."
+            )
 
     def _deep_copy_if_var(self, val, val_t, source_node):
         """Deep copy a %Box* value when the source is an existing variable (not a fresh allocation).
@@ -1274,6 +1307,14 @@ class CodeGen:
         if isinstance(node, VarDecl):
             if node.name in self.dropped_vars: self.dropped_vars.discard(node.name)
             self._track_null_valued(node.name, node.value)  # OPEN-4 scalar Null
+            # `index` must hold exactly one SCALAR value per key (never a
+            # list/index/dict/dict+) — see _check_index_values_are_scalar.
+            if node.vtype == "index":
+                self.index_typed_vars.add(node.name)
+                if isinstance(node.value, DictExpr):
+                    self._check_index_values_are_scalar(node.value, node.name)
+            else:
+                self.index_typed_vars.discard(node.name)
 
             # BUGFIX (bugs.log #5): `let [mut] b = link a` for a SCALAR source
             # (collections already work via shared %Box* pointers, see
@@ -1852,7 +1893,12 @@ class CodeGen:
             if curr.args:
                 keys = curr.args + keys
             curr = curr.obj if isinstance(curr, MethodCall) else curr.name
-            
+
+        # index(...).set(value): value must be a scalar (see
+        # _check_index_values_are_scalar's docstring for the rule).
+        set_base_name = curr.name if isinstance(curr, Var) else (curr if isinstance(curr, str) else None)
+        self._check_index_add_value_scalar(set_base_name, val_node)
+
         self._check_collection_mutable(curr)
         # Handle Var that is a class field (e.g., scores inside a class method)
         if isinstance(curr, Var) and self.is_class_field(curr.name):
@@ -1981,6 +2027,9 @@ class CodeGen:
                 self._check_element_type(base_var_name, val_b)
                 self.emit(f"  call void @collection_add1(%Box* {col_b}, %Box* {val_b})")
             elif len(val_nodes) == 2:
+                # index().add(key, value): value must be a scalar (see
+                # _check_index_values_are_scalar's docstring for the rule).
+                self._check_index_add_value_scalar(base_var_name, val_nodes[1])
                 key_v, key_t = self.emit_expr(val_nodes[0])
                 val_v, val_t = self.emit_expr(val_nodes[1])
                 key_b = self.coerce_to_box(key_v, key_t)
@@ -1988,7 +2037,7 @@ class CodeGen:
                 # Check element type constraint for the value (bugs.log #2)
                 self._check_element_type(base_var_name, val_b)
                 self.emit(f"  call void @dict_set(%Box* {col_b}, %Box* {key_b}, %Box* {val_b})")
-        
+
         return "0", "i64"
 
     def emit_collection_set_on_field(self, method_call_node, field_val, field_t):
@@ -2188,6 +2237,26 @@ class CodeGen:
         self.emit(f"  {ptr64} = bitcast {val_t}* {slot} to i64*")
         return ptr64, n
 
+    def _emit_fp128_halves(self, val):
+        """Float-precision fix: store an fp128 SSA value to a fresh alloca and
+        read back its raw 128 bits as two i64 halves (lo, hi) — the calling
+        convention shared by print_fp128_exact/fp128_to_exact_decimal_str,
+        which extract the IEEE-754 binary128 sign/exponent/mantissa directly
+        from those bits (no double intermediate, so no precision is lost).
+        Returns (lo_ssa, hi_ssa)."""
+        slot = self.new_tmp()
+        self.emit(f"  {slot} = alloca fp128")
+        self.emit(f"  store fp128 {val}, fp128* {slot}")
+        ptr64 = self.new_tmp()
+        self.emit(f"  {ptr64} = bitcast fp128* {slot} to i64*")
+        lo = self.new_tmp()
+        self.emit(f"  {lo} = load i64, i64* {ptr64}")
+        hi_ptr = self.new_tmp()
+        self.emit(f"  {hi_ptr} = getelementptr i64, i64* {ptr64}, i64 1")
+        hi = self.new_tmp()
+        self.emit(f"  {hi} = load i64, i64* {hi_ptr}")
+        return lo, hi
+
     def emit_print(self, value):
          # If printing a dropped variable, emit error message only
         if isinstance(value, Var) and value.name in self.dropped_vars:
@@ -2241,7 +2310,16 @@ class CodeGen:
             # as its real number, not "Null".
             cv = self.coerce(val, val_t, "i64")
             self.emit(f'  call void @print_int_plain(i64 {cv})')
-        elif val_t in ("float", "double", "fp128"):
+        elif val_t == "fp128":
+            # Float-precision fix: fp128 (f128/f256/.../f2048's IR type — see
+            # a typed math block `(expr): TYPE`) used to be narrowed to
+            # double and printed with printf's default 6-sig-fig "%g",
+            # throwing away all the extra precision that was actually
+            # computed. Print the exact decimal value directly from the raw
+            # 128-bit bit pattern instead (no double intermediate).
+            lo, hi = self._emit_fp128_halves(val)
+            self.emit(f'  call void @print_fp128_exact(i64 {lo}, i64 {hi})')
+        elif val_t in ("float", "double"):
             fmt, flen = self.intern_str("%g\n")
             ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
@@ -4825,7 +4903,16 @@ class CodeGen:
             ptr64, n = self._emit_bignum_ptr(val, t)
             self.emit(f"  {tmp} = call i8* @bignum_to_str(i64* {ptr64}, i32 {n})")
             return tmp
-        elif t in ("float", "double", "fp128"):
+        elif t == "fp128":
+            # Float-precision fix: same reasoning as emit_print's fp128 case —
+            # exact decimal conversion straight from the raw bits, no double
+            # intermediate (and the exact-string length isn't bounded, unlike
+            # double's %g, so this calls its own malloc rather than using the
+            # fixed 32-byte `buf` above).
+            lo, hi = self._emit_fp128_halves(val)
+            self.emit(f"  {tmp} = call i8* @fp128_to_exact_decimal_str(i64 {lo}, i64 {hi})")
+            return tmp
+        elif t in ("float", "double"):
             fmt_lbl, flen = self.intern_str("%g")
             fmt_ptr = self.new_tmp()
             self.emit(f"  {buf} = call i8* @malloc(i64 32)")

@@ -1651,6 +1651,21 @@ class Analyzer:
             return ('bool', str(node.value).lower())
         return None
 
+    def _check_index_values_scalar(self, dict_expr_node, var_name):
+        """`index` is a key -> single SCALAR value map — never a list/index/
+        dict/dict+. Mirrors codegen.py's compile-time check (same scoping
+        caveat: only catches values written directly as a collection
+        literal)."""
+        for k, v in dict_expr_node.pairs:
+            if isinstance(v, (ast.ListExpr, ast.DictExpr)):
+                lit = self._literal_key(k)
+                key_desc = f"{lit[1]!r}" if lit is not None else "a key"
+                kind = "list" if isinstance(v, ast.ListExpr) else ("index" if getattr(v, "is_index", False) else "dict")
+                self._emit('ERROR', self._ln('var', var_name), 'Invalid Index Value',
+                           f"index '{var_name}': value for {key_desc} is a {kind}, not a scalar.",
+                           "`index` holds exactly one scalar value per key — use `dict` "
+                           "instead if a key needs to hold a collection of values.")
+
     def _is_null_node(self, node) -> bool:
         if isinstance(node, ast.Bool) and str(node.value).lower() in ('null', 'none'):
             return True
@@ -2172,6 +2187,13 @@ class Analyzer:
                 if lit is not None:
                     keys.add(lit)
             info['index_keys'] = keys
+        # `index` holds exactly one SCALAR value per key (never a list/index/
+        # dict/dict+) — mirrors codegen's compile-time check. Only fires when
+        # the variable is actually declared `index` (a `dict` literal reuses
+        # the same [key: value] bracket syntax and legitimately allows
+        # collection values).
+        if node.vtype == "index" and isinstance(node.value, ast.DictExpr):
+            self._check_index_values_scalar(node.value, node.name)
         # Per spec: 'let' without 'local' enters the global memory pool,
         # even when declared inside a function or class method body.
         # Only 'let local' and function parameters stay function-scoped.
@@ -2776,6 +2798,26 @@ class Analyzer:
                                 f"Use {cname}({new_key[1]!r}).set(...) to update "
                                 f"an existing key instead of .add()."
                             )
+                # `index` values must be scalar — idx().add(key, [list]) or
+                # idx(key).set([list]) are invalid, mirroring codegen's
+                # compile-time check.
+                bad_val = None
+                if (info is not None and info.get('vtype') == 'index'
+                        and node.method == 'add' and len(node.args) == 2
+                        and isinstance(node.args[1], (ast.ListExpr, ast.DictExpr))):
+                    bad_val = node.args[1]
+                elif (info is not None and info.get('vtype') == 'index'
+                        and node.method == 'set' and len(node.args) == 1
+                        and isinstance(node.args[0], (ast.ListExpr, ast.DictExpr))):
+                    bad_val = node.args[0]
+                if bad_val is not None:
+                    kind = "list" if isinstance(bad_val, ast.ListExpr) else ("index" if getattr(bad_val, "is_index", False) else "dict")
+                    self._emit(
+                        'ERROR', info.get('line'), 'Invalid Index Value',
+                        f"index '{cname}': value is a {kind}, not a scalar.",
+                        "`index` holds exactly one scalar value per key — use `dict` "
+                        "instead if a key needs to hold a collection of values."
+                    )
         # Bug 6: string-mutation methods (.set/.insert/.replace) called
         # directly on a variable (e.g. `text.set(0, "J")`) need the same
         # mutability check — these reach us with node.obj as a plain Var,

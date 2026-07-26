@@ -520,8 +520,9 @@ print(words.combine())
 # -----------------------------------------
 
 # A flat key-value map.
-# Keys and values can be any type.
-# Each key stores exactly one value.
+# Keys can be any type. Values must be a single SCALAR (i32/f64/str/bool/
+# Null/etc) — never a list, index, dict, or dict+. Use `dict` instead if a
+# key needs to hold a collection of values.
 
 let mut my_index: index = [
     "name": "Rubidium",
