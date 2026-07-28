@@ -161,6 +161,12 @@ Box* box_null(void) { Box* b=malloc(sizeof(Box)); b->type=6; b->i=-2147483648LL;
 // class_id identifies which class it is (see codegen's self.class_ids).
 Box* box_class(void* p, long long class_id) { Box* b=malloc(sizeof(Box)); b->type=5; b->p=p; b->class_id=class_id; return b; }
 Box* box_deep_copy(Box* src);  // OPEN-9: forward decl (defined later)
+// BUG-3: forward decls for the temporary arena (defined further down). Every
+// function below that stores a Box BY POINTER calls rub_temp_untrack on it,
+// so the container becomes the owner and the arena stops tracking it. Without
+// this a nested literal such as {"A" = ["x","y"]} kept its inner list in the
+// arena, which then freed it at block exit while the dict still pointed at it.
+Box* rub_temp_untrack(Box* b);
 Box* box_copy(Box* src) {
     if(!src) return box_i(0);
     if(src->type==0) return box_i(src->i);
@@ -245,6 +251,7 @@ Box* rub_dynvar_get(const char* key) {
 }
 
 void rub_dynvar_set(const char* key, Box* value) {
+    rub_temp_untrack(value);    /* BUG-3: the table owns it from here on */
     for (int i = 0; i < _rub_dynvar_count; i++) {
         if (strcmp(_rub_dynvars[i].key, key) == 0) { _rub_dynvars[i].value = value; return; }
     }
@@ -605,6 +612,7 @@ Box* make_list() { RList* l=malloc(sizeof(RList)); l->magic=1; l->count=0; l->ca
 // safe for this, since its singleton-Null-replace rule would otherwise fire
 // mid-construction on any literal that starts with a Null element.
 void list_append_raw(Box* lst, Box* b) {
+    rub_temp_untrack(b);        /* the list owns b from here on */
     if(!lst || lst->type != 3) return;
     RList* l=lst->p;
     if(!l || l->magic != 1) return; /* not a list */
@@ -612,6 +620,7 @@ void list_append_raw(Box* lst, Box* b) {
     l->items[l->count++]=b;
 }
 void list_append(Box* lst, Box* b) {
+    rub_temp_untrack(b);        /* the list owns b from here on */
     if(!lst || lst->type != 3) return;
     RList* l=lst->p;
     if(!l || l->magic != 1) return; /* not a list */
@@ -779,7 +788,10 @@ Box* box_deep_copy(Box* src) {
     if(IS_DICT_MAGIC(*magic)) {
         RDict* sd = (RDict*)src->p;
         RDict* dd = malloc(sizeof(RDict));
-        dd->magic=2; dd->count=sd->count; dd->cap=sd->count>0?sd->count:1;
+        // Preserve the ORIGINAL magic: 2 = dict, 4 = dict+ (see IS_DICT_MAGIC).
+        // Hardcoding 2 silently demoted every deep-copied dict+ to a plain
+        // dict, so nested-key access on the copy stopped working.
+        dd->magic=sd->magic; dd->count=sd->count; dd->cap=sd->count>0?sd->count:1;
         dd->keys=malloc(dd->cap*sizeof(Box*)); dd->vals=malloc(dd->cap*sizeof(Box*));
         for(int i=0;i<sd->count;i++) {
             dd->keys[i]=box_deep_copy(sd->keys[i]);
@@ -798,6 +810,7 @@ int box_eq(Box* a, Box* b) {
     return a->p==b->p;
 }
 void dict_set(Box* dct, Box* k, Box* v) {
+    rub_temp_untrack(k); rub_temp_untrack(v);   /* the dict owns them now */
     if(!dct || dct->type != 3) return;
     RDict* d=dct->p;
     if(!d || !IS_DICT_MAGIC(d->magic)) return; /* not a dict/dict+ */
@@ -884,6 +897,7 @@ Box* collection_get(Box* col_box, Box* key) {
 }
 
 void collection_set(Box* col_box, Box* key, Box* val) {
+    rub_temp_untrack(val);      /* stored by pointer — the collection owns it */
     // Null sentinel: auto-promote to a dict and set the key in-place.
     if (col_box && col_box->type == 6) {
         RDict* d = malloc(sizeof(RDict));
@@ -955,21 +969,138 @@ unsigned int _rub_str_hash(const char* s) {
     return (unsigned int)hash;
 }
 
+// BUG-5: single runtime entry point for `.has()` on ANY %Box*. The caller
+// cannot always know statically whether the receiver is a str or a
+// collection (both are %Box* in global scope), so the dispatch happens here
+// off the type tag instead of in codegen.
+//   str        -> substring search
+//   list       -> value scan
+//   index/dict -> keys AND values (spec: ".has() checks for keys or values")
+// Anything else (or a needle of the wrong shape) is simply "not found"
+// rather than a crash.
 int collection_has(Box* col, Box* needle) {
-    if (!col || col->type != 3) return 0;
+    if (!col || !needle) return 0;
+    // str receiver: substring / character containment.
+    if (col->type == 2) {
+        if (!col->s || needle->type != 2 || !needle->s) return 0;
+        return strstr(col->s, needle->s) != NULL;
+    }
+    if (col->type != 3) return 0;
     void* ptr = col->p;
     if(!ptr) return 0;
     int* magic = (int*)ptr;
     if (*magic == 1) {
         RList* l = ptr;
         for(int i = 0; i < l->count; i++)
-            if(box_eq(l->items[i], needle)) return 1;
+            if(box_equal(l->items[i], needle)) return 1;
     } else if (IS_DICT_MAGIC(*magic)) {
         RDict* d = ptr;
         for(int i = 0; i < d->count; i++)
-            if(box_eq(d->keys[i], needle)) return 1;
+            if(box_equal(d->keys[i], needle)) return 1;
+        for(int i = 0; i < d->count; i++)
+            if(box_equal(d->vals[i], needle)) return 1;
     }
     return 0;
+}
+
+/* =======================================================================
+   BUG-3 — SCOPE-OWNED TEMPORARY ARENA
+   -----------------------------------------------------------------------
+   The spec says "Temporary scoped values are dropped automatically" and
+   that locals/loop variables are released at the end of their block, but
+   nothing ever freed the intermediate Boxes and strings an expression
+   allocates. A loop that merely READ a collection therefore grew without
+   bound (~230 B per read; 400 MB over 300k iterations).
+
+   Every heap temporary an expression produces is registered here. codegen
+   takes a mark at the start of each block and releases back to it after
+   every statement, so a temporary lives exactly as long as the statement
+   that made it. A value that outlives its statement — because it gets
+   bound to a variable or returned — is handed to rub_temp_untrack* first,
+   which transfers ownership out of the arena to that variable.
+
+   Thread-local: per spec, temporaries/locals belong only to the thread
+   executing them and are never shared.
+   ======================================================================= */
+typedef struct { void* p; int is_box; } RTemp;
+static __thread RTemp*    _rub_tmp     = NULL;
+static __thread long long _rub_tmp_n   = 0;
+static __thread long long _rub_tmp_cap = 0;
+
+static void _rub_tmp_push(void* p, int is_box) {
+    if (!p) return;
+    if (_rub_tmp_n == _rub_tmp_cap) {
+        _rub_tmp_cap = _rub_tmp_cap ? _rub_tmp_cap * 2 : 128;
+        _rub_tmp = realloc(_rub_tmp, (size_t)_rub_tmp_cap * sizeof(RTemp));
+    }
+    _rub_tmp[_rub_tmp_n].p = p;
+    _rub_tmp[_rub_tmp_n].is_box = is_box;
+    _rub_tmp_n++;
+}
+
+Box*  rub_temp_track(Box* b)       { _rub_tmp_push(b, 1); return b; }
+char* rub_temp_track_str(char* s)  { _rub_tmp_push(s, 0); return s; }
+
+// Ownership escapes the current statement (bound to a variable, returned,
+// or explicitly .drop()ed) — forget it so the arena never double-frees it.
+// Scans from the newest entry: an escaping temporary is nearly always the
+// one just created, so this is O(1) in practice.
+static void _rub_tmp_forget(void* p) {
+    if (!p) return;
+    for (long long i = _rub_tmp_n - 1; i >= 0; i--)
+        if (_rub_tmp[i].p == p) { _rub_tmp[i].p = NULL; return; }
+}
+Box*  rub_temp_untrack(Box* b)      { _rub_tmp_forget((void*)b); return b; }
+char* rub_temp_untrack_str(char* s) { _rub_tmp_forget((void*)s); return s; }
+
+long long rub_temp_mark(void) { return _rub_tmp_n; }
+
+void rub_temp_release_to(long long mark) {
+    if (mark < 0) mark = 0;
+    while (_rub_tmp_n > mark) {
+        RTemp t = _rub_tmp[--_rub_tmp_n];
+        if (!t.p) continue;
+        if (t.is_box) box_drop((Box*)t.p);
+        else          free(t.p);
+    }
+}
+
+/* BUG-4 — reads return an INDEPENDENT DEEP COPY.
+   list_get/dict_get hand back the collection's own interior Box, so
+   `let first = chars(0)` aliased the element: dropping `first` and `chars`
+   double-freed, and dropping a value read out of a global destroyed the
+   global's data. The spec is explicit ("Assignment always creates an
+   independent value", "Rubidium does not use references"), so element
+   reads copy. The copy is a temporary owned by the arena above, which is
+   what keeps the extra allocation from turning into a leak.
+   Navigation for MUTATION (`d("scores").add(40)`) still uses the plain
+   collection_get — that intentionally needs the real interior object. */
+static Box* _rub_own_copy(Box* elem) {
+    Box* c = box_deep_copy(elem);
+    // box_deep_copy keeps reference semantics for class instances (type 5)
+    // and returns the very same Box — tracking that would free the
+    // collection's own element.
+    if (c == elem) return c;
+    return rub_temp_track(c);
+}
+
+Box* collection_get_copy(Box* col, Box* key) {
+    return _rub_own_copy(collection_get(col, key));
+}
+
+// NULL on missing key/out-of-bounds (used inside try blocks), otherwise a copy.
+Box* try_collection_get_copy(Box* col, Box* key) {
+    Box* e = try_collection_get(col, key);
+    if (!e) return NULL;
+    return _rub_own_copy(e);
+}
+
+// Box* -> char* for a `str`-typed binding. unbox_s() returns the Box's OWN
+// ->s buffer, so a string read out of a collection aliased the collection's
+// characters (BUG-4) and freeing either one invalidated the other. This
+// hands back an owned copy instead; the caller (codegen) tracks or binds it.
+char* unbox_s_dup(Box* b) {
+    return strdup((b && b->type == 2 && b->s) ? b->s : "");
 }
 
 Box* collection_get_at(Box* col_box, int idx) {

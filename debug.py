@@ -15,6 +15,188 @@ from lexer import tokenize
 from parser import Parser
 import rub_ast as ast
 
+# ---------------------------------------------------------------------------
+# BUG-6: wide floats (f128 / f256 / f512 / f1024 / f2048)
+# ---------------------------------------------------------------------------
+# The compiler maps all of these to LLVM `fp128` — IEEE binary128, a 113-bit
+# significand — and print() shows the EXACT decimal value of the stored
+# number (syntax lines 275-281). Python's float is a 64-bit double, so
+# evaluating these as plain floats made the debug run disagree with the
+# compiled binary (`3.33333` instead of 3.3333...461728... for `(10/3): f2048`).
+#
+# _Wide holds the exact rational value of a binary128 number: every operation
+# is computed exactly and then rounded once to binary128, the same way the
+# hardware/soft-float does, so the debugger reproduces the compiler digit for
+# digit. Because a binary128 value is always a dyadic rational, its decimal
+# expansion is finite and can be printed exactly.
+WIDE_FLOAT_TYPES = ('f128', 'f256', 'f512', 'f1024', 'f2048')
+_B128_PREC = 113          # significand bits, including the implicit leading 1
+
+
+def _round_binary128(value):
+    """Round an exact rational (or int/float) to the nearest binary128 value,
+    ties-to-even — matching IEEE 754."""
+    from fractions import Fraction
+    f = Fraction(value)
+    if f == 0:
+        return Fraction(0)
+    neg = f < 0
+    if neg:
+        f = -f
+    # Normalise into [1, 2) and remember the exponent.
+    e = 0
+    two = Fraction(2)
+    while f >= 2:
+        f /= two
+        e += 1
+    while f < 1:
+        f *= two
+        e -= 1
+    shift = 1 << (_B128_PREC - 1)
+    scaled = f * shift
+    q, r = divmod(scaled.numerator, scaled.denominator)
+    # ties-to-even
+    if 2 * r > scaled.denominator or (2 * r == scaled.denominator and q % 2):
+        q += 1
+    out = Fraction(q, shift) * (two ** e)
+    return -out if neg else out
+
+
+class _Wide:
+    """A binary128 value. Arithmetic rounds to binary128 after every step."""
+    __slots__ = ('v',)
+
+    def __init__(self, value):
+        from fractions import Fraction
+        self.v = value if isinstance(value, Fraction) else _round_binary128(value)
+
+    @staticmethod
+    def _raw(other):
+        """The exact rational behind `other`, or None if it isn't numeric."""
+        from fractions import Fraction
+        if isinstance(other, _Wide):
+            return other.v
+        if isinstance(other, bool):
+            return None
+        if isinstance(other, (int, float)):
+            return Fraction(other)
+        return None
+
+    def _op(self, other, fn):
+        o = self._raw(other)
+        if o is None:
+            return NotImplemented
+        return _Wide(_round_binary128(fn(self.v, o)))
+
+    def _rop(self, other, fn):
+        o = self._raw(other)
+        if o is None:
+            return NotImplemented
+        return _Wide(_round_binary128(fn(o, self.v)))
+
+    def __add__(self, o):      return self._op(o, lambda a, b: a + b)
+    def __radd__(self, o):     return self._rop(o, lambda a, b: a + b)
+    def __sub__(self, o):      return self._op(o, lambda a, b: a - b)
+    def __rsub__(self, o):     return self._rop(o, lambda a, b: a - b)
+    def __mul__(self, o):      return self._op(o, lambda a, b: a * b)
+    def __rmul__(self, o):     return self._rop(o, lambda a, b: a * b)
+    def __truediv__(self, o):  return self._op(o, lambda a, b: a / b)
+    def __rtruediv__(self, o): return self._rop(o, lambda a, b: a / b)
+    def __mod__(self, o):      return self._op(o, lambda a, b: a - b * int(a / b))
+    def __neg__(self):         return _Wide(-self.v)
+    def __abs__(self):         return _Wide(abs(self.v))
+
+    def __pow__(self, o):
+        from fractions import Fraction
+        e = self._raw(o)
+        if e is None:
+            return NotImplemented
+        if e.denominator == 1 and abs(e.numerator) < 4096:
+            n = e.numerator
+            if n >= 0:
+                acc = Fraction(1)
+                for _ in range(n):
+                    acc = _round_binary128(acc * self.v)
+                return _Wide(acc)
+            return _Wide(_round_binary128(Fraction(1) / (self.v ** (-n))))
+        # Fractional exponent — no exact rational result; fall back to double.
+        return _Wide(float(self.v) ** float(e))
+
+    def __rpow__(self, o):
+        base = self._raw(o)
+        if base is None:
+            return NotImplemented
+        return _Wide(base) ** self
+
+    def _cmp(self, o):
+        r = self._raw(o)
+        return None if r is None else (self.v > r) - (self.v < r)
+
+    def __eq__(self, o):
+        c = self._cmp(o)
+        return NotImplemented if c is None else c == 0
+
+    def __ne__(self, o):
+        c = self._cmp(o)
+        return NotImplemented if c is None else c != 0
+
+    def __lt__(self, o):
+        c = self._cmp(o)
+        return NotImplemented if c is None else c < 0
+
+    def __le__(self, o):
+        c = self._cmp(o)
+        return NotImplemented if c is None else c <= 0
+
+    def __gt__(self, o):
+        c = self._cmp(o)
+        return NotImplemented if c is None else c > 0
+
+    def __ge__(self, o):
+        c = self._cmp(o)
+        return NotImplemented if c is None else c >= 0
+
+    def __hash__(self):    return hash(self.v)
+    def __bool__(self):    return self.v != 0
+    def __float__(self):   return float(self.v)
+    def __int__(self):     return int(self.v)
+
+    def __str__(self):
+        """The EXACT decimal expansion, as the compiled binary prints it."""
+        from decimal import Decimal, localcontext
+        n, d = self.v.numerator, self.v.denominator
+        if d == 1:
+            return str(n)
+        # d is a power of two, so the expansion terminates; give Decimal
+        # enough precision to hold every digit of it.
+        with localcontext() as ctx:
+            ctx.prec = d.bit_length() * 2 + 40
+            return str(Decimal(n) / Decimal(d))
+
+    __repr__ = __str__
+
+
+def _round_f32(value):
+    """Round to IEEE single precision — the compiler maps f32 to LLVM float."""
+    import struct
+    try:
+        return struct.unpack('f', struct.pack('f', float(value)))[0]
+    except (OverflowError, ValueError):
+        return float(value)
+
+
+def _apply_float_type(value, vtype):
+    """Coerce a numeric result to the precision the given Rubidium float type
+    actually has in the compiled program."""
+    if value is None or isinstance(value, bool):
+        return value
+    if vtype in WIDE_FLOAT_TYPES:
+        return _Wide(value)
+    if vtype == 'f32':
+        return _round_f32(value)
+    return float(value)
+
+
 def _edit_distance(a: str, b: str) -> int:
     la, lb = len(a), len(b)
     dp = list(range(lb + 1))
@@ -144,7 +326,7 @@ class _Continue(Exception): pass
 
 class Debugger:
 
-    def __init__(self, source_lines=None, tokens=None):
+    def __init__(self, source_lines=None, tokens=None, source_dir=None):
         self.scope          = Scope()
         self._root_scope    = self.scope  # global pool — non-local 'let' lands here
         self.line           = "?"
@@ -158,6 +340,11 @@ class Debugger:
         self._math_block_type = None  # typed math block `(expr): TYPE` — governs division/result type
         self._dynvars       = {}      # runtime SY reflection backing store — see DynResolve/DynVarDecl
         self._os_active     = set()   # open os.start(id) session ids — see OsStart/OsRun/OsDrop
+        self._timers        = {}      # BUG-11: time.timer_start(id) state — see the time.* branch
+        self._modules       = {}      # BUG-13: imported .rub namespaces — see _load_module
+        self._ffi_libs      = {}      # BUG-14: handle name -> ctypes.CDLL
+        self._ffi_fns       = {}      # BUG-14: Rubidium name -> {handle, symbol, params, ret}
+        self._source_dir    = source_dir  # folder to resolve `import <file>` against
         if tokens:
             self._build_lmap(tokens)
 
@@ -202,6 +389,157 @@ class Debugger:
 
 
     # ── Entry point ───────────────────────────────────────────────────────────
+
+    # ── FFI (BUG-14) ─────────────────────────────────────────────────────────
+    # FFILoad/FFIBind used to be pure no-ops in a debug run, so every foreign
+    # call returned Null (and `lib.fn()` even reported "method called on None")
+    # while the compiled binary dlopen'd the library and returned real values.
+    # ctypes gives the debugger the same capability, so a debug run exercises
+    # the actual library exactly as the compiled program does.
+    _FFI_CTYPES = {
+        'i32': 'c_int', 'i64': 'c_longlong', 'i128': 'c_longlong',
+        'f32': 'c_float', 'f64': 'c_double',
+        'str': 'c_char_p', 'str+': 'c_char_p',
+        'bool': 'c_int', 'Any': 'c_longlong',
+    }
+
+    def _ffi_ctype(self, rub_type):
+        import ctypes
+        return getattr(ctypes, self._FFI_CTYPES.get(rub_type or 'i64', 'c_longlong'))
+
+    def _ffi_open(self, path):
+        """dlopen a shared library, mirroring the runtime's search order:
+        the path as given, then relative to the source folder."""
+        import ctypes
+        path = str(path)
+        candidates = [path]
+        if self._source_dir and not os.path.isabs(path):
+            candidates.append(os.path.join(self._source_dir, path))
+        for cand in candidates:
+            try:
+                return ctypes.CDLL(cand)
+            except OSError:
+                continue
+        return None
+
+    def _ffi_invoke(self, name, arg_values):
+        """Call a bound foreign symbol. Returns (True, result) when `name` is
+        an FFI binding, (False, None) otherwise, so callers can fall through
+        to normal function resolution."""
+        bind = self._ffi_fns.get(name)
+        if bind is None:
+            return False, None
+        lib = self._ffi_libs.get(bind['handle'])
+        if lib is None:
+            self.error(f"FFI call '{name}()' — library '{bind['handle']}' was not loaded")
+            return True, None
+        try:
+            fn = getattr(lib, bind['symbol'])
+        except AttributeError:
+            self.error(f"FFI call '{name}()' — symbol '{bind['symbol']}' not found in library")
+            return True, None
+        fn.argtypes = [self._ffi_ctype(t) for _n, t in bind['params']]
+        fn.restype = None if not bind['ret'] else self._ffi_ctype(bind['ret'])
+        call_args = []
+        for value, (_pn, ptype) in zip(arg_values, bind['params']):
+            if ptype in ('str', 'str+'):
+                call_args.append(str(value if value is not None else "").encode())
+            elif ptype in ('f32', 'f64'):
+                call_args.append(float(value or 0))
+            else:
+                call_args.append(int(value or 0))
+        try:
+            result = fn(*call_args)
+        except Exception as e:
+            self.error(f"FFI call '{name}()' failed: {e}")
+            return True, None
+        if isinstance(result, bytes):
+            result = result.decode(errors='replace')
+        return True, result
+
+    def _load_module(self, mod):
+        """BUG-13: load `<mod>.rub` from the importing file's folder, run its
+        top level in an isolated scope, and return a namespace object holding
+        its variables, functions and classes. Returns None when there is no
+        such file (an unknown import is the analyzer's job to report, not the
+        debug run's job to crash on). Imports are cached and re-entrant-safe,
+        so a cycle can't recurse forever."""
+        if mod in self._modules:
+            return self._modules[mod]
+        base = self._source_dir or os.getcwd()
+        path = os.path.join(base, f"{mod}.rub")
+        if not os.path.isfile(path):
+            return None
+        ns = {"__namespace__": mod, "vars": {}, "fns": {}, "classes": {}, "scope": None}
+        self._modules[mod] = ns          # cache first: breaks import cycles
+        try:
+            with open(path, 'r') as f:
+                src = f.read()
+            nodes = Parser(tokenize(src)).parse()
+        except Exception as e:
+            self.error(f"Could not import '{mod}': {e}")
+            return ns
+
+        # Run the module's top level with its own global pool, so its
+        # variables never leak into the importer's namespace (spec: "Imported
+        # files are isolated through namespaces").
+        saved_scope, saved_root = self.scope, self._root_scope
+        saved_fns, saved_classes = self._fn_defs, self._class_defs
+        mod_scope = Scope()
+        self.scope = self._root_scope = mod_scope
+        self._fn_defs, self._class_defs = {}, {}
+        try:
+            for n in nodes:
+                try:
+                    self.execute(n)
+                except (_Return, _Break, _Continue):
+                    pass
+            ns["fns"] = self._fn_defs
+            ns["classes"] = self._class_defs
+            ns["vars"] = mod_scope.vars
+            ns["scope"] = mod_scope
+        except Exception as e:
+            self.error(f"Error while importing '{mod}': {type(e).__name__}: {e}")
+        finally:
+            self.scope, self._root_scope = saved_scope, saved_root
+            self._fn_defs, self._class_defs = saved_fns, saved_classes
+        return ns
+
+    def _namespace_of(self, node):
+        """The namespace object behind `node` (a Var naming an import), or None."""
+        if not isinstance(node, ast.Var):
+            return None
+        info = self.scope.lookup(node.name)
+        value = info.get("value") if info else None
+        if isinstance(value, dict) and "__namespace__" in value:
+            return value
+        return None
+
+    def _call_namespaced(self, ns, name, arg_nodes):
+        """Call `ns.name(...)`. The module's own functions and classes must be
+        visible while its body runs, so swap them in for the duration."""
+        fn = ns["fns"].get(name)
+        if fn is None:
+            self.error(f"Unknown function '{ns['__namespace__']}.{name}()'")
+            return None
+        # Arguments are evaluated in the CALLER's scope, before switching.
+        arg_values = [self.evaluate(a) for a in arg_nodes]
+        saved_fns, saved_classes = self._fn_defs, self._class_defs
+        saved_scope, saved_root = self.scope, self._root_scope
+        self._fn_defs = dict(saved_fns); self._fn_defs.update(ns["fns"])
+        self._class_defs = dict(saved_classes); self._class_defs.update(ns["classes"])
+        # The module's own globals must be visible while its body runs — the
+        # spec's FFI-wrapper example is exactly this: an imported file whose
+        # function bodies reference the FFI handle declared at that file's top
+        # level. Without the scope swap the body saw the CALLER's globals and
+        # reported "Variable 'native' used before declaration".
+        if ns.get("scope") is not None:
+            self.scope = self._root_scope = ns["scope"]
+        try:
+            return self._call_fn(fn, arg_values)
+        finally:
+            self._fn_defs, self._class_defs = saved_fns, saved_classes
+            self.scope, self._root_scope = saved_scope, saved_root
 
     def run(self, nodes):
         """Execute all top-level nodes; stop & report on first unhandled crash."""
@@ -294,7 +632,15 @@ class Debugger:
                     target.declare(node.name, target_info)
                     target.linked_names.add(node.name)
                     return
-            value = self._deep_copy_value(self.evaluate(node.value))
+            if isinstance(node.value, ast.FFILoad):
+                # BUG-14: bind the loaded library to THIS variable's name, so
+                # `fn <name> sym(...) as alias` and `<name>.alias(...)` resolve.
+                value = self.evaluate(node.value)
+                self._ffi_libs[node.name] = value.get("__lib__")
+                if value.get("__lib__") is None:
+                    self.error(f"FFI library not found: {value.get('__ffi__')}")
+            else:
+                value = self._deep_copy_value(self.evaluate(node.value))
             if node.vtype:
                 value = self._clamp_int(value, node.vtype)
             # Per spec: 'let' without 'local' enters the global memory pool.
@@ -466,6 +812,18 @@ class Debugger:
         elif isinstance(node, ast.Continue):
             raise _Continue()
 
+        # ── Raise ─────────────────────────────────────────────────────────────
+        # BUG-9: `raise` was not handled at all, so the debug run silently fell
+        # through it and kept executing — `try { check(-1) } error { ... }`
+        # printed the function's success path instead of the error message the
+        # compiled binary produces. Per spec, the nearest enclosing try catches
+        # it (directly, or through a function called from inside that try);
+        # outside any try it halts the program with the message. self.error()
+        # already implements exactly that split via _try_depth.
+        elif isinstance(node, ast.Raise):
+            msg = self.evaluate(node.message)
+            self.error(str(msg) if msg is not None else "raised error")
+
         # ── Try / Error ───────────────────────────────────────────────────────
         elif isinstance(node, ast.Try):
             self._try_depth += 1
@@ -512,14 +870,29 @@ class Debugger:
         elif isinstance(node, (ast.Use, ast.Import)):
             mod = node.module_name
             self.line = self._lmap.get(('import', mod), self.line)
-            stub = {"value": {"__module__": mod}, "type": "module",
-                    "mutable": False, "dropped": False}
-            self.scope.declare(mod, stub)
-            # Also register the alias (import tokeniser as tk → declare 'tk' too)
+            # BUG-13: `import <file>` was stubbed out exactly like `use <builtin
+            # module>`, so every namespaced access into an imported .rub file
+            # returned Null in a debug run while the compiled binary produced
+            # real values. Actually load the file (spec: "import loads an
+            # external .rub file from the same folder into your code with the
+            # name of the file as the namespace"), run its top level in its own
+            # isolated scope, and keep its functions/classes for later
+            # `ns.fn()` / `ns.var` resolution. `use` keeps the old stub — those
+            # ARE compiler-provided modules with no file behind them.
+            value = None
+            if isinstance(node, ast.Import):
+                value = self._load_module(mod)
+            if value is None:
+                value = {"__module__": mod}
+            self.scope.declare(mod, {"value": value, "type": "module",
+                                     "mutable": False, "dropped": False})
+            # Also register the alias (import tokeniser as tk → declare 'tk' too).
+            # Per spec an alias "does not copy or duplicate the module", so it
+            # shares the very same namespace object.
             alias = getattr(node, 'alias', None)
             if alias:
                 self.line = self._lmap.get(('import', alias), self.line)
-                self.scope.declare(alias, {"value": {"__module__": mod}, "type": "module",
+                self.scope.declare(alias, {"value": value, "type": "module",
                                            "mutable": False, "dropped": False})
 
         # ── Threads (bugs.log OPEN-7): actually run the task function's body
@@ -539,17 +912,40 @@ class Debugger:
         # errored with "no os.start() was seen first" even right after a
         # real os.start() call. Removed from the stub list so all three
         # fall through to the real evaluate()-based implementation.
-        elif isinstance(node, (
-            ast.FFILoad, ast.FFIBind,
-            ast.ThreadWait, ast.ThreadRunning,
-        )):
-            pass   # not executed in debug mode
+        # BUG-14: FFIBind registers a real binding now (FFILoad is handled in
+        # evaluate(), reached through the VarDecl that holds it).
+        elif isinstance(node, ast.FFIBind):
+            self._ffi_fns[node.alias or node.symbol_name] = {
+                'handle': node.handle_name,
+                'symbol': node.symbol_name,
+                'params': node.params or [],
+                'ret':    node.ret_type,
+            }
+
+        elif isinstance(node, (ast.ThreadWait, ast.ThreadRunning)):
+            pass   # bookkeeping only — see the evaluate() branches
 
         # ── File I/O — real file operations, matching the compiled runtime ──
         elif isinstance(node, ast.FileOpen):
             path = self.evaluate(node.path_expr)
-            if not os.path.exists(str(path)):
-                raise Exception("file not found")
+            # BUG-12: per spec, "If the file does not exist, open() creates it,
+            # raises a (non-fatal, catchable) error, and then continues" — and
+            # the compiled runtime does exactly that (file_open returns -2:
+            # created, error flag set, block still runs). The debugger instead
+            # raised a bare Exception without creating anything, so the FIRST
+            # `open()` of a not-yet-existing file aborted the whole debug run
+            # ("Unhandled runtime crash in main()") while the real program ran
+            # fine. Create the file, and only surface the error when there is a
+            # try to catch it — matching the compiler, which otherwise just
+            # leaves the flag set and carries on.
+            missing = not os.path.exists(str(path))
+            if missing:
+                try:
+                    open(str(path), "w").close()
+                except OSError as e:
+                    raise Exception(f"file error: {e}")
+            if missing and self._try_depth > 0:
+                raise RuntimeError("file not found")
             self.scope.declare(node.var_name, {
                 "value": {"__file__": True, "path": str(path)},
                 "type": "file", "dropped": False, "mutable": True,
@@ -749,6 +1145,16 @@ class Debugger:
         if isinstance(node, ast.BinOp):
             left  = self.evaluate(node.left)
             right = self.evaluate(node.right)
+            # BUG-6: inside a `(...): f128`/f256/... block every operation is
+            # computed at binary128, exactly as the compiled program does.
+            # Promoting one operand is enough — _Wide's operators handle the
+            # other side and round the result.
+            if (self._math_block_type in WIDE_FLOAT_TYPES
+                    and node.op in ("+", "-", "*", "/", "**", "%")
+                    and not isinstance(left, str) and not isinstance(right, str)
+                    and left is not None and right is not None):
+                if not isinstance(left, _Wide):
+                    left = _Wide(left)
             # BUGFIX: these must run BEFORE the try/except below — the
             # generic `except Exception as e: self.error(f"Operation ...")`
             # handler was catching the RuntimeError that self.error() itself
@@ -823,8 +1229,10 @@ class Debugger:
             val = self.evaluate(node.expr)
             t   = node.target_type
             try:
-                if t in ("i32","i64","i128"): return int(val)
-                if t in ("f32","f64","f128"): return float(val)
+                if t in ("i32","i64","i128","i256","i512","i1024","i2048"): return int(val)
+                # BUG-6: f128+ are binary128, not double (syntax lines 275-281).
+                if t in ("f32","f64") or t in WIDE_FLOAT_TYPES:
+                    return _apply_float_type(val, t)
                 if t == "str":   return str(val)
                 if t == "bool":  return bool(val)
             except Exception as e:
@@ -845,8 +1253,10 @@ class Debugger:
             if val is None:
                 return None
             try:
-                if node.vtype and node.vtype[0] == 'f':  # float type -> float result
-                    return float(val)
+                if node.vtype and node.vtype[0] == 'f':  # float type
+                    # BUG-6: round to the precision the type really has —
+                    # binary128 for f128+, single for f32, double otherwise.
+                    return _apply_float_type(val, node.vtype)
                 if node.vtype and node.vtype[0] == 'i':  # int type -> int result
                     return int(val)
             except Exception:
@@ -863,6 +1273,16 @@ class Debugger:
             return result
 
         if isinstance(node, ast.FieldAccess):
+            # BUG-13: `math_tools.pi` — a variable read out of an imported
+            # file's namespace, which lives in that module's own scope rather
+            # than as a key on the namespace dict itself.
+            ns = self._namespace_of(node.obj)
+            if ns is not None:
+                entry = ns["vars"].get(node.field)
+                if entry is None:
+                    self.error(f"Unknown symbol '{ns['__namespace__']}.{node.field}'")
+                    return None
+                return entry.get("value")
             obj = self.evaluate(node.obj)
             if isinstance(obj, dict):
                 return obj.get(node.field)
@@ -877,6 +1297,15 @@ class Debugger:
         if isinstance(node, (ast.MethodCall, ast.CollectionMethodCall)):
             return self._eval_method_call(node)
 
+        # BUG-14: `let lib = FFI("libs/mylib.so")` — actually dlopen it. The
+        # returned marker is what makes `lib.fn()` resolvable later; the
+        # VarDecl branch registers the handle under the variable's name, which
+        # is the name FFIBind refers to.
+        if isinstance(node, ast.FFILoad):
+            path = self.evaluate(node.path_expr)
+            lib = self._ffi_open(path)
+            return {"__ffi__": str(path), "__loaded__": lib is not None, "__lib__": lib}
+
         if isinstance(node, ast.OsStart):
             id_ = self.evaluate(node.id_expr)
             self._os_active.add(id_)
@@ -885,6 +1314,17 @@ class Debugger:
         if isinstance(node, ast.OsDrop):
             id_ = self.evaluate(node.id_expr)
             self._os_active.discard(id_)
+            return None
+
+        # BUG-11: `thread.running(id)` parses to its own AST node, not a
+        # MethodCall, so it never reached the thread.* intercept and fell
+        # through to `return None` — printing Null where the compiled binary
+        # prints False. The debugger runs thread() bodies synchronously, so a
+        # thread is always already finished by the time this is asked.
+        if isinstance(node, ast.ThreadRunning):
+            return False
+
+        if isinstance(node, ast.ThreadWait):
             return None
 
         if isinstance(node, ast.OsRun):
@@ -938,6 +1378,16 @@ class Debugger:
     def _eval_fn_call(self, node):
         fname = node.name if isinstance(node.name, str) else None
         args  = [self.evaluate(a) for a in node.args]
+
+        # BUG-14: a bound FFI symbol called by its Rubidium name
+        # (`fn lib rb_sin(x: f64) -> f64 as sin` then `sin(0.5)`). Checked
+        # before the builtins below so a binding named e.g. `sin` — exactly
+        # the syntax file's FFI RENAMING example — reaches the library rather
+        # than the interpreter's own math builtin.
+        if fname is not None:
+            handled, result = self._ffi_invoke(fname, args)
+            if handled:
+                return result
 
         # Built-ins
         if fname == "random":
@@ -1101,6 +1551,74 @@ class Debugger:
                         return random.choice(list(coll.values()))
                 return None
 
+        # ── lib.alias(...) on an FFI handle — BUG-14. The syntax file's own
+        # FFI WRAPPERS example calls a bound symbol this way.
+        if isinstance(node.obj, ast.Var):
+            _info = self.scope.lookup(node.obj.name)
+            _val = _info.get("value") if _info else None
+            if isinstance(_val, dict) and "__ffi__" in _val:
+                handled, result = self._ffi_invoke(method, args)
+                if handled:
+                    return result
+                self.error(f"Unknown FFI binding '{node.obj.name}.{method}()'")
+                return None
+
+        # ── ns.fn(...) on an imported .rub file — BUG-13. Must run before the
+        # generic dispatch, which would otherwise treat the namespace dict as
+        # a plain value and return None.
+        _ns = self._namespace_of(node.obj)
+        if _ns is not None:
+            return self._call_namespaced(_ns, method, node.args)
+
+        # ── time.* — BUG-11. Like random.* above, `time` has no dedicated AST
+        # node, so time.wait()/timer_start()/timer_pause()/timer_stop()/
+        # timer_read() all landed on the generic module stub and returned
+        # None. That made `time.timer_read(1)` print Null (and any comparison
+        # against it wrong) where the compiled binary returns real elapsed
+        # seconds. Timers are keyed by integer ID exactly as the spec
+        # describes, and multiple timers can run at once.
+        if isinstance(node.obj, ast.Var) and node.obj.name == "time":
+            import time as _time
+            if method == "wait":
+                if args:
+                    try: _time.sleep(float(args[0]))
+                    except (TypeError, ValueError): pass
+                return None
+            if method == "timer_start":
+                if args:
+                    self._timers[args[0]] = {"start": _time.time(), "elapsed": 0.0,
+                                             "running": True}
+                return None
+            if method == "timer_pause":
+                t = self._timers.get(args[0]) if args else None
+                if t and t["running"]:
+                    t["elapsed"] += _time.time() - t["start"]
+                    t["running"] = False
+                return None
+            if method == "timer_stop":
+                if args: self._timers.pop(args[0], None)
+                return None
+            if method == "timer_read":
+                t = self._timers.get(args[0]) if args else None
+                if not t:
+                    return 0.0
+                total = t["elapsed"]
+                if t["running"]:
+                    total += _time.time() - t["start"]
+                return total
+
+        # ── thread.wait()/running() — BUG-11. The debugger runs a thread()
+        # call synchronously to completion (see the ThreadCall branch in
+        # execute), so by the time either of these is reached the thread has
+        # already finished: wait() is a no-op and running() is False. Both
+        # previously returned None, so `print(thread.running(1))` printed Null
+        # instead of False.
+        if isinstance(node.obj, ast.Var) and node.obj.name == "thread":
+            if method == "wait":
+                return None
+            if method == "running":
+                return False
+
         # ── file.read()/write()/add()/writeln()/readln() as a plain
         # MethodCall (the parser only special-cases FileHandleMethod for
         # some contexts; expression position falls through to here) ──────
@@ -1113,10 +1631,22 @@ class Debugger:
         # e.g. my_list(0).set("val")   →  my_list[0] = "val"
         #      my_index("k").set("v")  →  my_index["k"] = "v"
         #      my_dict("key", 1).set(x) → my_dict["key"][1] = x
-        if method == "set" and isinstance(node.obj, ast.FnCall):
-            col = self._resolve_collection_for_mutation(node.obj.name)
-            if col is not None:
+        if method == "set" and isinstance(node.obj, (ast.FnCall, ast.MethodCall)):
+            if isinstance(node.obj, ast.FnCall):
+                col = self._resolve_collection_for_mutation(node.obj.name)
                 fname = node.obj.name if isinstance(node.obj.name, str) else "<dynamic>"
+            else:
+                # BUG-10: `p.scores(0).set(99)` — a collection FIELD on a class
+                # instance, mutated from OUTSIDE the class (the syntax file's
+                # own CLASSES example). node.obj is a MethodCall here, not a
+                # FnCall, so this branch never matched and the call fell
+                # through to the generic path, which evaluated p.scores(0) to
+                # the ELEMENT and then "set" it on that copy — a silent no-op.
+                # (.add() happened to work because p.scores() evaluates to the
+                # live list itself.) Resolve the field to the live collection.
+                col = self._resolve_instance_field(node.obj)
+                fname = f"{getattr(node.obj.obj, 'name', '?')}.{node.obj.method}"
+            if col is not None:
                 idx_args = [self.evaluate(a) for a in node.obj.args]
                 new_val  = args[0] if args else None
                 if isinstance(col, list) and len(idx_args) == 1:
@@ -1173,6 +1703,22 @@ class Debugger:
                 info["value"] = result
 
         return result
+
+    def _resolve_instance_field(self, mcall):
+        """BUG-10: for `p.scores(0)` (a MethodCall whose `method` is really a
+        class FIELD name), return the instance's live collection so callers can
+        mutate it in place. None when it isn't an instance-field access."""
+        if not isinstance(mcall, ast.MethodCall):
+            return None
+        try:
+            inst = self.evaluate(mcall.obj)
+        except Exception:
+            return None
+        if isinstance(inst, dict) and "__class__" in inst and mcall.method in inst:
+            value = inst[mcall.method]
+            if isinstance(value, (list, dict)):
+                return value
+        return None
 
     def _resolve_collection_for_mutation(self, name_node):
         """Given the .name of an FnCall used as an index/mutation target
@@ -1401,6 +1947,9 @@ class Debugger:
             return "{" + ", ".join(
                 f"{self._format_value(k, nested=True)}: {self._format_value(v, nested=True)}"
                 for k, v in value.items()) + "}"
+        if isinstance(value, _Wide):
+            # BUG-6: exact decimal expansion, matching the compiled binary.
+            return str(value)
         if isinstance(value, float):
             return f"{value:g}"
         return str(value)
@@ -1630,8 +2179,78 @@ class Analyzer:
             return 'i64'
         if isinstance(node, ast.FnCall):
             fname = node.name if isinstance(node.name, str) else None
+            # BUG-16: `let mut p = player()` parses as a FnCall, not a
+            # ClassInstantiate, so an instance variable's type was inferred as
+            # None — which meant no `p.field` access ever marked the field
+            # used, and every class field was reported "Unused Field".
+            if fname and fname in self.classes:
+                return fname
             if fname and fname in self.functions:
                 return self.functions[fname].get('ret_type')
+        return None
+
+    # BUG-2: the analyzer used to type EVERY `for` variable as 'i32', which is
+    # only right for `for i in range(a, b)`. Iterating a collection yields
+    # values/keys/lines, so `for item in ["a","b"] { take_char(item) }` was
+    # wrongly reported as "Expected str, Received i32". These two helpers work
+    # out what a loop actually yields; anything not statically knowable falls
+    # back to 'Any', which _types_compat treats as compatible with everything
+    # (an unknown element type must never manufacture an error).
+    @staticmethod
+    def _unify_types(types):
+        """The single type shared by every element, or 'Any' if mixed/unknown."""
+        seen = {t for t in types if t}
+        if len(seen) == 1 and len(types) > 0 and all(types):
+            return seen.pop()
+        return 'Any'
+
+    def _iter_elem_type(self, node, scope: Scope) -> str:
+        """Type of the value produced by one iteration of `for x in <node>`.
+        Per spec: list -> values, index/dict/dict+ -> keys, file -> lines,
+        str -> characters."""
+        if node is None:
+            return 'i32'                       # `for i in range(a, b)`
+        if isinstance(node, (ast.Str, ast.InterpolatedStr)):
+            return 'str'                       # iterating a string yields chars
+        if isinstance(node, ast.ListExpr):
+            return self._unify_types([self._infer(e, scope) for e in node.elements])
+        if isinstance(node, ast.DictExpr):
+            return self._unify_types([self._infer(k, scope) for k, _v in node.pairs])
+        if isinstance(node, (ast.MethodCall, ast.CollectionMethodCall)):
+            # "text".slice() yields single-character strings.
+            if getattr(node, 'method', None) == 'slice':
+                return 'str'
+            return 'Any'
+        if isinstance(node, ast.Var):
+            info = scope.lookup(node.name)
+            if not info:
+                return 'Any'
+            etype = info.get('etype')
+            if etype:
+                return etype
+            vtype = info.get('vtype')
+            if vtype in ('str', 'str+', 'file'):
+                return 'str'                   # chars, or file lines
+            return 'Any'
+        return 'Any'
+
+    def _decl_elem_type(self, node: ast.VarDecl, scope: Scope):
+        """Element type recorded on a collection variable at declaration, used
+        later by _iter_elem_type. Honours the spec's forced-element-type form
+        (`let x: list: i32 = [...]`) first, then falls back to the literal."""
+        forced = getattr(node, 'element_type', None)
+        if forced:
+            return forced
+        value = node.value
+        if isinstance(value, ast.ListExpr):
+            return self._unify_types([self._infer(e, scope) for e in value.elements])
+        if isinstance(value, ast.DictExpr):
+            # index/dict iterate over KEYS, so that's what a loop over this
+            # variable will produce.
+            return self._unify_types([self._infer(k, scope) for k, _v in value.pairs])
+        if isinstance(value, (ast.MethodCall, ast.CollectionMethodCall)):
+            if getattr(value, 'method', None) == 'slice':
+                return 'str'
         return None
 
     def _is_heap_node(self, node) -> bool:
@@ -2177,6 +2796,11 @@ class Analyzer:
             'line':          self._ln('var', node.name),
             'drop_line':     None,
             'possibly_null': possibly_null,
+            # BUG-2: what `for x in <this var>` will yield (None = unknown).
+            'etype':         self._decl_elem_type(node, scope),
+            # BUG-15: `let local` is auto-dropped at scope exit, so it must
+            # never be leak-reported.
+            'is_local':      bool(node.is_local),
         }
         # Bug 14: remember literal keys from an `index` literal initializer
         # so later `.add(key, ...)` calls can be checked against them.
@@ -2216,6 +2840,7 @@ class Analyzer:
                     'is_heap':       is_heap,
                     'possibly_null': possibly_null,
                     'line':          self._ln('var', node.name),
+                    'etype':         info['etype'],
                     '__stub':        False,
                 })
                 self._expr(node.value, scope)
@@ -2228,6 +2853,7 @@ class Analyzer:
                     'vtype':         node.vtype or inferred_type,
                     'is_heap':       is_heap,
                     'possibly_null': possibly_null,
+                    'etype':         info['etype'],
                 })
                 self._expr(node.value, scope)
                 return
@@ -2242,6 +2868,7 @@ class Analyzer:
                 'is_heap':       is_heap,
                 'possibly_null': possibly_null,
                 'line':          self._ln('var', node.name),
+                'etype':         info['etype'],
                 'dropped':       False,
             })
             self._expr(node.value, scope)
@@ -2408,7 +3035,15 @@ class Analyzer:
             if not vinfo.get('used') and vname not in self._sy_holder_names:
                 self._emit('INFO', vinfo.get('line'), 'Unused Variable',
                            f"Unused variable: {vname}")
-            if vinfo.get('is_heap') and not vinfo.get('dropped'):
+            # BUG-15: a `let local` is released automatically when its block
+            # ends — spec ("Local variables ... automatically dropped when
+            # their scope ends", "Automatically dropped at scope exit") and,
+            # since the BUG-3 fix, the generated code really does free it.
+            # Warning about it told the user to write a .drop() that is both
+            # unnecessary and, for a value read out of a collection, actively
+            # misleading.
+            if (vinfo.get('is_heap') and not vinfo.get('dropped')
+                    and not vinfo.get('is_local')):
                 self._emit(
                     'WARNING', vinfo.get('line'), 'Possible Memory Leak',
                     f"Variable '{vname}' was never dropped.",
@@ -2571,14 +3206,13 @@ class Analyzer:
                 self._node(stmt, method_scope, in_loop=False)
             self._fn_depth -= 1
 
-        for fname, finfo in self.classes[node.name]['fields'].items():
-            if not finfo.get('used'):
-                self._emit(
-                    'INFO',
-                    self._ln('class', node.name),
-                    'Unused Field',
-                    f"Unused field: {node.name}.{fname}"
-            )
+        # BUG-16: the unused-FIELD report used to run right here, while the
+        # ClassDef itself was being analysed — i.e. BEFORE any of the code that
+        # actually uses the instance had been walked. Every field of a class
+        # declared above its first use was therefore reported unused, which is
+        # the normal layout (and the syntax file's own CLASSES example).
+        # Reporting is deferred to _check_unused, after the whole program has
+        # been analysed.
 
     def _drop(self, node: ast.Drop, scope: Scope):
         info = scope.lookup(node.name)
@@ -2629,9 +3263,15 @@ class Analyzer:
 
     def _for(self, node: ast.For, scope: Scope):
         loop_scope = Scope(parent=scope)
+        # BUG-2: type the loop variable from what the loop actually yields
+        # (i32 only for `range`), not unconditionally i32.
+        loop_vtype = self._iter_elem_type(node.iterable, scope)
         loop_scope.declare(node.var, {
-            'mutable': True, 'vtype': 'i32', 'dropped': False, 'used': True,
-            'is_heap': False, 'line': None, 'drop_line': None, 'possibly_null': False,
+            'mutable': True, 'vtype': loop_vtype, 'dropped': False, 'used': True,
+            # is_heap stays False: loop variables are auto-dropped at the end
+            # of the loop per spec, so they must never be leak-reported.
+            'is_heap': False, 'line': None, 'drop_line': None,
+            'possibly_null': False,
         })
         if node.iterable:
             self._expr(node.iterable, scope)
@@ -2769,6 +3409,30 @@ class Analyzer:
             self._emit('ERROR', None, 'Unknown Variable', msg)
 
     def _method_call(self, node: ast.MethodCall, scope: Scope):
+        # BUG-16: `p.scores(0).set(99)` / `p.scores().add(50)` reach a class's
+        # COLLECTION field through a MethodCall whose `method` is the field
+        # name, never through a FieldAccess — so those fields were still
+        # reported "Unused Field" even though the spec's own CLASSES example
+        # mutates them exactly this way. Mark the field used here too.
+        obj = node.obj
+        while isinstance(obj, ast.MethodCall):
+            inner = obj.obj
+            if isinstance(inner, ast.Var):
+                oinfo = scope.lookup(inner.name)
+                vtype = oinfo.get('vtype') if oinfo else None
+                if vtype in self.classes:
+                    finfo = self.classes[vtype]['fields'].get(obj.method)
+                    if finfo:
+                        finfo['used'] = True
+            obj = inner
+        if isinstance(node.obj, ast.Var):
+            oinfo = scope.lookup(node.obj.name)
+            vtype = oinfo.get('vtype') if oinfo else None
+            if vtype in self.classes:
+                finfo = self.classes[vtype]['fields'].get(node.method)
+                if finfo:
+                    finfo['used'] = True
+
         # Handles plain `.method()` calls. The parser never emits
         # CollectionMethodCall (see bugs.log #1), so collection mutations
         # like `my_list().add(x)` / `my_list(0).set(x)` arrive here as a
@@ -2914,7 +3578,19 @@ class Analyzer:
             elif op == "!=":
                 always_false = True
         else:
-            # One side is Null, other is a concrete non-null value
+            # BUG-17: only a LITERAL on the other side is provably non-Null.
+            # `Null` is a valid value for every type (spec: NULL BEHAVIOR), so
+            # `let e: i32 = Null` followed by `e == Null` is True — and the
+            # compiled binary prints True. Judging a variable comparison here
+            # told the user their correct code was "always False". This mirrors
+            # the compiler, which likewise only constant-folds a Null
+            # comparison against Number/Str/Bool/UnaryOp literals.
+            other = node.right if l_null else node.left
+            if not isinstance(other, (ast.Number, ast.Str, ast.Bool, ast.UnaryOp)):
+                return
+            if self._is_null_node(other):
+                return
+            # One side is Null, other is a concrete non-null literal
             # Null < x → True  (not always false)
             # Null > x → False (always false)
             # Null == x → False (always false)
@@ -2958,6 +3634,12 @@ class Analyzer:
             if not vinfo.get('used') and vname not in self._sy_holder_names:
                 self._emit('INFO', vinfo.get('line'), 'Unused Variable',
                            f"Unused variable: {vname}")
+        # BUG-16: unused fields, now that every use site has been seen.
+        for cname, cinfo in self.classes.items():
+            for fname, finfo in (cinfo.get('fields') or {}).items():
+                if not finfo.get('used'):
+                    self._emit('INFO', self._ln('class', cname), 'Unused Field',
+                               f"Unused field: {cname}.{fname}")
         # Unused class definitions
         for cname, cinfo in self.classes.items():
             if not cinfo.get('used'):
@@ -2970,8 +3652,13 @@ class Analyzer:
 
         for vname, vinfo in global_scope.vars.items():
 
-            # Only warn heap allocations
-            if vinfo.get('is_heap') and not vinfo.get('dropped'):
+            # Only warn heap allocations. SY holders are exempt (BUG-15): SY is
+            # a compile-time construct — codegen emits a NoOp for the
+            # declaration and substitutes the name at parse time — so there is
+            # no runtime allocation to drop, and `.drop()`ing one isn't even
+            # expressible.
+            if (vinfo.get('is_heap') and not vinfo.get('dropped')
+                    and vname not in self._sy_holder_names):
 
                 leaks.append(vname)
 
@@ -3315,7 +4002,8 @@ def check_file(filepath: str, strict: bool = False) -> bool:
 
         ast_tree = Parser(tokens).parse()
 
-        debugger = Debugger(source_lines=source_lines, tokens=tokens)
+        debugger = Debugger(source_lines=source_lines, tokens=tokens,
+                            source_dir=os.path.dirname(os.path.abspath(filepath)))
 
         print(f"\n{ANSI['BOLD']}Rubidium Debug Run{ANSI['RESET']}")
         print(f"{ANSI['DIM']}Running: {filepath}{ANSI['RESET']}\n")

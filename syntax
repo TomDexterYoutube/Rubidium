@@ -1577,7 +1577,7 @@ print(math_tools.pi)
 # Collections:
 #   - Collections require mut to be modified
 #   - list   = ordered sequence of values
-#   - index  = key -> value map
+#   - index  = key -> single scalar value map (never a collection)
 #   - dict   = key -> collection map
 #   - dict+  = key -> nested dict+ map (unlimited nesting depth)
 #   - .len() returns the number of items

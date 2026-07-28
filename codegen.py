@@ -50,6 +50,17 @@ declare i64 @unbox_class_id(%Box*)
 declare %Box* @str_split(i8*, i8*)
 declare %Box* @try_collection_get(%Box*, %Box*)
 declare void @collection_add1(%Box*, %Box*)
+; BUG-4: element reads return an independent deep copy (see the runtime).
+declare %Box* @collection_get_copy(%Box*, %Box*)
+declare %Box* @try_collection_get_copy(%Box*, %Box*)
+declare i8* @unbox_s_dup(%Box*)
+; BUG-3: scope-owned temporary arena.
+declare %Box* @rub_temp_track(%Box*)
+declare i8* @rub_temp_track_str(i8*)
+declare %Box* @rub_temp_untrack(%Box*)
+declare i8* @rub_temp_untrack_str(i8*)
+declare i64 @rub_temp_mark()
+declare void @rub_temp_release_to(i64)
 @_rub_error_msg = global i8* null
 @_rub_error_flag = global i1 0
 declare %Box* @collection_get_at(%Box*, i32)
@@ -269,6 +280,68 @@ class CodeGen:
 
     def emit(self, line):
         self.fn_lines.append(line)
+
+    # -------------------------------------------------------
+    # BUG-3: scope-owned temporaries
+    # -------------------------------------------------------
+    def _block_is_terminated(self):
+        """True when the last thing emitted ends the current basic block, so
+        no further instruction may be appended to it (LLVM requires exactly
+        one terminator, at the end). Guards the release calls below, which are
+        emitted after a statement that may have been `break`/`continue`/
+        `raise`/`return`."""
+        for line in reversed(self.fn_lines):
+            s = line.strip()
+            if not s or s.startswith(";"):
+                continue
+            if s.endswith(":"):        # a fresh label — block is open and empty
+                return False
+            return (s.startswith("br ") or s.startswith("ret ")
+                    or s.startswith("unreachable") or s.startswith("switch "))
+        return False
+
+    def _emit_temp_mark(self):
+        """Remember the arena high-water mark on entry to a scope."""
+        mark = self.new_tmp()
+        self.emit(f"  {mark} = call i64 @rub_temp_mark()")
+        return mark
+
+    def _emit_temp_release(self, mark):
+        """Free every temporary allocated since `mark`. Per spec, 'temporary
+        scoped values are dropped automatically' and locals are released when
+        their block ends — this is what actually performs that."""
+        if mark is not None and not self._block_is_terminated():
+            self.emit(f"  call void @rub_temp_release_to(i64 {mark})")
+
+    def _track_temp(self, val, ir_t):
+        """Register a freshly allocated value with the arena so it is freed
+        when the enclosing block ends."""
+        out = self.new_tmp()
+        if ir_t == "%Box*":
+            self.emit(f"  {out} = call %Box* @rub_temp_track(%Box* {val})")
+            return out
+        if ir_t == "i8*":
+            self.emit(f"  {out} = call i8* @rub_temp_track_str(i8* {val})")
+            return out
+        return val
+
+    def _escape_temp(self, val, ir_t):
+        """Move a value OUT of the temporary arena because it will outlive the
+        block that produced it — it is being stored in a global / class field,
+        or returned. Without this the arena would free memory the program
+        still owns. A no-op for scalars and for values that were never
+        tracked."""
+        if val in ("null", "0", None):
+            return val
+        if ir_t == "%Box*":
+            out = self.new_tmp()
+            self.emit(f"  {out} = call %Box* @rub_temp_untrack(%Box* {val})")
+            return out
+        if ir_t == "i8*":
+            out = self.new_tmp()
+            self.emit(f"  {out} = call i8* @rub_temp_untrack_str(i8* {val})")
+            return out
+        return val
 
     # -------------------------------------------------------
     # Type system: rank-based promotion for mixed-width math
@@ -751,8 +824,12 @@ class CodeGen:
         Called on VarDecl/Assign to implement the spec's 'every assignment creates a full deep copy' rule."""
         if val_t == "%Box*" and isinstance(source_node, Var):
             copied = self.new_tmp()
+            tracked = self.new_tmp()
             self.emit(f"  {copied} = call %Box* @box_deep_copy(%Box* {val})")
-            return copied
+            # BUG-3: the fresh copy belongs to the current block until it is
+            # bound somewhere longer-lived (which calls _escape_temp).
+            self.emit(f"  {tracked} = call %Box* @rub_temp_track(%Box* {copied})")
+            return tracked
         return val
 
     def _infer_type(self, node):
@@ -1228,10 +1305,18 @@ class CodeGen:
     def emit_body(self, stmts):
         # Push a new scope for this block
         self.local_vars_stack.append({})
+        # BUG-3: everything the block allocates above this mark is released
+        # when the block ends — the spec's "locals and temporaries are dropped
+        # at scope exit" rule. Anything that must outlive the block (a global
+        # binding, a class field, a return value) is taken out of the arena by
+        # _escape_temp at the point it escapes.
+        mark = self._emit_temp_mark()
         returned = False
         for s in stmts:
             if returned: break
             if self.emit_stmt(s): returned = True
+        if not returned:
+            self._emit_temp_release(mark)
         # Pop the scope when leaving the block
         self.local_vars_stack.pop()
         return returned
@@ -1388,7 +1473,13 @@ class CodeGen:
                     self.element_types[node.name] = node.element_type
                 if node.mutable: self.mutable_vars.add(node.name)
                 ptr_str = f"%ptr_{node.name}"
-                if node.name not in self._alloca_emitted:
+                # BUG-3: a FIRST declaration owns its storage for exactly this
+                # block, so its value can stay arena-tracked and be auto-dropped
+                # at scope exit (the spec's local-variable rule). A REPEAT `let`
+                # of the same name reuses an alloca that may belong to an
+                # enclosing block, so that value must escape instead.
+                first_decl = node.name not in self._alloca_emitted
+                if first_decl:
                     self.emit(f"  {ptr_str} = alloca {ir_t}")
                     self._alloca_emitted.add(node.name)
                 val, val_t = self.emit_expr(node.value)
@@ -1404,6 +1495,8 @@ class CodeGen:
                 # end of iteration).
                 val = self._deep_copy_if_var(val, val_t, node.value)
                 val = self.coerce(val, val_t, ir_t)
+                if not (first_decl and node.is_local):
+                    val = self._escape_temp(val, ir_t)
                 self.emit(f"  store {ir_t} {val}, {ir_t}* {ptr_str}")
                 return False
             if self.cur_fn is not None and self.cur_fn != "_rubidium_init" and self.cur_class is not None:
@@ -1439,6 +1532,8 @@ class CodeGen:
                 # at the is_local branch above — same stale-val_t bug otherwise).
                 val = self._deep_copy_if_var(val, val_t, node.value)
                 val = self.coerce(val, val_t, field_ir_t)
+                # BUG-3: a class field outlives this block — take ownership.
+                val = self._escape_temp(val, field_ir_t)
                 self.emit(f"  store {field_ir_t} {val}, {field_ir_t}* {fptr}")
                 if isinstance(node.value, FFILoad):
                     slot = f"@_ffi_slot_{node.name}"
@@ -1481,7 +1576,13 @@ class CodeGen:
                     self.element_types[node.name] = node.element_type
                 if node.mutable: self.mutable_vars.add(node.name)
                 ptr_str = f"%ptr_{node.name}"
-                if node.name not in self._alloca_emitted:
+                # BUG-3: a FIRST declaration owns its storage for exactly this
+                # block, so its value can stay arena-tracked and be auto-dropped
+                # at scope exit (the spec's local-variable rule). A REPEAT `let`
+                # of the same name reuses an alloca that may belong to an
+                # enclosing block, so that value must escape instead.
+                first_decl = node.name not in self._alloca_emitted
+                if first_decl:
                     self.emit(f"  {ptr_str} = alloca {ir_t}")
                     self._alloca_emitted.add(node.name)
                 val, val_t = self.emit_expr(node.value)
@@ -1489,6 +1590,8 @@ class CodeGen:
                 # at the is_local branch above — same stale-val_t bug otherwise).
                 val = self._deep_copy_if_var(val, val_t, node.value)
                 val = self.coerce(val, val_t, ir_t)
+                if not (first_decl and node.is_local):
+                    val = self._escape_temp(val, ir_t)
                 self.emit(f"  store {ir_t} {val}, {ir_t}* {ptr_str}")
                 if isinstance(node.value, FFILoad):
                     slot = f"@_ffi_slot_{node.name}"
@@ -1535,6 +1638,9 @@ class CodeGen:
                 # at the is_local branch above — same stale-val_t bug otherwise).
                 val = self._deep_copy_if_var(val, val_t, node.value)
                 val = self.coerce(val, val_t, actual_t)
+                # BUG-3: globals live until an explicit .drop(), so this value
+                # must leave the block-scoped arena.
+                val = self._escape_temp(val, actual_t)
                 ir_name = f"_var_{node.name}" if node.name in ("pow", "sin", "cos", "tan", "sqrt", "log", "log10", "exp", "fabs", "floor", "ceil", "round") else node.name
                 self.emit(f"  store {actual_t} {val}, {actual_t}* @{ir_name}")
                 if isinstance(node.value, FFILoad):
@@ -1601,6 +1707,13 @@ class CodeGen:
                 val = self.coerce(val, val_t, ir_t)
                 # Deep copy only if the COERCED value is a Box* (collection), not the original value
                 val = self._deep_copy_if_var(val, ir_t, node.value)
+                # BUG-3: reassignment always takes the value out of the arena.
+                # The target variable may have been DECLARED in an enclosing
+                # block, which outlives this one, so leaving the value tracked
+                # here could free it while the variable still points at it.
+                # (Only a variable's own `let` declaration keeps its value
+                # block-scoped — that is what auto-drops locals at scope exit.)
+                val = self._escape_temp(val, ir_t)
                 self.emit(f"  store {ir_t} {val}, {ir_t}* {ptr_str}")
                 
         elif isinstance(node, FieldAssign): self.emit_field_assign(node)
@@ -1621,6 +1734,12 @@ class CodeGen:
             else:
                 expected = getattr(self, '_cur_fn_ret_ir', val_t)
             val = self.coerce(val, val_t, expected)
+            # BUG-3: deliberately NOT escaped. A returning block skips its own
+            # release (see emit_body), so a tracked return value simply stays
+            # in the arena at a level above the CALLER's block mark — the
+            # caller's block-end release is what frees it. That is also why a
+            # returned temporary is never double-freed: it is only ever one
+            # arena entry, no matter how many frames it is passed back through.
             self.emit(f"  ret {expected} {val}")
             return True
         elif isinstance(node, FnCall): self.emit_call_expr(node)
@@ -1682,6 +1801,10 @@ class CodeGen:
                 ptr_str = f"%ptr_{node.name}" if any(node.name in scope for scope in self.local_vars_stack) else f"@_var_{node.name}" if node.name in {"pow", "sin", "cos", "tan", "sqrt", "log", "log10", "exp", "fabs", "floor", "ceil", "round"} else f"@{node.name}"
                 val = self.new_tmp()
                 self.emit(f"  {val} = load {ir_t}, {ir_t}* {ptr_str}")
+                # BUG-3: an explicit .drop() frees the value NOW, so the arena
+                # must forget it — otherwise the block-end release would free
+                # the same allocation a second time.
+                val = self._escape_temp(val, ir_t)
                 if ir_t == "%Box*": self.emit(f"  call void @box_drop(%Box* {val})")
                 elif ir_t == "i8*": self.emit(f"  call void @free(i8* {val})")
         elif isinstance(node, Break):
@@ -1836,10 +1959,17 @@ class CodeGen:
         self._emit_raise_or_propagate(err_ptr)
         self.emit(f"{ok_l}:")
 
-    def emit_guarded_collection_get(self, col_b, key_b, err_msg="collection access error"):
-        """Emit a collection_get with a null-check guard; catch-or-propagate (OPEN-7)."""
+    def emit_guarded_collection_get(self, col_b, key_b, err_msg="collection access error",
+                                    copy=False):
+        """Emit a collection_get with a null-check guard; catch-or-propagate (OPEN-7).
+
+        copy=True (BUG-4) returns an independent deep copy of the element
+        instead of the collection's own interior Box. Use it for the FINAL
+        step of a value READ; leave it False while navigating toward a
+        mutation (.set()/.add()/.drop()), which must reach the real object."""
         res = self.new_tmp()
-        self.emit(f"  {res} = call %Box* @try_collection_get(%Box* {col_b}, %Box* {key_b})")
+        getter = "try_collection_get_copy" if copy else "try_collection_get"
+        self.emit(f"  {res} = call %Box* @{getter}(%Box* {col_b}, %Box* {key_b})")
         # Check for null — null means out-of-bounds or missing key
         is_null = self.new_tmp(); ok_l = self.new_label("cgok"); err_l = self.new_label("cgerr")
         err_lbl, err_len = self.intern_str(err_msg)
@@ -2384,7 +2514,15 @@ class CodeGen:
 
     def emit_while(self, node):
         cond_l, body_l, end_l = self.new_label("wcond"), self.new_label("wbody"), self.new_label("wend")
+        # BUG-3: the CONDITION is re-evaluated every iteration but lives in the
+        # enclosing block, so a condition that reads a collection
+        # (`while items(0) < n`) would pile up one temporary per iteration.
+        # Release back to this mark at the top of each condition evaluation;
+        # the body has its own (higher) mark, so nothing the body still needs
+        # is ever in range.
+        loop_mark = self._emit_temp_mark()
         self.emit(f"  br label %{cond_l}\n{cond_l}:")
+        self._emit_temp_release(loop_mark)
         cond, ct = self.emit_expr(node.cond); cond = self.to_bool(cond, ct)
         self.emit(f"  br i1 {cond}, label %{body_l}, label %{end_l}\n{body_l}:")
         self.loop_end_stack.append(end_l)
@@ -3193,7 +3331,7 @@ class CodeGen:
             # Concatenate remaining parts
             for pv in part_vals[1:]:
                 self.emit(f"  call i8* @strcat(i8* {buf}, i8* {pv})")
-            return buf, "i8*"
+            return self._track_temp(buf, "i8*"), "i8*"   # BUG-3
 
         if isinstance(node, ListExpr):
             lst = self.new_tmp()
@@ -3205,7 +3343,10 @@ class CodeGen:
                 # literal must keep every element verbatim, including a
                 # leading Null, without .add()'s singleton-replace rule.
                 self.emit(f"  call void @list_append_raw(%Box* {lst}, %Box* {eb})")
-            return lst, "%Box*"
+            # BUG-3: a literal is a fresh allocation owned by this block until
+            # something longer-lived (a global, a field, a first-declaration
+            # local) takes it over via _escape_temp.
+            return self._track_temp(lst, "%Box*"), "%Box*"
         if isinstance(node, DictExpr):
             # FEATURE: dict+ — same underlying RDict layout as dict, just a
             # different magic number (see IS_DICT_MAGIC in the C runtime),
@@ -3220,7 +3361,7 @@ class CodeGen:
                 kv, kt = self.emit_expr(k); vv, vt = self.emit_expr(v)
                 kb = self.coerce_to_box(kv, kt); vb = self.coerce_to_box(vv, vt)
                 self.emit(f"  call void @dict_set(%Box* {dct}, %Box* {kb}, %Box* {vb})")
-            return dct, "%Box*"
+            return self._track_temp(dct, "%Box*"), "%Box*"   # BUG-3
         if isinstance(node, Input):
             if node.prompt is not None:
                 pv, pt = self.emit_expr(node.prompt)
@@ -3384,11 +3525,15 @@ class CodeGen:
         if not isinstance(node.name, str):
             col_v, col_t = self.emit_expr(node.name)
             col_b = self.coerce_to_box(col_v, col_t)
-            for arg in node.args:
+            # BUG-4: navigate through the real interior objects, then hand back
+            # an independent copy of the element the read actually lands on.
+            last = len(node.args) - 1
+            for i, arg in enumerate(node.args):
                 idx_v, idx_t = self.emit_expr(arg)
                 idx_b = self.coerce_to_box(idx_v, idx_t)
                 res = self.new_tmp()
-                self.emit(f"  {res} = call %Box* @collection_get(%Box* {col_b}, %Box* {idx_b})")
+                getter = "collection_get_copy" if i == last else "collection_get"
+                self.emit(f"  {res} = call %Box* @{getter}(%Box* {col_b}, %Box* {idx_b})")
                 col_b = res
             return col_b, "%Box*"
 
@@ -3439,9 +3584,17 @@ class CodeGen:
         if node.name == "input":
             return self.emit_expr(Input(node.args[0] if node.args else None))
 
-        # C library math functions
+        # C library math functions.
+        # BUG-8: a USER-DEFINED function of the same name must win. This branch
+        # used to fire unconditionally, so `fn log(msg: str)` — which is the
+        # syntax file's own FUNCTIONS example — compiled into a call to libm's
+        # log(double), silently passing a char* as a double and never running
+        # the user's body. Same for the spec's FFI-wrapper example, which
+        # defines `fn sqrt(value: f64)`. The definition side already mangles
+        # these to a safe LLVM symbol (see _safe_fn_symbol); only the call side
+        # resolved them wrongly.
         c_math_fns = {"sin", "cos", "tan", "sqrt", "pow", "log", "log10", "exp", "fabs", "floor", "ceil", "round"}
-        if node.name in c_math_fns:
+        if node.name in c_math_fns and node.name not in self.functions:
             args_ir = []
             for a in node.args:
                 v, t = self.emit_expr(a); args_ir.append(f"{t} {v}")
@@ -3636,10 +3789,12 @@ class CodeGen:
             col_v, col_t = self.emit_expr(Var(node.name))
             col_b = self.coerce_to_box(col_v, col_t)
             # Chain multiple get calls for nested access: col("key", 2) -> col["key"][2]
-            for arg in node.args:
+            # BUG-4: only the last hop copies (see emit_guarded_collection_get).
+            last = len(node.args) - 1
+            for i, arg in enumerate(node.args):
                 idx_v, idx_t = self.emit_expr(arg)
                 idx_b = self.coerce_to_box(idx_v, idx_t)
-                col_b = self.emit_guarded_collection_get(col_b, idx_b)
+                col_b = self.emit_guarded_collection_get(col_b, idx_b, copy=(i == last))
             return col_b, "%Box*"
 
         # 4.5 Class field access via call syntax: e.g., inv() inside class → loads field "inv"
@@ -3648,7 +3803,8 @@ class CodeGen:
             # If args provided, treat as collection access on the field
             if node.args:
                 col_b = self.coerce_to_box(field_val, field_t)
-                for arg in node.args:
+                last = len(node.args) - 1
+                for i, arg in enumerate(node.args):
                     idx_v, idx_t = self.emit_expr(arg)
                     idx_b = self.coerce_to_box(idx_v, idx_t)
                     # BUGFIX (bugs.log #16): was the unguarded collection_get,
@@ -3656,7 +3812,7 @@ class CodeGen:
                     # sku) crashed the whole program even inside try/error —
                     # unlike the near-identical branch just above (4.), which
                     # already used the guarded version.
-                    col_b = self.emit_guarded_collection_get(col_b, idx_b)
+                    col_b = self.emit_guarded_collection_get(col_b, idx_b, copy=(i == last))
                 return col_b, "%Box*"
             return field_val, field_t
 
@@ -4041,10 +4197,11 @@ class CodeGen:
                     else:
                         # p.scores(0) or p.dict_field("key", 0) — chain get for each arg
                         col_b = field_val
-                        for arg in node.args:
+                        last = len(node.args) - 1
+                        for i, arg in enumerate(node.args):
                             idx_v, idx_t = self.emit_expr(arg)
                             idx_b = self.coerce_to_box(idx_v, idx_t)
-                            col_b = self.emit_guarded_collection_get(col_b, idx_b)
+                            col_b = self.emit_guarded_collection_get(col_b, idx_b, copy=(i == last))
                         return col_b, "%Box*"
                 return field_val, field_t
 
@@ -4249,12 +4406,26 @@ class CodeGen:
         if obj_t == "%Box*" and node.method == "combine" and not node.args:
             tmp = self.new_tmp()
             self.emit(f"  {tmp} = call i8* @list_combine(%Box* {obj_val})")
-            return tmp, "i8*"
+            return self._track_temp(tmp, "i8*"), "i8*"   # BUG-3
+
+        # Collection/string .has() check — BUG-5: this must come BEFORE the
+        # string dispatch below, not after. A `list`/`index`/`dict` global is
+        # also a %Box*, so the string branch used to swallow every .has() call,
+        # unbox the collection with box_to_cstr() and hand a non-string needle
+        # (e.g. the integer 20) to strstr() as a pointer — an instant segfault.
+        # @collection_has handles BOTH cases at runtime off the Box type tag:
+        # substring search for a str Box, key/value scan for a collection.
+        if obj_t == "%Box*" and node.method == "has" and node.args:
+            needle_v, needle_t = self.emit_expr(node.args[0])
+            needle_b = self.coerce_to_box(needle_v, needle_t)
+            tmp = self.new_tmp()
+            self.emit(f"  {tmp} = call i1 @collection_has(%Box* {obj_val}, %Box* {needle_b})")
+            return tmp, "i1"
 
         # String methods on Box*-typed variables (global scope): unbox to i8* first
         # Exception: numeric-returning methods on numeric Boxes must unbox via i64, not i8*
         known_str_methods_on_box = ("len", "to_int", "contains", "slice", "split",
-                                    "concat", "combine", "has", "to", "char",
+                                    "concat", "combine", "to", "char",
                                     "set", "insert", "replace")
         if obj_t == "%Box*" and node.method in known_str_methods_on_box:
             if node.method in ("to_int", "to") and (not node.args or self._ffi_type_to_ir(
@@ -4266,21 +4437,14 @@ class CodeGen:
                 return i64_tmp, "i64"
             unboxed = self.new_tmp()
             self.emit(f"  {unboxed} = call i8* @box_to_cstr(%Box* {obj_val})")
+            unboxed = self._track_temp(unboxed, "i8*")   # BUG-3: fresh buffer
             return self.emit_string_method(unboxed, node.method, node.args)
-        
-        # Collection .has() check — must come AFTER string dispatch since strings can be Box*
-        if obj_t == "%Box*" and node.method == "has" and node.args:
-            needle_v, needle_t = self.emit_expr(node.args[0])
-            needle_b = self.coerce_to_box(needle_v, needle_t)
-            tmp = self.new_tmp()
-            self.emit(f"  {tmp} = call i1 @collection_has(%Box* {obj_val}, %Box* {needle_b})")
-            return tmp, "i1"
         
         # Collection .combine() — join all items as a string
         if obj_t == "%Box*" and node.method == "combine" and not node.args:
             tmp = self.new_tmp()
             self.emit(f"  {tmp} = call i8* @list_combine(%Box* {obj_val})")
-            return tmp, "i8*"
+            return self._track_temp(tmp, "i8*"), "i8*"   # BUG-3
         
         # bugs.log OPEN-9: dynamic (runtime) dispatch for a method call on a
         # value whose static class type is unknown — e.g. retrieved back out
@@ -4381,6 +4545,18 @@ class CodeGen:
         return self.emit_call_expr(_FnCall(target_name, node.args))
 
     def emit_string_method(self, obj_val, method, args):
+        # BUG-3: every i8*-returning string method below builds a FRESH buffer
+        # (malloc/strndup/strdup/str_replace) that nothing ever freed — so a
+        # loop doing `text.char(i)` leaked one allocation per call. Register
+        # the result with the arena so it is released at block exit. The one
+        # exception is `.to(str)`, which hands back the receiver unchanged;
+        # tracking that would free a buffer this call does not own.
+        res, res_t = self._emit_string_method_impl(obj_val, method, args)
+        if res_t == "i8*" and res != obj_val:
+            res = self._track_temp(res, "i8*")
+        return res, res_t
+
+    def _emit_string_method_impl(self, obj_val, method, args):
         if method == "len":
             tmp = self.new_tmp()
             self.emit(f"  {tmp} = call i64 @strlen(i8* {obj_val})")
@@ -4457,6 +4633,7 @@ class CodeGen:
             delim_v = self.coerce(delim_v, delim_t, "i8*")
             result = self.new_tmp()
             self.emit(f"  {result} = call %Box* @str_split(i8* {obj_val}, i8* {delim_v})")
+            result = self._track_temp(result, "%Box*")   # BUG-3
             return result, "%Box*"
         if method == "combine" and len(args) == 1:
             other, _ = self.emit_expr(args[0])
@@ -4514,6 +4691,8 @@ class CodeGen:
         if method == "slice" and len(args) == 0:
             result = self.new_tmp()
             self.emit(f"  {result} = call %Box* @str_slice(i8* {obj_val})")
+            # BUG-3: freshly built collection — block-scoped until bound.
+            result = self._track_temp(result, "%Box*")
             return result, "%Box*"
         return "0", "i64"
 
@@ -4543,7 +4722,7 @@ class CodeGen:
             self.emit(f"  {fmt_ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt_lbl}, i64 0, i64 0")
             cv = self.coerce(val, from_t, "i64")
             self.emit(f"  call i32 (i8*, i8*, ...) @sprintf(i8* {buf}, i8* {fmt_ptr}, i64 {cv})")
-            return buf, "i8*"
+            return self._track_temp(buf, "i8*"), "i8*"   # BUG-3
         if from_t in ("float","double") and to_t == "i8*":
             buf, fmt_ptr = self.new_tmp(), self.new_tmp()
             fmt_lbl, flen = self.intern_str("%g")
@@ -4551,7 +4730,7 @@ class CodeGen:
             self.emit(f"  {fmt_ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt_lbl}, i64 0, i64 0")
             dv = self.coerce(val, from_t, "double")
             self.emit(f"  call i32 (i8*, i8*, ...) @sprintf(i8* {buf}, i8* {fmt_ptr}, double {dv})")
-            return buf, "i8*"
+            return self._track_temp(buf, "i8*"), "i8*"   # BUG-3
         if from_t == "i8*" and to_t in ("i1","i64"):
             t2 = self.new_tmp()
             self.emit(f"  {t2} = call i64 @atol(i8* {val})")
@@ -4624,7 +4803,7 @@ class CodeGen:
                 self.emit(f"  {buf} = call i8* @malloc(i64 {total2})")
                 self.emit(f"  call i8* @strcpy(i8* {buf}, i8* {l})")
                 self.emit(f"  call i8* @strcat(i8* {buf}, i8* {r})")
-                return buf, "i8*"
+                return self._track_temp(buf, "i8*"), "i8*"   # BUG-3
             # String + Other -> Convert other to string and concatenate  
             if lt == "i8*" and rt != "i8*":
                 str_r = self.coerce_to_string(r, rt)
@@ -4636,7 +4815,7 @@ class CodeGen:
                 self.emit(f"  {buf} = call i8* @malloc(i64 {total2})")
                 self.emit(f"  call i8* @strcpy(i8* {buf}, i8* {l})")
                 self.emit(f"  call i8* @strcat(i8* {buf}, i8* {str_r})")
-                return buf, "i8*"
+                return self._track_temp(buf, "i8*"), "i8*"   # BUG-3
             # Other + String -> Convert other to string and concatenate
             if lt != "i8*" and rt == "i8*":
                 str_l = self.coerce_to_string(l, lt)
@@ -4648,7 +4827,7 @@ class CodeGen:
                 self.emit(f"  {buf} = call i8* @malloc(i64 {total2})")
                 self.emit(f"  call i8* @strcpy(i8* {buf}, i8* {str_l})")
                 self.emit(f"  call i8* @strcat(i8* {buf}, i8* {r})")
-                return buf, "i8*"
+                return self._track_temp(buf, "i8*"), "i8*"   # BUG-3
         # BUGFIX (bugs.log #17): was hardcoded to "double" (if either side
         # looked like a float) or otherwise always "i64" — completely
         # ignoring wider types. Any i128+ arithmetic silently computed at
@@ -4761,6 +4940,21 @@ class CodeGen:
             # Note: Null < variable (ordinal) won't work correctly without runtime tagging (see bugs.log).
 
         l, lt = self.emit_expr(node.left); r, rt = self.emit_expr(node.right)
+        # BUG-7: the Null literal carries the pseudo-type "null" (see OPEN-4 in
+        # emit_expr), which is NOT a real LLVM type. `let n: i32 = Null` then
+        # `n == Null` reaches here as i32 vs "null", falls through to the
+        # generic path at the bottom and emits `icmp eq null %n, -2147483648`
+        # — invalid IR, so the whole program failed to compile. Resolve the
+        # literal against the other operand's concrete type first; coerce()
+        # already knows the right Null representation per type (the INT32_MIN
+        # sentinel for ints, the float sentinel for floats, a null pointer for
+        # strings), and coerce_to_box() produces a real Null-tagged Box.
+        if lt == "null" and rt != "null":
+            l = self.coerce_to_box(l, "null") if rt == "%Box*" else self.coerce(l, "null", rt)
+            lt = rt
+        elif rt == "null" and lt != "null":
+            r = self.coerce_to_box(r, "null") if lt == "%Box*" else self.coerce(r, "null", lt)
+            rt = lt
         # Collection equality (list/index/dict) — compare contents recursively
         if lt == "%Box*" and rt == "%Box*" and node.op in ("==", "!="):
             eq_i32, tmp = self.new_tmp(), self.new_tmp()
@@ -4862,7 +5056,12 @@ class CodeGen:
             v = self.new_tmp()
             self.emit(f"  {v} = bitcast {t} {val} to i8*")
             self.emit(f"  {tmp} = call %Box* @box_p(i8* {v})")
-        return tmp
+        # BUG-3: every branch above (an already-%Box* value returns early and
+        # is NOT touched) allocates a brand-new Box — most of them short-lived
+        # keys and boxed arguments that nothing ever freed. Hand them to the
+        # arena; a container that takes ownership calls rub_temp_untrack in the
+        # runtime, so only genuinely temporary boxes are released.
+        return self._track_temp(tmp, "%Box*")
 
     def coerce_to_string(self, val, t):
         """Convert a value of any type to a string (i8*)"""
@@ -4871,8 +5070,9 @@ class CodeGen:
         tmp = self.new_tmp()
         buf = self.new_tmp()
         if t == "%Box*":
+            # box_to_cstr always returns a fresh heap buffer (BUG-3).
             self.emit(f"  {tmp} = call i8* @box_to_cstr(%Box* {val})")
-            return tmp
+            return self._track_temp(tmp, "i8*")
         if t == "i1":
             true_lbl, true_len = self.intern_str("True")
             false_lbl, false_len = self.intern_str("False")
@@ -4888,21 +5088,21 @@ class CodeGen:
             self.emit(f"  {fmt_ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt_lbl}, i64 0, i64 0")
             cv = self.coerce(val, t, "i64")
             self.emit(f"  {tmp} = call i32 (i8*, i8*, ...) @sprintf(i8* {buf}, i8* {fmt_ptr}, i64 {cv})")
-            return buf
+            return self._track_temp(buf, "i8*")   # BUG-3: fresh buffer
         if t == "i128":
             # BUGFIX (bugs.log #17): previously fell through to the generic
             # `else: return val` below, which returned the raw i128 bit
             # pattern completely unconverted — later code (e.g. strlen/
             # strcpy on the "string") would treat that as a garbage pointer.
             self.emit(f"  {tmp} = call i8* @i128_to_str(i128 {val})")
-            return tmp
+            return self._track_temp(tmp, "i8*")   # BUG-3
         if t in ("i256", "i512", "i1024", "i2048"):
             # OPEN-6: true bignum string conversion — previously routed
             # through the i32/i64 branch above via sprintf("%lld", ...),
             # which silently narrowed to i64 first.
             ptr64, n = self._emit_bignum_ptr(val, t)
             self.emit(f"  {tmp} = call i8* @bignum_to_str(i64* {ptr64}, i32 {n})")
-            return tmp
+            return self._track_temp(tmp, "i8*")   # BUG-3
         elif t == "fp128":
             # Float-precision fix: same reasoning as emit_print's fp128 case —
             # exact decimal conversion straight from the raw bits, no double
@@ -4911,7 +5111,7 @@ class CodeGen:
             # fixed 32-byte `buf` above).
             lo, hi = self._emit_fp128_halves(val)
             self.emit(f"  {tmp} = call i8* @fp128_to_exact_decimal_str(i64 {lo}, i64 {hi})")
-            return tmp
+            return self._track_temp(tmp, "i8*")   # BUG-3
         elif t in ("float", "double"):
             fmt_lbl, flen = self.intern_str("%g")
             fmt_ptr = self.new_tmp()
@@ -4919,7 +5119,7 @@ class CodeGen:
             self.emit(f"  {fmt_ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt_lbl}, i64 0, i64 0")
             dv = self.coerce(val, t, "double")
             self.emit(f"  {tmp} = call i32 (i8*, i8*, ...) @sprintf(i8* {buf}, i8* {fmt_ptr}, double {dv})")
-            return buf
+            return self._track_temp(buf, "i8*")   # BUG-3
         else:
             return val
 
@@ -4960,7 +5160,15 @@ class CodeGen:
                     self.emit(f"  {tmp} = fpext double {dbl_tmp} to fp128"); return tmp
                 return dbl_tmp
             if to_t == "i8*":
-                self.emit(f"  {tmp} = call i8* @unbox_s(%Box* {val})"); return tmp
+                # BUG-4: unbox_s() hands back the Box's OWN ->s buffer, so a
+                # `str` read out of a collection aliased the collection's
+                # characters — dropping either one invalidated the other.
+                # unbox_s_dup returns an owned copy; the arena (BUG-3) frees it
+                # at block exit unless it is bound to something longer-lived.
+                dup = self.new_tmp()
+                self.emit(f"  {dup} = call i8* @unbox_s_dup(%Box* {val})")
+                self.emit(f"  {tmp} = call i8* @rub_temp_track_str(i8* {dup})")
+                return tmp
             # Pointer cast
             p_tmp = self.new_tmp()
             self.emit(f"  {p_tmp} = call i8* @unbox_p(%Box* {val})")
