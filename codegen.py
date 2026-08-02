@@ -253,6 +253,18 @@ class CodeGen:
             "  %buf = call i8* @malloc(i64 1024)",
             "  %stdin = load i8*, i8** @_stdin_ptr", # Changed from @.stdin_ptr
             "  %res = call i8* @fgets(i8* %buf, i32 1024, i8* %stdin)",
+            # BUG-19: fgets' result used to be ignored. At EOF (or a read
+            # error) fgets leaves the buffer UNTOUCHED, so strlen below ran
+            # over uninitialized malloc memory — it only looked like "" because
+            # a fresh heap chunk happens to be zeroed. On a dirty heap this
+            # returns stale garbage from whatever last used that chunk. Detect
+            # the failure and return a real empty string instead.
+            "  %read_ok = icmp ne i8* %res, null",
+            "  br i1 %read_ok, label %have_line, label %at_eof",
+            "at_eof:",
+            "  store i8 0, i8* %buf",
+            "  br label %done",
+            "have_line:",
             "  %len = call i64 @strlen(i8* %buf)",
             "  %is_empty = icmp eq i64 %len, 0",
             "  br i1 %is_empty, label %done, label %check_nl",

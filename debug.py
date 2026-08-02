@@ -1289,7 +1289,26 @@ class Debugger:
             return None
 
         if isinstance(node, ast.Input):
-            return ""   # can't do real input in debug mode
+            # BUG-18: this used to be hardcoded to "" and never touched stdin,
+            # even when real input was waiting. Any `while` loop driven by
+            # input() therefore never saw its exit command and spun until the
+            # 100 000-iteration guard — with a heavy loop body (a game redraw,
+            # say) that reads as a total hang at 100% CPU, with no output and
+            # no diagnostic. The compiled binary prints the prompt and reads a
+            # line, so the debug run now does exactly the same, returning ""
+            # at EOF to match _rubidium_input_line's end-of-stream result.
+            if node.prompt is not None:
+                prompt = self.evaluate(node.prompt)
+                if prompt is not None:
+                    print(self._format_value(prompt), end="")
+                    sys.stdout.flush()
+            try:
+                line = sys.stdin.readline()
+            except Exception:
+                return ""
+            if line == "":
+                return ""            # EOF
+            return line.rstrip("\n")
 
         if isinstance(node, ast.FnCall):
             return self._eval_fn_call(node)
