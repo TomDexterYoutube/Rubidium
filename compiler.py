@@ -1905,11 +1905,253 @@ def _prefix_fn_calls(node, prefix, local_fns=None):
         for part in node.parts:
             _prefix_fn_calls(part, prefix, local_fns)
 
+def _collect_module_globals(ast):
+    """BUG-20: every top-level variable an imported module declares, plus the
+    non-local `let`s inside its functions (per spec those enter the global
+    pool too). These are the names that must be rewritten to their prefixed
+    module-global form wherever the module refers to them."""
+    from rub_ast import Var
+    names = set()
+
+    def scan(stmts):
+        for s in stmts:
+            if isinstance(s, VarDecl):
+                if not getattr(s, 'is_local', False):
+                    names.add(s.name)
+                scan_expr_bodies(s)
+            elif isinstance(s, FnDef):
+                scan(s.body)
+            elif isinstance(s, ClassDef):
+                for m in (s.methods or []):
+                    scan(m.body)
+            elif isinstance(s, If):
+                scan(s.then_body or []); scan(s.else_body or [])
+            elif isinstance(s, (While, For)):
+                scan(s.body or [])
+            elif isinstance(s, Try):
+                scan(s.try_body or []); scan(s.error_body or [])
+            elif isinstance(s, FileOpen):
+                scan(s.body or [])
+
+    def scan_expr_bodies(_s):
+        return
+
+    scan(ast)
+    return names
+
+
+def _qualify_module_globals(node, prefix, mod_vars, shadowed):
+    """BUG-20: rewrite a module's references to its OWN module-level variables
+    into their prefixed form.
+
+    parse_file renames an imported module's top-level `let x` to `mod_x`, but
+    nothing rewrote the references — so a module function reading its own
+    global failed with "Undefined variable", and assigning to one failed with
+    "Immutable". That made any imported module WITH STATE unusable; only pure
+    functions and externally-read variables happened to work.
+
+    `shadowed` carries the names bound more locally (parameters, `let local`,
+    loop variables, file handles) which must NOT be rewritten — per spec a
+    local shadows a global and takes priority.
+    """
+    from rub_ast import (FnCall, MethodCall, Return, Print, Println, FieldAssign,
+                         BinOp, UnaryOp, Compare, TypeCast, Input, InterpolatedStr,
+                         Var, ListExpr, DictExpr, FieldAccess, MathBlock, LinkArg,
+                         ThreadCall, ThreadWait, ThreadRunning, ElementDrop, Raise,
+                         FileHandleStmt, OsStart, OsRun, OsDrop, FileNew, FileExists,
+                         FileDelete, FileRename, FileCopy, FileList, DynVarDecl)
+
+    def q(name):
+        """Prefixed form of `name`, or None when it must be left alone."""
+        if not isinstance(name, str) or "." in name:
+            return None
+        if name in shadowed or name not in mod_vars:
+            return None
+        if name.startswith(f"{prefix}_"):
+            return None
+        return f"{prefix}_{name}"
+
+    def walk(n, sh):
+        if n is None or isinstance(n, (str, int, float, bool)):
+            return
+        if isinstance(n, list):
+            for c in n:
+                walk(c, sh)
+            return
+
+        if isinstance(n, Var):
+            new = _qualify_module_globals._q(n.name, sh, mod_vars, prefix)
+            if new:
+                n.name = new
+            return
+
+        if isinstance(n, FnCall):
+            # `items(0)` — collection access parses as a call on the variable.
+            new = _qualify_module_globals._q(n.name, sh, mod_vars, prefix)
+            if new:
+                n.name = new
+            else:
+                walk(n.name, sh)
+            walk(n.args, sh)
+            return
+
+        if isinstance(n, Assign):
+            new = _qualify_module_globals._q(n.name, sh, mod_vars, prefix)
+            if new:
+                n.name = new
+            walk(n.value, sh)
+            return
+
+        if isinstance(n, Drop):
+            new = _qualify_module_globals._q(n.name, sh, mod_vars, prefix)
+            if new:
+                n.name = new
+            return
+
+        if isinstance(n, VarDecl):
+            walk(n.value, sh)
+            # A `let local` binds a NEW name for the rest of this scope, so it
+            # shadows any module global of the same name from here on.
+            if getattr(n, 'is_local', False):
+                sh.add(n.name)
+            else:
+                new = _qualify_module_globals._q(n.name, sh, mod_vars, prefix)
+                if new:
+                    n.name = new
+            return
+
+        if isinstance(n, FnDef):
+            inner = set(sh)
+            inner.update(p[0] for p in (n.params or []))
+            walk(n.body, inner)
+            return
+
+        if isinstance(n, ClassDef):
+            for f in (n.fields or []):
+                walk(getattr(f, 'value', None), set(sh))
+            for m in (n.methods or []):
+                inner = set(sh)
+                inner.update(p[0] for p in (m.params or []))
+                # Class fields are reached bare inside methods (no `self`), so
+                # they shadow module globals of the same name.
+                inner.update(f.name for f in (n.fields or []))
+                walk(m.body, inner)
+            return
+
+        if isinstance(n, For):
+            inner = set(sh)
+            if isinstance(n.var, str):
+                inner.add(n.var)
+            walk(getattr(n, 'iterable', None), sh)
+            walk(getattr(n, 'start', None), sh)
+            walk(getattr(n, 'end', None), sh)
+            walk(n.body, inner)
+            return
+
+        if isinstance(n, FileOpen):
+            walk(n.path_expr, sh)
+            inner = set(sh)
+            inner.add(n.var_name)
+            walk(n.body or [], inner)
+            return
+
+        # Everything else: walk each child attribute generically. A block body
+        # gets its own shadow set so declarations inside don't leak out.
+        for attr in ('value', 'expr', 'left', 'right', 'cond', 'obj',
+                     'path_expr', 'message', 'prompt', 'thread_id',
+                     'func_call', 'id_expr', 'cmd_expr', 'input_expr',
+                     'old_path', 'new_path', 'src_path', 'dst_path',
+                     'access_node'):
+            if hasattr(n, attr):
+                walk(getattr(n, attr), sh)
+        for attr in ('args', 'elements', 'parts', 'thread_ids'):
+            if hasattr(n, attr):
+                walk(getattr(n, attr), sh)
+        if hasattr(n, 'pairs'):
+            for k, v in (n.pairs or []):
+                walk(k, sh); walk(v, sh)
+        if hasattr(n, 'struct_args') and n.struct_args:
+            for v in n.struct_args.values():
+                walk(v, sh)
+        for attr in ('body', 'then_body', 'else_body', 'try_body', 'error_body'):
+            if hasattr(n, attr):
+                walk(getattr(n, attr) or [], set(sh))
+
+    walk(node, set(shadowed))
+
+
+def _qualify_module_globals_q(name, shadowed, mod_vars, prefix):
+    if not isinstance(name, str) or "." in name:
+        return None
+    if name in shadowed or name not in mod_vars:
+        return None
+    if name.startswith(f"{prefix}_"):
+        return None
+    return f"{prefix}_{name}"
+
+
+_qualify_module_globals._q = _qualify_module_globals_q
+
+
+def _rebind_namespace(node, old_ns, new_ns):
+    """FEATURE (`import local`): point one file's references at a PRIVATE copy
+    of a module. Rewrites `old_ns.foo` -> `new_ns.foo` everywhere in this
+    file's AST — dotted call names (`file_one.bump()`), and the Var that names
+    the namespace in a field access / method call (`file_one.counter`).
+    Only this file's references move; every other importer keeps pointing at
+    the shared instance."""
+    from rub_ast import FnCall, Var
+
+    def walk(n):
+        if n is None or isinstance(n, (str, int, float, bool)):
+            return
+        if isinstance(n, list):
+            for c in n:
+                walk(c)
+            return
+        if isinstance(n, FnCall) and isinstance(n.name, str) and n.name.startswith(old_ns + "."):
+            n.name = new_ns + n.name[len(old_ns):]
+        elif isinstance(n, Var) and n.name == old_ns:
+            n.name = new_ns
+        elif isinstance(n, FnCall):
+            walk(n.name)
+        for attr in ('value', 'expr', 'left', 'right', 'cond', 'obj',
+                     'path_expr', 'message', 'prompt', 'thread_id',
+                     'func_call', 'id_expr', 'cmd_expr', 'input_expr',
+                     'old_path', 'new_path', 'src_path', 'dst_path',
+                     'access_node', 'iterable', 'start', 'end'):
+            if hasattr(n, attr):
+                walk(getattr(n, attr))
+        for attr in ('args', 'elements', 'parts', 'thread_ids', 'fields'):
+            if hasattr(n, attr):
+                walk(getattr(n, attr))
+        if hasattr(n, 'pairs'):
+            for k, v in (n.pairs or []):
+                walk(k); walk(v)
+        if hasattr(n, 'struct_args') and n.struct_args:
+            for v in n.struct_args.values():
+                walk(v)
+        for attr in ('body', 'then_body', 'else_body', 'try_body', 'error_body'):
+            if hasattr(n, attr):
+                walk(getattr(n, attr) or [])
+        if hasattr(n, 'methods'):
+            for m in (n.methods or []):
+                walk(m.body or [])
+
+    walk(node)
+
+
 def parse_file(filepath, parsed_files, combined_ast, is_main=False, mod_name_override=None):
     abs_path = os.path.abspath(filepath)
-    if abs_path in parsed_files:
+    # The dedupe key includes the module name a file is being parsed UNDER, not
+    # just its path. A plain `import` always resolves to the same name, so it
+    # is still parsed exactly once and every importer shares that one instance.
+    # An `import local` asks for a private copy under a different name, so it
+    # must be allowed to parse the same file again (FEATURE: import local).
+    parse_key = (abs_path, mod_name_override or "")
+    if parse_key in parsed_files:
         return
-    parsed_files.add(abs_path)
+    parsed_files.add(parse_key)
     
     # Generate module name from file (e.g., 'math_tools' from 'math_tools.rub').
     # Package imports (`xeon <name>`) override this: every package's main file
@@ -1934,6 +2176,10 @@ def parse_file(filepath, parsed_files, combined_ast, is_main=False, mod_name_ove
         if isinstance(node, FnDef):
             local_fns_original.add(node.name)  # Original name before prefixing
     
+    # BUG-20: the module's own global variable names, captured BEFORE any
+    # renaming, so references to them can be rewritten to the prefixed form.
+    mod_vars_original = set() if is_main else _collect_module_globals(ast)
+
     # First pass: prefix all names (only for imported files, not main)
     if not is_main:
         for node in ast:
@@ -1958,6 +2204,15 @@ def parse_file(filepath, parsed_files, combined_ast, is_main=False, mod_name_ove
             if isinstance(node, FnDef):
                 for stmt in node.body:
                     _prefix_fn_calls(stmt, mod_name, local_fns_original)
+
+    # Third pass (BUG-20): rewrite the module's references to its OWN globals
+    # into the prefixed names the first pass gave those declarations. Without
+    # this a module function could not read or assign its own module-level
+    # state at all. Top-level statements are qualified too, since a module's
+    # top level runs as part of program init and may read its own globals.
+    if not is_main and mod_vars_original:
+        for node in ast:
+            _qualify_module_globals(node, mod_name, mod_vars_original, set())
     
     def _find_imports(stmts):
         """Recursively find Import nodes in a list of statements (including nested in functions)."""
@@ -2004,7 +2259,23 @@ def parse_file(filepath, parsed_files, combined_ast, is_main=False, mod_name_ove
             base_dir = os.path.dirname(filepath)
             mod_path = os.path.join(base_dir, mod_file) if base_dir else mod_file
             if os.path.exists(mod_path):
-                parse_file(mod_path, parsed_files, combined_ast)
+                if getattr(node, 'is_local', False):
+                    # FEATURE (`import local`): a private instance for THIS
+                    # file only. Parse the module again under a name unique to
+                    # this importer, then point this file's references at it.
+                    # Other importers are untouched and keep sharing the one
+                    # global instance.
+                    base_ns = os.path.splitext(os.path.basename(mod_file))[0].replace("-", "_")
+                    private_ns = f"{mod_name}__{base_ns}"
+                    parse_file(mod_path, parsed_files, combined_ast,
+                               mod_name_override=private_ns)
+                    for stmt in ast:
+                        _rebind_namespace(stmt, base_ns, private_ns)
+                    if getattr(node, 'alias', None):
+                        for stmt in ast:
+                            _rebind_namespace(stmt, node.alias, private_ns)
+                else:
+                    parse_file(mod_path, parsed_files, combined_ast)
             else:
                 alias_note = f" (alias: {node.alias})" if getattr(node, 'alias', None) else ""
                 print(f"\033[1;33mWARNING\033[0m: Import '{node.module_name}'{alias_note} "

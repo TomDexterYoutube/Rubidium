@@ -342,6 +342,8 @@ class Debugger:
         self._os_active     = set()   # open os.start(id) session ids — see OsStart/OsRun/OsDrop
         self._timers        = {}      # BUG-11: time.timer_start(id) state — see the time.* branch
         self._modules       = {}      # BUG-13: imported .rub namespaces — see _load_module
+        self._current_module = None   # module whose top level is running (None = main file)
+        self._indexed_links = {}      # BUG-24: `let y = link x(i)` -> (collection, key)
         self._ffi_libs      = {}      # BUG-14: handle name -> ctypes.CDLL
         self._ffi_fns       = {}      # BUG-14: Rubidium name -> {handle, symbol, params, ret}
         self._source_dir    = source_dir  # folder to resolve `import <file>` against
@@ -457,21 +459,28 @@ class Debugger:
             result = result.decode(errors='replace')
         return True, result
 
-    def _load_module(self, mod):
+    def _load_module(self, mod, instance_key=None):
         """BUG-13: load `<mod>.rub` from the importing file's folder, run its
         top level in an isolated scope, and return a namespace object holding
         its variables, functions and classes. Returns None when there is no
         such file (an unknown import is the analyzer's job to report, not the
         debug run's job to crash on). Imports are cached and re-entrant-safe,
-        so a cycle can't recurse forever."""
-        if mod in self._modules:
-            return self._modules[mod]
+        so a cycle can't recurse forever.
+
+        `instance_key` selects WHICH instance to use. A plain `import` passes
+        the module name, so every importer resolves to one shared instance. An
+        `import local` passes a key unique to the importing file, giving that
+        file a private instance with its own independent variables (FEATURE:
+        import local)."""
+        key = instance_key or mod
+        if key in self._modules:
+            return self._modules[key]
         base = self._source_dir or os.getcwd()
         path = os.path.join(base, f"{mod}.rub")
         if not os.path.isfile(path):
             return None
         ns = {"__namespace__": mod, "vars": {}, "fns": {}, "classes": {}, "scope": None}
-        self._modules[mod] = ns          # cache first: breaks import cycles
+        self._modules[key] = ns          # cache first: breaks import cycles
         try:
             with open(path, 'r') as f:
                 src = f.read()
@@ -485,9 +494,13 @@ class Debugger:
         # files are isolated through namespaces").
         saved_scope, saved_root = self.scope, self._root_scope
         saved_fns, saved_classes = self._fn_defs, self._class_defs
+        saved_current = self._current_module
         mod_scope = Scope()
         self.scope = self._root_scope = mod_scope
         self._fn_defs, self._class_defs = {}, {}
+        # A nested `import local` inside this module must key its private
+        # instance off THIS module, not off whoever imported it.
+        self._current_module = key
         try:
             for n in nodes:
                 try:
@@ -503,6 +516,7 @@ class Debugger:
         finally:
             self.scope, self._root_scope = saved_scope, saved_root
             self._fn_defs, self._class_defs = saved_fns, saved_classes
+            self._current_module = saved_current
         return ns
 
     def _namespace_of(self, node):
@@ -515,11 +529,39 @@ class Debugger:
             return value
         return None
 
+    def _ns_var_entry(self, ns, name):
+        """BUG-21: the scope entry for `ns.name` when it is a module VARIABLE
+        rather than a function. Functions win the name."""
+        if ns is None or name in ns["fns"]:
+            return None
+        return ns["vars"].get(name)
+
     def _call_namespaced(self, ns, name, arg_nodes):
         """Call `ns.name(...)`. The module's own functions and classes must be
         visible while its body runs, so swap them in for the duration."""
         fn = ns["fns"].get(name)
         if fn is None:
+            # BUG-21: `helper.shared_list(0)` is not a call at all — it is
+            # indexed access into the module's collection, which parses
+            # identically to a method call. Resolve it against the module's
+            # variables before giving up.
+            entry = self._ns_var_entry(ns, name)
+            if entry is not None:
+                value = entry.get("value")
+                for a in arg_nodes:
+                    key = self.evaluate(a)
+                    try:
+                        if isinstance(value, list):
+                            value = value[int(key)]
+                        elif isinstance(value, dict):
+                            value = value[key]
+                        else:
+                            return value
+                    except (IndexError, KeyError, TypeError, ValueError):
+                        self.error(f"collection access error on "
+                                   f"'{ns['__namespace__']}.{name}'")
+                        return None
+                return value
             self.error(f"Unknown function '{ns['__namespace__']}.{name}()'")
             return None
         # Arguments are evaluated in the CALLER's scope, before switching.
@@ -625,8 +667,42 @@ class Debugger:
             # then `x(0).set(99)` never showed up through `y`. Alias
             # collections the exact same way as scalars (share the info
             # dict) instead of special-casing them out.
-            if isinstance(node.value, ast.LinkArg) and isinstance(node.value.expr, ast.Var):
-                target_info = self.scope.lookup(node.value.expr.name)
+            if isinstance(node.value, ast.LinkArg):
+                target_info = None
+                expr = node.value.expr
+                if isinstance(expr, ast.Var):
+                    target_info = self.scope.lookup(expr.name)
+                elif isinstance(expr, (ast.FnCall, ast.MethodCall)) and getattr(expr, 'args', None):
+                    # BUG-24: `link x(i)` / `link mod.x(i)` — link to one
+                    # element. Resolve the collection now, remember the key,
+                    # and read through it on every access (see ast.Var above).
+                    coll = None
+                    if isinstance(expr, ast.FnCall) and isinstance(expr.name, str):
+                        coll = self._resolve_collection_for_mutation(expr.name)
+                    else:
+                        coll = self._resolve_ns_collection(expr)
+                    if isinstance(coll, (list, dict)):
+                        key = self.evaluate(expr.args[0])
+                        target = self.scope if node.is_local else self._root_scope
+                        try:
+                            cur = coll[int(key)] if isinstance(coll, list) else coll[key]
+                        except (IndexError, KeyError, TypeError, ValueError):
+                            cur = None
+                        target.declare(node.name, {
+                            "value": cur, "type": node.vtype or self.rub_type(cur),
+                            "mutable": node.mutable, "dropped": False, "line": self.line,
+                        })
+                        self._indexed_links[node.name] = (coll, key)
+                        return
+                elif isinstance(expr, ast.FieldAccess):
+                    # BUG-22: `link helper.shared_num` — a link INTO an
+                    # imported module. Only plain Var targets were recognised,
+                    # so a cross-file link silently became a one-off copy that
+                    # never tracked the module's later changes. Share the
+                    # module's own scope entry, exactly as a same-file link
+                    # shares the target's entry.
+                    ns = self._namespace_of(expr.obj)
+                    target_info = self._ns_var_entry(ns, expr.field)
                 if target_info is not None:
                     target = self.scope if node.is_local else self._root_scope
                     target.declare(node.name, target_info)
@@ -711,6 +787,20 @@ class Debugger:
 
         # ── Field Assignment ──────────────────────────────────────────────────
         elif isinstance(node, ast.FieldAssign):
+            # BUG-23: `helper.shared_num = 42` — assigning to an imported
+            # module's variable. `helper` evaluates to the namespace object, so
+            # the generic dict write below would have set a KEY on the
+            # namespace instead of updating the module's variable, leaving the
+            # module's own state (and anything linked to it) unchanged.
+            ns = self._namespace_of(node.obj) if hasattr(node, 'obj') else None
+            entry = self._ns_var_entry(ns, node.field) if ns is not None else None
+            if entry is not None:
+                if not entry.get("mutable", False):
+                    self.error(f"Cannot modify '{ns['__namespace__']}.{node.field}': "
+                               f"not declared 'mut'")
+                    return
+                entry["value"] = self._deep_copy_value(self.evaluate(node.value))
+                return
             obj = self.evaluate(node.obj) if hasattr(node, 'obj') else None
             if isinstance(obj, dict):
                 val = self.evaluate(node.value)
@@ -881,7 +971,15 @@ class Debugger:
             # ARE compiler-provided modules with no file behind them.
             value = None
             if isinstance(node, ast.Import):
-                value = self._load_module(mod)
+                # FEATURE (`import local`): a private instance for this file
+                # only. Keyed by the importing file so two different files each
+                # asking for a local copy get two independent instances, and
+                # neither disturbs the shared one.
+                if getattr(node, 'is_local', False):
+                    owner = self._current_module or "__main__"
+                    value = self._load_module(mod, instance_key=f"{owner}__{mod}")
+                else:
+                    value = self._load_module(mod)
             if value is None:
                 value = {"__module__": mod}
             self.scope.declare(mod, {"value": value, "type": "module",
@@ -1119,6 +1217,16 @@ class Debugger:
             if info.get("dropped"):
                 self.error(f"Variable '{node.name}' used after drop")
                 return None
+            # BUG-24: `let y = link x(i)` links to an ELEMENT. A Python int is
+            # immutable, so the value can't be aliased the way a collection
+            # can — resolve through the collection on every read instead, so
+            # the link tracks later changes the way the compiled binary does.
+            if node.name in self._indexed_links:
+                coll, key = self._indexed_links[node.name]
+                try:
+                    return coll[int(key)] if isinstance(coll, list) else coll[key]
+                except (IndexError, KeyError, TypeError, ValueError):
+                    return info["value"]
             return info["value"]
 
         if isinstance(node, ast.DynResolve):
@@ -1663,7 +1771,14 @@ class Debugger:
                 # the ELEMENT and then "set" it on that copy — a silent no-op.
                 # (.add() happened to work because p.scores() evaluates to the
                 # live list itself.) Resolve the field to the live collection.
-                col = self._resolve_instance_field(node.obj)
+                # BUG-21: `helper.shared_list(0).set(50)` — mutating an
+                # imported module's collection. Resolve the namespace to the
+                # module's live variable first; otherwise this fell through to
+                # the generic path and "set" a copy of the element, silently
+                # leaving the module untouched.
+                col = self._resolve_ns_collection(node.obj)
+                if col is None:
+                    col = self._resolve_instance_field(node.obj)
                 fname = f"{getattr(node.obj.obj, 'name', '?')}.{node.obj.method}"
             if col is not None:
                 idx_args = [self.evaluate(a) for a in node.obj.args]
@@ -1722,6 +1837,19 @@ class Debugger:
                 info["value"] = result
 
         return result
+
+    def _resolve_ns_collection(self, mcall):
+        """BUG-21: the live collection behind `<ns>.<var>` for an imported
+        module, so mutations land on the module's own data. None when this
+        isn't a namespaced variable access."""
+        if not isinstance(mcall, ast.MethodCall):
+            return None
+        ns = self._namespace_of(mcall.obj)
+        entry = self._ns_var_entry(ns, mcall.method)
+        if entry is None:
+            return None
+        value = entry.get("value")
+        return value if isinstance(value, (list, dict)) else None
 
     def _resolve_instance_field(self, mcall):
         """BUG-10: for `p.scores(0)` (a MethodCall whose `method` is really a

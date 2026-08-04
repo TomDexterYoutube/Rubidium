@@ -205,9 +205,13 @@ class ThreadRunning:
         self.thread_id = thread_id
 
 class Import:
-    def __init__(self, module_name, alias=None, is_xeon_pkg=False):
+    def __init__(self, module_name, alias=None, is_xeon_pkg=False, is_local=False):
         self.module_name = module_name
         self.alias = alias          # e.g.  import math_tools as mt  →  alias="mt"
+        # `import local X` — this file gets its OWN private instance of X,
+        # independent of every other importer's. A plain `import X` shares one
+        # single instance across the whole program (see MODULES & IMPORTS).
+        self.is_local = is_local
         self.is_xeon_pkg = is_xeon_pkg  # True for `xeon math_tools` (installed package,
                                          # resolved from ~/.xeon/packages/ instead of a relative path)
 

@@ -177,6 +177,12 @@ class Parser:
 
     def import_stmt(self, is_xeon_pkg=False):
         self.match("XEON" if is_xeon_pkg else "IMPORT")
+        # `import local X` — a private, per-importer instance of the module
+        # (mirrors `let local`: global by default, `local` for your own copy).
+        is_local = False
+        if not is_xeon_pkg and self.peek() and self.peek()[0] == "LOCAL":
+            self.match("LOCAL")
+            is_local = True
         # For xeon packages, allow hyphens in package names (e.g. config-wiz)
         if is_xeon_pkg:
             # Build package name allowing hyphens
@@ -197,7 +203,7 @@ class Parser:
         if self.peek() and self.peek()[0] == "AS":
             self.match("AS")
             alias = self.match("IDENT")
-        return Import(name, alias=alias, is_xeon_pkg=is_xeon_pkg)
+        return Import(name, alias=alias, is_xeon_pkg=is_xeon_pkg, is_local=is_local)
 
     def use_stmt(self):
         self.match("USE")

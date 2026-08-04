@@ -928,6 +928,36 @@ let y = link x(2)
 let x = [1, 2, 3]
 let y = link x
 
+# -----------------------------------------
+# LINK ACROSS FILES
+# -----------------------------------------
+
+# link works through a namespace exactly as it does inside one file.
+# It links to whichever INSTANCE that namespace refers to, so a plain
+# import links to the shared one and an 'import local' links to that
+# file's private one (see SHARED VS LOCAL IMPORTS).
+
+import helper
+
+let mut view = link helper.shared_list   # link a module's collection
+let s        = link helper.shared_num    # link a module's scalar
+let el       = link helper.shared_list(2)  # link one element of it
+
+# All three track the module's later changes:
+
+helper.shared_num = 42
+print(s)                 # 42
+
+# A module's variable can also be passed by link into another module:
+
+helper.append_to(link my_list)
+
+# Editing a linked collection still needs 'mut' on the linked name,
+# the same rule as any other collection:
+
+let mut editable = link helper.shared_list
+editable().add(9)
+
 # =========================================
 # ERROR HANDLING
 # =========================================
@@ -1427,6 +1457,53 @@ math_tools.sin(0.5)
 
 # Alias names only affect access.
 # They do not copy or duplicate the module.
+
+# =========================================
+# SHARED VS LOCAL IMPORTS
+# =========================================
+
+# A plain 'import' creates ONE shared instance of that module for the whole
+# program. The module's file is loaded once, and every file that imports it
+# sees the same variables — exactly like a normal global.
+
+# main.rub
+import file_one
+import file_two
+
+# file_two.rub
+import file_one
+
+# Here file_one exists once. If main.rub changes file_one's state, file_two
+# sees that change, and the other way round — they are the same variable.
+
+file_one.bump()          # main.rub
+print(file_one.count)    # 1
+print(file_two.read())   # 1  — file_two reads the same file_one
+
+# 'import local' gives the importing file its OWN private instance instead.
+# The module is loaded again under that file alone, with its own independent
+# copy of every variable. This mirrors 'let' vs 'let local': shared by
+# default, 'local' when you want your own.
+
+# file_two.rub
+import local file_one
+
+# Now file_two has a file_one that is completely separate from main's.
+
+file_one.bump()          # main.rub — affects main's instance only
+print(file_one.count)    # 1
+print(file_two.read())   # 0  — file_two's own instance is untouched
+
+# Rules:
+# - 'import x'        — one instance shared by every file that imports it
+# - 'import local x'  — a private instance belonging to this file only
+# - Two different files that each use 'import local x' get two separate
+#   instances, and neither affects the shared one.
+# - A local instance runs the module's top level for itself, so it starts
+#   from the module's initial values.
+# - Aliases work the same way: 'import local file_one as fo'
+
+import local math_tools as mt
 
 # =========================================
 # MAIN ENTRY POINT

@@ -195,6 +195,7 @@ class CodeGen:
         self._file_handle_vars = {}     # var_name -> slot_int while inside an open() block
         # import alias map: alias_name -> module_prefix (e.g. "mt" -> "math_tools")
         self.import_aliases = import_aliases or {}
+        self._all_global_names = set()   # BUG-21: filled at the top of gen()
         # Tracks the IR return type of the function currently being emitted;
         # used by the Return handler to avoid type mismatches when ret_type is None.
         self._cur_fn_ret_ir: str = "i64"
@@ -601,6 +602,17 @@ class CodeGen:
                 walk(m.body, cls, seen)
 
     def gen(self, stmts):
+        # BUG-21: the set of every top-level variable name in the merged
+        # program, collected BEFORE anything else runs. Type inference happens
+        # in a prescan, at which point self.global_vars is still empty — so
+        # _ns_global_name could not tell that `helper.shared_list` names an
+        # imported module's VARIABLE rather than a method, and indexed access
+        # into a module collection failed to compile.
+        self._all_global_names = {
+            s2.name for s2 in stmts
+            if isinstance(s2, VarDecl) and not getattr(s2, 'is_local', False)
+        }
+
         # BUGFIX (bugs.log #2): top-level functions and classes were being
         # registered by blindly overwriting self.functions[name] /
         # self.class_defs[name], so a duplicate `fn foo()` or `class Foo()`
@@ -972,7 +984,14 @@ class CodeGen:
                 if target_name in self.functions:
                     fn_obj = self.functions[target_name]
                     return self.rubi_type_to_ir(fn_obj.ret_type) if fn_obj.ret_type else "i64"
-            
+
+            # BUG-21: `helper.shared_list(2)` — an ELEMENT of an imported
+            # module's collection. Not a method call at all; the module's
+            # variable is the merged global, and an element read out of it is
+            # a boxed value like any other collection element.
+            if self._ns_global_name(node) is not None:
+                return "%Box*"
+
             raise RubidiumNameError(f"Cannot infer type for method call '{node.method}' on object '{obj_name}'")
 
         if isinstance(node, OsRun):
@@ -1418,6 +1437,11 @@ class CodeGen:
             # _deep_copy_if_var). Register b as an alias of a instead of giving
             # it its own storage, so get_var_ptr("b") transparently resolves to
             # a's real pointer and every future read of b sees a's live value.
+            # BUG-22: rewrite a namespaced link target into the merged global
+            # it actually refers to, so the two branches below recognise it.
+            if isinstance(node.value, LinkArg):
+                node.value.expr = self._ns_link_target(node.value.expr)
+
             if isinstance(node.value, LinkArg) and isinstance(node.value.expr, Var):
                 target_name = node.value.expr.name
                 target_t = self._infer_type(node.value.expr)
@@ -1866,7 +1890,7 @@ class CodeGen:
     def emit_element_drop(self, node):
         """items(1).drop() — remove element/key at the given index/key and
         shift, per spec (does NOT replace with Null, unlike .set(Null))."""
-        access_node = node.access_node
+        access_node = self._normalize_ns_access(node.access_node)        # BUG-21
         keys = []
         curr = access_node
         while isinstance(curr, (FnCall, MethodCall)):
@@ -1971,6 +1995,61 @@ class CodeGen:
         self._emit_raise_or_propagate(err_ptr)
         self.emit(f"{ok_l}:")
 
+    def _ns_global_name(self, node):
+        """BUG-21: `helper.shared_list` names an imported module's VARIABLE, but
+        with arguments it parses as a MethodCall — indistinguishable from a
+        method call. Return the merged global name (`helper_shared_list`) when
+        that is what this really is, else None. Functions win: a module
+        function of the same name is resolved before this is consulted."""
+        if not isinstance(node, MethodCall) or not isinstance(node.obj, Var):
+            return None
+        ns = self.import_aliases.get(node.obj.name, node.obj.name)
+        merged = f"{ns}_{node.method}"
+        if merged in self.functions:
+            return None
+        if merged in self.global_vars:
+            return merged
+        # Prescan (type inference) runs before global_vars is filled — fall
+        # back to the names gathered up front in gen().
+        if merged in getattr(self, '_all_global_names', ()):
+            return merged
+        return None
+
+    def _ns_link_target(self, expr):
+        """BUG-22: resolve the target of a `link` that points into an imported
+        module, so cross-file links register the same way same-file ones do.
+
+          link helper.shared_num      -> Var("helper_shared_num")
+          link helper.shared_list(2)  -> FnCall("helper_shared_list", [2])
+
+        The link machinery only recognised Var / FnCall targets, so these
+        namespaced forms silently fell through to a plain copy: the linked
+        name held the value at link time and never tracked later changes."""
+        if isinstance(expr, FieldAccess) and isinstance(expr.obj, Var):
+            ns = self.import_aliases.get(expr.obj.name, expr.obj.name)
+            merged = f"{ns}_{expr.field}"
+            if merged not in self.functions and (
+                    merged in self.global_vars or merged in getattr(self, '_all_global_names', ())):
+                return Var(merged)
+        if isinstance(expr, MethodCall):
+            merged = self._ns_global_name(expr)
+            if merged is not None:
+                return FnCall(merged, expr.args)
+        return expr
+
+    def _normalize_ns_access(self, node):
+        """Rewrite `<ns>.<var>(...)` into a plain collection access on the
+        merged global, so every existing read/mutate path handles a module's
+        collection exactly like a local one. Without this, indexed reads
+        reported "Undefined variable 'helper'" and mutations reported
+        "Cannot modify 'helper'" — both because the walk that finds the base of
+        a chained access stopped at the NAMESPACE (`helper`) instead of the
+        variable it qualifies."""
+        merged = self._ns_global_name(node)
+        if merged is not None:
+            return FnCall(merged, node.args)
+        return node
+
     def emit_guarded_collection_get(self, col_b, key_b, err_msg="collection access error",
                                     copy=False):
         """Emit a collection_get with a null-check guard; catch-or-propagate (OPEN-7).
@@ -1995,7 +2074,7 @@ class CodeGen:
         return res
 
     def emit_collection_set(self, method_call_node):
-        access_node = method_call_node.obj
+        access_node = self._normalize_ns_access(method_call_node.obj)   # BUG-21
         val_node = method_call_node.args[0]
         
         # Handle MethodCall on class instances where method is actually a field (e.g., p.scores(0).set(99))
@@ -2102,7 +2181,7 @@ class CodeGen:
         return "0", "i64"
 
     def emit_collection_add(self, method_call_node):
-        access_node = method_call_node.obj
+        access_node = self._normalize_ns_access(method_call_node.obj)    # BUG-21
         val_nodes = method_call_node.args
         
         # Handle MethodCall on class instances where method is actually a field (e.g., p.scores().add(50))
@@ -2339,6 +2418,20 @@ class CodeGen:
 
     def emit_field_assign(self, node):
         obj_name = node.obj.name if hasattr(node.obj, 'name') else node.obj
+        # BUG-23: `helper.shared_num = 42` — assigning to an imported module's
+        # variable. `helper` is a namespace, not a class instance, so this fell
+        # straight through the `not in self.instances` return below and the
+        # assignment was SILENTLY DISCARDED: no error, no write, the module's
+        # value simply never changed. Route it through the normal assignment
+        # path on the merged global, which brings the mutability check,
+        # deep-copy semantics and link-unlinking with it.
+        if obj_name not in self.instances and isinstance(node.obj, Var):
+            ns = self.import_aliases.get(obj_name, obj_name)
+            merged = f"{ns}_{node.field}"
+            if merged not in self.functions and (
+                    merged in self.global_vars or merged in getattr(self, '_all_global_names', ())):
+                self.emit_stmt(Assign(merged, node.value))
+                return
         if obj_name not in self.instances: return
         class_name = self.instances[obj_name]
 
@@ -4284,6 +4377,13 @@ class CodeGen:
             # Resolve import alias (e.g. 'mt' -> 'math_tools') before building target name
             resolved_name = self.import_aliases.get(obj_name, obj_name)
             target_name = f"{resolved_name}_{node.method}"
+            # BUG-21: `helper.shared_list(0)` — indexed access into an imported
+            # module's collection. Checked AFTER the function lookup below, so
+            # a module function always wins the name.
+            if target_name not in self.functions:
+                merged = self._ns_global_name(node)
+                if merged is not None:
+                    return self.emit_call_expr(FnCall(merged, node.args))
             if target_name in self.functions:
                 fn_obj = self.functions[target_name]
                 # OPEN-12: coerce each arg to the callee's declared param type
