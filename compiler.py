@@ -1515,6 +1515,53 @@ static void _exe_dir(char* out, size_t out_sz) {
     if(slash) *slash = '\0'; else out[0] = '\0';
 }
 // Load a shared library, return a slot index (used as the "handle" in Rubidium)
+// BUG-25: resolve a bare, UNVERSIONED library name to the versioned soname
+// actually installed on the system. `FFI("libglfw.so")` is the natural thing
+// to write, but the plain "libglfw.so" name only exists if the distro's -dev
+// package is installed — a normal runtime install ships only "libglfw.so.3".
+// dlopen() does NOT do this fallback itself, so the load failed and every
+// call through that handle silently returned 0 (a window that never opened,
+// with no error at the call site). Scan the standard library directories for
+// "<name>.<version>" and use the highest version found — the same thing the
+// -dev symlink would have pointed at.
+static int _ffi_version_rank(const char* suffix) {
+    // "3" -> 3, "3.3" -> 3, anything non-numeric -> -1 (not a version)
+    if(!*suffix) return -1;
+    int major = 0, seen = 0;
+    for(const char* p = suffix; *p; p++) {
+        if(*p >= '0' && *p <= '9') { major = major * 10 + (*p - '0'); seen = 1; }
+        else if(*p == '.') break;
+        else return -1;
+    }
+    return seen ? major : -1;
+}
+
+static void* _ffi_try_versioned(const char* name) {
+    static const char* dirs[] = {
+        "/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu",
+        "/lib64", "/usr/lib64", "/lib", "/usr/lib", "/usr/local/lib", NULL
+    };
+    size_t nlen = strlen(name);
+    char best[4096]; best[0] = '\0';
+    int best_rank = -1;
+    for(int d = 0; dirs[d]; d++) {
+        DIR* dp = opendir(dirs[d]);
+        if(!dp) continue;
+        struct dirent* ent;
+        while((ent = readdir(dp))) {
+            if(strncmp(ent->d_name, name, nlen) != 0) continue;
+            if(ent->d_name[nlen] != '.') continue;          // need "<name>.<something>"
+            int rank = _ffi_version_rank(ent->d_name + nlen + 1);
+            if(rank < 0 || rank <= best_rank) continue;
+            best_rank = rank;
+            snprintf(best, sizeof(best), "%s/%s", dirs[d], ent->d_name);
+        }
+        closedir(dp);
+    }
+    if(best[0]) return dlopen(best, RTLD_LAZY | RTLD_LOCAL);
+    return NULL;
+}
+
 long long ffi_load(const char* path) {
     void* h = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
     if(!h && !strchr(path, '/')) {
@@ -1524,7 +1571,19 @@ long long ffi_load(const char* path) {
             char candidate[4096];
             snprintf(candidate, sizeof(candidate), "%s/lib/%s", exe_dir, path);
             h = dlopen(candidate, RTLD_LAZY | RTLD_LOCAL);
+            // BUG-25: also look right NEXT TO the binary. The bundler copies
+            // src/**.so into the build dir preserving its path under src/, so
+            // a lib at src/foo.so lands at build/foo.so — which the lib/
+            // candidate above would never find.
+            if(!h) {
+                snprintf(candidate, sizeof(candidate), "%s/%s", exe_dir, path);
+                h = dlopen(candidate, RTLD_LAZY | RTLD_LOCAL);
+            }
         }
+    }
+    // BUG-25: last resort for a bare name — find the installed versioned soname.
+    if(!h && !strchr(path, '/')) {
+        h = _ffi_try_versioned(path);
     }
     if(!h) {
         fprintf(stderr, "[FFI] dlopen failed: %s\n", dlerror());

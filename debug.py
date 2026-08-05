@@ -410,19 +410,80 @@ class Debugger:
         return getattr(ctypes, self._FFI_CTYPES.get(rub_type or 'i64', 'c_longlong'))
 
     def _ffi_open(self, path):
-        """dlopen a shared library, mirroring the runtime's search order:
-        the path as given, then relative to the source folder."""
+        """dlopen a shared library, mirroring the compiled runtime's search
+        order exactly (see ffi_load in compiler.py):
+          1. the path as given
+          2. next to / under the build output, and the source folder
+          3. BUG-25: for a bare name, the versioned soname actually installed
+             — `FFI("libglfw.so")` must find libglfw.so.3, since the
+             unversioned name only exists when the distro's -dev package is.
+        """
         import ctypes
         path = str(path)
         candidates = [path]
         if self._source_dir and not os.path.isabs(path):
-            candidates.append(os.path.join(self._source_dir, path))
+            base = self._source_dir
+            candidates += [
+                os.path.join(base, path),
+                os.path.join(base, "lib", path),
+                os.path.join(base, "build", path),
+                os.path.join(base, "build", "lib", path),
+                os.path.join(os.path.dirname(base), "build", path),
+                os.path.join(os.path.dirname(base), "build", "lib", path),
+            ]
         for cand in candidates:
             try:
                 return ctypes.CDLL(cand)
             except OSError:
                 continue
+        if "/" not in path:
+            versioned = self._ffi_find_versioned(path)
+            if versioned:
+                try:
+                    return ctypes.CDLL(versioned)
+                except OSError:
+                    pass
+            # Last resort: the system's own resolver, which is what a linker
+            # would use (`libglfw.so` -> whatever ldconfig knows about).
+            bare = re.sub(r'\.so(\.\d+)*$', '', path)
+            for suffix in ('.dll', '.dylib'):
+                if bare.endswith(suffix):
+                    bare = bare[: -len(suffix)]
+                    break
+            lookup = bare[3:] if bare.startswith('lib') else bare
+            try:
+                import ctypes.util
+                found = ctypes.util.find_library(lookup)
+                if found:
+                    return ctypes.CDLL(found)
+            except OSError:
+                pass
+            except Exception:
+                pass
         return None
+
+    @staticmethod
+    def _ffi_find_versioned(name):
+        """BUG-25: highest-versioned `<name>.<n>` in the standard library
+        directories — the same scan the compiled runtime does."""
+        dirs = ("/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu",
+                "/lib64", "/usr/lib64", "/lib", "/usr/lib", "/usr/local/lib")
+        best, best_rank = None, -1
+        for d in dirs:
+            try:
+                entries = os.listdir(d)
+            except OSError:
+                continue
+            for ent in entries:
+                if not ent.startswith(name + "."):
+                    continue
+                m = re.match(r'^(\d+)', ent[len(name) + 1:])
+                if not m:
+                    continue
+                rank = int(m.group(1))
+                if rank > best_rank:
+                    best, best_rank = os.path.join(d, ent), rank
+        return best
 
     def _ffi_invoke(self, name, arg_values):
         """Call a bound foreign symbol. Returns (True, result) when `name` is
