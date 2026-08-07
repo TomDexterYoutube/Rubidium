@@ -69,6 +69,36 @@ declare void @box_drop(%Box*)
 declare void @collection_drop(%Box*, %Box*)
 declare void @rub_throw(i8*)
 declare void @rub_overflow_check(i32, i8*)
+; BUG (found via syntax sweep): the ONLY existing overflow check lived in the
+; NARROWING half of coerce() (e.g. i64 -> i32), which only ever ran when a
+; literal happened to force implicit widening followed by narrowing back down
+; at an assignment. Ordinary same-typed arithmetic (`x + y` for two i32
+; variables, or arithmetic already at the widest type in play, e.g.
+; i128 + i128) had NO overflow protection at all and silently WRAPPED —
+; confirmed empirically, directly contradicting the spec's explicit "does not
+; wrap around" guarantee. These give emit_binop's arithmetic path (not just
+; coerce()'s narrowing path) real overflow detection for +, -, *.
+declare { i32, i1 } @llvm.sadd.with.overflow.i32(i32, i32)
+declare { i32, i1 } @llvm.ssub.with.overflow.i32(i32, i32)
+declare { i32, i1 } @llvm.smul.with.overflow.i32(i32, i32)
+declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)
+declare { i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)
+declare { i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)
+declare { i128, i1 } @llvm.sadd.with.overflow.i128(i128, i128)
+declare { i128, i1 } @llvm.ssub.with.overflow.i128(i128, i128)
+declare { i128, i1 } @llvm.smul.with.overflow.i128(i128, i128)
+declare { i256, i1 } @llvm.sadd.with.overflow.i256(i256, i256)
+declare { i256, i1 } @llvm.ssub.with.overflow.i256(i256, i256)
+declare { i256, i1 } @llvm.smul.with.overflow.i256(i256, i256)
+declare { i512, i1 } @llvm.sadd.with.overflow.i512(i512, i512)
+declare { i512, i1 } @llvm.ssub.with.overflow.i512(i512, i512)
+declare { i512, i1 } @llvm.smul.with.overflow.i512(i512, i512)
+declare { i1024, i1 } @llvm.sadd.with.overflow.i1024(i1024, i1024)
+declare { i1024, i1 } @llvm.ssub.with.overflow.i1024(i1024, i1024)
+declare { i1024, i1 } @llvm.smul.with.overflow.i1024(i1024, i1024)
+declare { i2048, i1 } @llvm.sadd.with.overflow.i2048(i2048, i2048)
+declare { i2048, i1 } @llvm.ssub.with.overflow.i2048(i2048, i2048)
+declare { i2048, i1 } @llvm.smul.with.overflow.i2048(i2048, i2048)
 declare %Box* @rub_dynvar_get(i8*)
 declare void @rub_dynvar_set(i8*, %Box*)
 declare %Box* @box_add(%Box*, %Box*)
@@ -458,6 +488,13 @@ class CodeGen:
             if name not in self._alloca_emitted:
                 self.emit(f"  {ptr_str} = alloca {ir_t}")
                 self._alloca_emitted.add(name)
+                # bugs.log OPEN-J: now that it has real storage of its own
+                # (no longer aliasing the link target's flag), give it a
+                # companion is-null cell like any other freshly-declared
+                # scalar — get_null_flag_ptr() would otherwise report this
+                # name as tagged (linked_to no longer excludes it, just
+                # removed above) without a flag ever having been allocated.
+                self._emit_null_flag_decl(name, ir_t, is_local=True)
             return ptr_str, ir_t
         # Global scope — emit the `@name = global ...` decl directly (can't
         # use declare_global(), which no-ops because we already registered
@@ -472,6 +509,7 @@ class CodeGen:
                 self.global_decls.append(f"@{name} = global {ir_t} 0.0")
             else:
                 self.global_decls.append(f"@{name} = global {ir_t} 0")
+            self._emit_null_flag_decl(name, ir_t, is_local=False)  # bugs.log OPEN-J, see note above
         return f"@{name}", ir_t
 
     def declare_global(self, name, ir_type):
@@ -677,6 +715,7 @@ class CodeGen:
             "declare i32 @scanf(i8*, ...)", "declare i8* @fgets(i8*, i32, i8*)",
             "declare i8* @strcpy(i8*, i8*)", "declare i32 @strcmp(i8*, i8*)",
             "declare i8* @strcat(i8*, i8*)", "declare i8* @strstr(i8*, i8*)",
+            "declare i8* @rub_strdup_safe(i8*)",  # BUG: str variable-to-variable assignment aliasing
             "declare i8* @strncpy(i8*, i8*, i64)",
             "declare i8* @str_replace(i8*, i8*, i8*)",
             "declare %Box* @str_slice(i8*)",
@@ -813,6 +852,101 @@ class CodeGen:
         else:
             self.null_valued.discard(name)
 
+    # ---------------------------------------------------------------
+    # bugs.log OPEN-J: real RUNTIME Null tagging for local/global scalars
+    # ---------------------------------------------------------------
+    # self.null_valued (above) is compile-time-only and provably-null-only —
+    # it can't tell a genuinely-Null value apart from one that merely
+    # overflow-clamped to the same sentinel bit pattern in every case (that
+    # collision is OPEN-J itself), and it loses track of a var's Null-ness
+    # across any branch (confirmed by testing: a var set to Null on only one
+    # side of an if/else is never in null_valued afterward, regardless of
+    # which side actually ran). Phase 1 gives every plain `let`-declared
+    # local/global SCALAR variable a real companion `i1` cell alongside its
+    # value storage, updated on every write and consulted by comparisons/
+    # print/`as str` instead of the sentinel bits. Deliberately NOT extended
+    # to function parameters, return values, class fields, or `link`ed/
+    # indexed names — propagating the tag across a call boundary means
+    # widening every user function's LLVM signature, a separate, much
+    # larger change (see bugs.log OPEN-J Phase 2). Untagged names simply
+    # return None here and every call site below falls back to exactly
+    # today's behavior for them — this is strictly additive, never a
+    # regression.
+    _NULL_TAG_C_LIB_FUNCS = {"pow", "sin", "cos", "tan", "sqrt", "log", "log10", "exp", "fabs", "floor", "ceil", "round"}
+
+    def _is_null_taggable_ir(self, ir_t):
+        return ir_t in self._INT_IR_SET or ir_t in self._FLOAT_IR_SET
+
+    def get_null_flag_ptr(self, name):
+        """LLVM pointer string for `name`'s companion is-null i1 cell, or
+        None if `name` isn't a currently-in-scope scalar local/global that
+        actually has one declared (untagged: params, class fields, loop
+        vars, linked/indexed names — see the note above). Checking ONLY
+        scope membership + a taggable IR type is not enough: loop variables
+        and function parameters are ALSO registered straight into
+        local_vars_stack with a scalar type, by code paths that never call
+        _emit_null_flag_decl — so this must check the flag was actually
+        emitted (via the same dedup bookkeeping _emit_null_flag_decl uses:
+        self._alloca_emitted for locals, self.global_decls for globals),
+        not just infer eligibility from type."""
+        if not isinstance(name, str) or "." in name:
+            return None
+        if name in self.linked_to or name in self.indexed_links:
+            return None
+        for scope in reversed(self.local_vars_stack):
+            if name in scope:
+                flag_key = f"{name}__isnull"
+                return f"%ptr_{name}__isnull" if flag_key in self._alloca_emitted else None
+        if self.cur_class and name != "error":
+            return None
+        mangled = f"_var_{name}" if name in self._NULL_TAG_C_LIB_FUNCS else name
+        gname = f"@{mangled}__isnull"
+        return gname if any(d.startswith(f"{gname} =") for d in self.global_decls) else None
+
+    def _emit_null_flag_decl(self, name, ir_t, is_local):
+        """Emit the companion `i1` alloca/global for a scalar VarDecl,
+        exactly once per its normal storage's own lifetime (mirrors the
+        alloca/declare_global dedup already used for the main value)."""
+        if not self._is_null_taggable_ir(ir_t):
+            return
+        flag_key = f"{name}__isnull"
+        if is_local:
+            if flag_key not in self._alloca_emitted:
+                self.emit(f"  %ptr_{name}__isnull = alloca i1")
+                self._alloca_emitted.add(flag_key)
+        else:
+            mangled = f"_var_{name}" if name in self._NULL_TAG_C_LIB_FUNCS else name
+            gname = f"@{mangled}__isnull"
+            if not any(d.startswith(f"{gname} =") for d in self.global_decls):
+                self.global_decls.append(f"{gname} = global i1 0")
+
+    def _emit_null_flag_store(self, name, value_node):
+        """Store this write's Null-ness into `name`'s companion flag. No-op
+        if `name` isn't tagged (untagged categories, or a non-scalar type)."""
+        ptr = self.get_null_flag_ptr(name)
+        if ptr is None:
+            return
+        if isinstance(value_node, None_):
+            flag_val = "1"
+        elif isinstance(value_node, Var):
+            src_ptr = self.get_null_flag_ptr(value_node.name)
+            if src_ptr is not None:
+                flag_val = self.new_tmp()
+                self.emit(f"  {flag_val} = load i1, i1* {src_ptr}")
+            else:
+                flag_val = "0"
+        else:
+            flag_val = "0"
+        self.emit(f"  store i1 {flag_val}, i1* {ptr}")
+
+    def _emit_null_flag_load(self, name):
+        """Load a tagged var's current is-null flag as a fresh i1 SSA temp.
+        Caller must already know get_null_flag_ptr(name) is not None."""
+        ptr = self.get_null_flag_ptr(name)
+        tmp = self.new_tmp()
+        self.emit(f"  {tmp} = load i1, i1* {ptr}")
+        return tmp
+
     def _check_index_values_are_scalar(self, dict_expr_node, var_name):
         """`index` is a key -> SINGLE SCALAR VALUE map (per the language
         owner) — never a list/index/dict/dict+. Rejects any pair whose value
@@ -844,8 +978,11 @@ class CodeGen:
             )
 
     def _deep_copy_if_var(self, val, val_t, source_node):
-        """Deep copy a %Box* value when the source is an existing variable (not a fresh allocation).
-        Called on VarDecl/Assign to implement the spec's 'every assignment creates a full deep copy' rule."""
+        """Deep copy a value when the source is an existing variable (not a
+        fresh allocation). Called on VarDecl/Assign to implement the spec's
+        'every assignment creates a full deep copy' / 'Rubidium does not use
+        references, borrowing, or shared ownership' rule (THE DEEP COPY RULE,
+        stated as a GENERAL rule, not scoped to collections)."""
         if val_t == "%Box*" and isinstance(source_node, Var):
             copied = self.new_tmp()
             tracked = self.new_tmp()
@@ -853,6 +990,42 @@ class CodeGen:
             # BUG-3: the fresh copy belongs to the current block until it is
             # bound somewhere longer-lived (which calls _escape_temp).
             self.emit(f"  {tracked} = call %Box* @rub_temp_track(%Box* {copied})")
+            return tracked
+        # BUG (found via syntax sweep): a `str`-typed variable's slot must
+        # always hold a buffer IT owns, because .drop() unconditionally
+        # frees whatever is in the slot. Three ways that used to not be true:
+        #
+        #  1. `let t = s` (Var source) — s and t ended up ALIASED, sharing
+        #     the exact same heap buffer. Directly violates THE DEEP COPY
+        #     RULE ("a and b are completely independent... does not use
+        #     references, borrowing, or shared ownership"), and is a real
+        #     heap-use-after-free the moment either side is .drop()'d:
+        #     confirmed under AddressSanitizer — `let t = s; s.drop();
+        #     print(t)` reads freed memory.
+        #
+        #  2. `let s = "literal"` (bare Str source) — emit_expr for a Str
+        #     node returns a pointer straight into the LITERAL'S STATIC
+        #     STORAGE (an LLVM global constant), never a heap allocation.
+        #     Confirmed under AddressSanitizer: even a SINGLE `.drop()` of a
+        #     variable still holding its original literal crashed with
+        #     "free(): invalid pointer" — free() on read-only static memory.
+        #
+        #  3. `let y = i"just text"` / `let y = i"{x}"` (InterpolatedStr
+        #     source) — the 0-part and 1-part cases take a shortcut that
+        #     returns a part's raw pointer directly (same static-storage
+        #     issue as #2 for a literal part, same aliasing issue as #1 if
+        #     the one part is itself a plain string variable read).
+        #
+        # strdup() in all three cases gives the target its own independent,
+        # owned buffer, exactly mirroring the %Box* branch above. Multi-part
+        # interpolation and string concatenation (BinOp `+`) are NOT covered
+        # here — both already build a fresh malloc'd buffer of their own, so
+        # copying again would just leak the original for no safety benefit.
+        if val_t == "i8*" and isinstance(source_node, (Var, Str, InterpolatedStr)):
+            copied = self.new_tmp()
+            tracked = self.new_tmp()
+            self.emit(f"  {copied} = call i8* @rub_strdup_safe(i8* {val})")
+            self.emit(f"  {tracked} = call i8* @rub_temp_track_str(i8* {copied})")
             return tracked
         return val
 
@@ -1518,6 +1691,7 @@ class CodeGen:
                 if first_decl:
                     self.emit(f"  {ptr_str} = alloca {ir_t}")
                     self._alloca_emitted.add(node.name)
+                    self._emit_null_flag_decl(node.name, ir_t, is_local=True)  # bugs.log OPEN-J
                 val, val_t = self.emit_expr(node.value)
                 # OPEN-10: deep-copy the %Box* BEFORE coercing, not after. The
                 # old order coerced first (e.g. %Box* -> i8* via unbox_s, which
@@ -1534,6 +1708,7 @@ class CodeGen:
                 if not (first_decl and node.is_local):
                     val = self._escape_temp(val, ir_t)
                 self.emit(f"  store {ir_t} {val}, {ir_t}* {ptr_str}")
+                self._emit_null_flag_store(node.name, node.value)  # bugs.log OPEN-J
                 return False
             if self.cur_fn is not None and self.cur_fn != "_rubidium_init" and self.cur_class is not None:
                 # Inside a class method — keep variables local (class instances isolate memory)
@@ -1621,6 +1796,7 @@ class CodeGen:
                 if first_decl:
                     self.emit(f"  {ptr_str} = alloca {ir_t}")
                     self._alloca_emitted.add(node.name)
+                    self._emit_null_flag_decl(node.name, ir_t, is_local=True)  # bugs.log OPEN-J
                 val, val_t = self.emit_expr(node.value)
                 # OPEN-10: copy the %Box* before coercing (see the detailed note
                 # at the is_local branch above — same stale-val_t bug otherwise).
@@ -1629,6 +1805,7 @@ class CodeGen:
                 if not (first_decl and node.is_local):
                     val = self._escape_temp(val, ir_t)
                 self.emit(f"  store {ir_t} {val}, {ir_t}* {ptr_str}")
+                self._emit_null_flag_store(node.name, node.value)  # bugs.log OPEN-J
                 if isinstance(node.value, FFILoad):
                     slot = f"@_ffi_slot_{node.name}"
                     # BUG-1 (RIG report): `d.startswith(slot)` is a substring
@@ -1669,6 +1846,7 @@ class CodeGen:
                 # Using a freshly-recomputed ir_t here instead would store using
                 # the wrong type/size against the real global, corrupting memory.
                 actual_t = self.global_vars.get(node.name, ir_t)
+                self._emit_null_flag_decl(node.name, actual_t, is_local=False)  # bugs.log OPEN-J
                 val, val_t = self.emit_expr(node.value)
                 # OPEN-10: copy the %Box* before coercing (see the detailed note
                 # at the is_local branch above — same stale-val_t bug otherwise).
@@ -1679,6 +1857,7 @@ class CodeGen:
                 val = self._escape_temp(val, actual_t)
                 ir_name = f"_var_{node.name}" if node.name in ("pow", "sin", "cos", "tan", "sqrt", "log", "log10", "exp", "fabs", "floor", "ceil", "round") else node.name
                 self.emit(f"  store {actual_t} {val}, {actual_t}* @{ir_name}")
+                self._emit_null_flag_store(node.name, node.value)  # bugs.log OPEN-J
                 if isinstance(node.value, FFILoad):
                     slot = f"@_ffi_slot_{node.name}"
                     # BUG-1 (RIG report): `d.startswith(slot)` is a substring
@@ -1751,7 +1930,8 @@ class CodeGen:
                 # block-scoped — that is what auto-drops locals at scope exit.)
                 val = self._escape_temp(val, ir_t)
                 self.emit(f"  store {ir_t} {val}, {ir_t}* {ptr_str}")
-                
+                self._emit_null_flag_store(node.name, node.value)  # bugs.log OPEN-J
+
         elif isinstance(node, FieldAssign): self.emit_field_assign(node)
         elif isinstance(node, Print): self.emit_print(node.value)
         elif isinstance(node, Println): self.emit_println(node.value)
@@ -1841,15 +2021,54 @@ class CodeGen:
                 # must forget it — otherwise the block-end release would free
                 # the same allocation a second time.
                 val = self._escape_temp(val, ir_t)
-                if ir_t == "%Box*": self.emit(f"  call void @box_drop(%Box* {val})")
-                elif ir_t == "i8*": self.emit(f"  call void @free(i8* {val})")
+                if ir_t in ("%Box*", "i8*"):
+                    # BUG (found via syntax sweep): dropping the SAME variable
+                    # a SECOND time used to call box_drop()/free() again on
+                    # the already-freed pointer — a real double-free /
+                    # use-after-free, confirmed under AddressSanitizer (a
+                    # `str` double-drop SEGV'd inside the allocator; a `list`
+                    # double-drop aborted with "double free detected"). Spec
+                    # already documents "Accessing dropped memory" as a
+                    # runtime error, so raise THAT (catchable via try/error)
+                    # instead of corrupting the heap: null the slot right
+                    # after freeing, and treat a null slot on entry as
+                    # already-dropped rather than re-freeing it.
+                    is_dropped = self.new_tmp()
+                    ok_l = self.new_label("dropok")
+                    err_l = self.new_label("dropped_err")
+                    err_lbl, err_len = self.intern_str(f"Accessing dropped memory: '{node.name}'")
+                    err_ptr = self.new_tmp()
+                    self.emit(f"  {is_dropped} = icmp eq {ir_t} {val}, null")
+                    self.emit(f"  br i1 {is_dropped}, label %{err_l}, label %{ok_l}")
+                    self.emit(f"{err_l}:")
+                    self.emit(f"  {err_ptr} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
+                    self._emit_raise_or_propagate(err_ptr)
+                    self.emit(f"{ok_l}:")
+                    if ir_t == "%Box*": self.emit(f"  call void @box_drop(%Box* {val})")
+                    else: self.emit(f"  call void @free(i8* {val})")
+                    self.emit(f"  store {ir_t} null, {ir_t}* {ptr_str}")
         elif isinstance(node, Break):
-            if self.loop_end_stack: self.emit(f"  br label %{self.loop_end_stack[-1]}")
+            # BUG (found via syntax sweep): `break` outside any loop used to
+            # silently emit NOTHING (the `if self.loop_end_stack:` guard just
+            # skipped it) while still telling emit_body this statement
+            # terminated the block (the unconditional `return True` below).
+            # That left the current LLVM basic block with no terminator at
+            # all — invalid IR, so the whole compile failed with an opaque
+            # clang-level error ("expected instruction opcode") instead of a
+            # clean Rubidium compile error. The debugger already treats this
+            # as invalid (an unhandled `_Break` when there's no enclosing
+            # loop); the compiler should reject it just as cleanly, and
+            # before ever reaching codegen for it.
+            if not self.loop_end_stack:
+                raise RubidiumTypeError("'break' used outside of a loop")
+            self.emit(f"  br label %{self.loop_end_stack[-1]}")
             return True
         elif isinstance(node, Continue):
+            # Same reasoning as Break above.
+            if not self.loop_cond_stack:
+                raise RubidiumTypeError("'continue' used outside of a loop")
             # Continue: branch to the loop condition (skip to end of current iteration)
-            if self.loop_cond_stack:
-                self.emit(f"  br label %{self.loop_cond_stack[-1]}")
+            self.emit(f"  br label %{self.loop_cond_stack[-1]}")
             return False
         elif isinstance(node, Try): self.emit_try(node)
         elif isinstance(node, ThreadCall):
@@ -2049,6 +2268,34 @@ class CodeGen:
         if merged is not None:
             return FnCall(merged, node.args)
         return node
+
+    def _emit_slot_bounds_check(self, id_v, slot_count, kind):
+        """BUG (found via syntax sweep): thread/timer/OS-session/FFI-handle
+        IDs all index directly into fixed `[N]`-element C arrays. Most of
+        those access sites already bounds-check (time_timer_*, os_start/
+        os_run/os(id).drop, ffi_sym — all guard `0 <= id < N` before
+        touching the array), but two thread-related ones did not:
+        `thread(fn(), id)`'s pthread_create write into _thread_handles[id],
+        and thread_result(id)'s read from _thread_results[id]. Confirmed
+        under AddressSanitizer: a large out-of-range id (e.g. 1000000)
+        segfaults outright; a moderately out-of-range one (e.g. 5000)
+        silently corrupts whatever OTHER global happens to sit past the end
+        of the array, with no crash and no diagnostic — worse than the
+        crash, since it fails silently. This guard makes those two sites
+        match every other slot-indexed subsystem: an out-of-range id raises
+        a clean, catchable runtime error instead of touching memory outside
+        the array."""
+        in_range = self.new_tmp()
+        ok_l = self.new_label("slotok")
+        err_l = self.new_label("slotrange")
+        self.emit(f"  {in_range} = icmp ult i64 {id_v}, {slot_count}")
+        self.emit(f"  br i1 {in_range}, label %{ok_l}, label %{err_l}")
+        self.emit(f"{err_l}:")
+        err_lbl, err_len = self.intern_str(f"{kind} ID out of range (must be 0-{slot_count - 1})")
+        err_ptr = self.new_tmp()
+        self.emit(f"  {err_ptr} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
+        self._emit_raise_or_propagate(err_ptr)
+        self.emit(f"{ok_l}:")
 
     def emit_guarded_collection_get(self, col_b, key_b, err_msg="collection access error",
                                     copy=False):
@@ -2507,12 +2754,38 @@ class CodeGen:
         # limit, not Null". Boxed Null (type==6) still prints "Null" via
         # print_boxed and is unaffected by this scalar-only path.
         if self._is_known_null(value):
-            nl_lbl, nl_len = self.intern_str("Null\n")
-            nptr = self.new_tmp()
-            self.emit(f"  {nptr} = getelementptr [{nl_len} x i8], [{nl_len} x i8]* {nl_lbl}, i64 0, i64 0")
-            self.emit(f"  call i32 (i8*, ...) @printf(i8* {nptr})")
-            self.emit(f"  call i32 @fflush(i8* null)")
+            self._emit_print_null_literal()
             return
+        # bugs.log OPEN-J: a runtime-tagged scalar local/global (one whose
+        # Null-ness the compiler can't prove at compile time — e.g. set on
+        # only one branch of an if/else) needs a REAL runtime check here,
+        # not just the compile-time _is_known_null() above. Untagged names
+        # (params/class fields/loop vars — Phase 2) fall through unchanged.
+        if isinstance(value, Var):
+            flag_ptr = self.get_null_flag_ptr(value.name)
+            if flag_ptr is not None:
+                flag = self.new_tmp()
+                self.emit(f"  {flag} = load i1, i1* {flag_ptr}")
+                null_l, real_l, done_l = self.new_label("pnull"), self.new_label("pnum"), self.new_label("pdone")
+                self.emit(f"  br i1 {flag}, label %{null_l}, label %{real_l}")
+                self.emit(f"{null_l}:")
+                self._emit_print_null_literal()
+                self.emit(f"  br label %{done_l}")
+                self.emit(f"{real_l}:")
+                self._emit_print_value(value)
+                self.emit(f"  br label %{done_l}")
+                self.emit(f"{done_l}:")
+                return
+        self._emit_print_value(value)
+
+    def _emit_print_null_literal(self):
+        nl_lbl, nl_len = self.intern_str("Null\n")
+        nptr = self.new_tmp()
+        self.emit(f"  {nptr} = getelementptr [{nl_len} x i8], [{nl_len} x i8]* {nl_lbl}, i64 0, i64 0")
+        self.emit(f"  call i32 (i8*, ...) @printf(i8* {nptr})")
+        self.emit(f"  call i32 @fflush(i8* null)")
+
+    def _emit_print_value(self, value):
         val, val_t = self.emit_expr(value)
         if val_t == "%Box*":
             self.emit(f"  call void @print_boxed(%Box* {val})")  # print_boxed already calls fflush
@@ -3150,6 +3423,35 @@ class CodeGen:
                 len_v = self.new_tmp(); buf_sz = self.new_tmp(); buf = self.new_tmp()
                 buf_ptr = self.new_tmp()
                 self.emit(f"  {buf_ptr} = alloca i8*")
+                # BUGFIX (found via syntax sweep): idx_tmp/len_v were used as
+                # if they were mutable loop-carried pointers (`store ... , i32*
+                # {idx_tmp}` / `store ..., i64* {len_v}`) but neither ever got
+                # an `alloca` — {len_v} in particular is the RESULT of an `add`
+                # (a plain SSA value, not storage), so storing through it is
+                # invalid IR ("defined with type i64 but expected ptr"),
+                # confirmed failing to compile a `os.run({cmd:.., args:[...]})`
+                # call with 2+ args. idx_ptr fixes that half — real storage,
+                # loaded/stored every iteration, the same pattern buf_ptr
+                # already used correctly.
+                #
+                # The length side needed more than just an alloca: an EARLIER
+                # attempt gave len_v its own storage too and loaded it back
+                # each iteration, but the arithmetic itself was wrong at any
+                # scale beyond 2 args — `len_cmd + len_args` (and each
+                # iteration's `+= arg_len`) only ever counts RAW TEXT length,
+                # never the separator spaces, so the flat "+2" (one space +
+                # null) added to size each malloc undercounts by one byte per
+                # PRIOR separator once 3+ pieces have been joined. Confirmed
+                # under AddressSanitizer: `os.run({cmd:"echo", args:["one",
+                # "two","three","four"]})` (5 total pieces, 4 separators
+                # needed) heap-buffer-overflowed in strcat. Fixed by dropping
+                # the separate counter entirely and computing the CURRENT
+                # length via `strlen(cur_buf)` fresh each iteration — the
+                # actual buffer already contains every separator inserted so
+                # far, so this can never miscount regardless of how many
+                # pieces have accumulated.
+                idx_ptr = self.new_tmp()
+                self.emit(f"  {idx_ptr} = alloca i32")
                 self.emit(f"  {len_cmd} = call i64 @strlen(i8* {cmd_s})")
                 # Concatenate all args: cmd + " " + arg0 + " " + arg1 + ...
                 first_arg_b = self.new_tmp()
@@ -3165,14 +3467,13 @@ class CodeGen:
                 self.emit(f"  call i8* @strcat(i8* {buf}, i8* {first_arg_s})")
                 self.emit(f"  store i8* {buf}, i8** {buf_ptr}")
                 # Loop over remaining args and append each with a space
-                idx_tmp = self.new_tmp()
-                self.emit(f"  store i32 1, i32* {idx_tmp}")
+                self.emit(f"  store i32 1, i32* {idx_ptr}")
                 loop_lbl = self.new_label("osrun_args")
                 loop_end = self.new_label("osrun_args_end")
                 self.emit(f"  br label %{loop_lbl}")
                 self.emit(f"{loop_lbl}:")
                 i_val = self.new_tmp()
-                self.emit(f"  {i_val} = load i32, i32* {idx_tmp}")
+                self.emit(f"  {i_val} = load i32, i32* {idx_ptr}")
                 i64_val = self.new_tmp()
                 self.emit(f"  {i64_val} = sext i32 {i_val} to i64")
                 len_box = self.new_tmp()
@@ -3189,8 +3490,10 @@ class CodeGen:
                 self.emit(f"  {arg_len} = call i64 @strlen(i8* {arg_s})")
                 cur_buf = self.new_tmp()
                 self.emit(f"  {cur_buf} = load i8*, i8** {buf_ptr}")
+                cur_len = self.new_tmp()
+                self.emit(f"  {cur_len} = call i64 @strlen(i8* {cur_buf})")
                 new_len = self.new_tmp()
-                self.emit(f"  {new_len} = add i64 {len_v}, {arg_len}")
+                self.emit(f"  {new_len} = add i64 {cur_len}, {arg_len}")
                 new_sz = self.new_tmp()
                 self.emit(f"  {new_sz} = add i64 {new_len}, 2")  # space + null
                 new_buf = self.new_tmp()
@@ -3200,10 +3503,9 @@ class CodeGen:
                 self.emit(f"  call i8* @strcat(i8* {new_buf}, i8* {arg_s})")
                 self.emit(f"  call void @free(i8* {cur_buf})")
                 self.emit(f"  store i8* {new_buf}, i8** {buf_ptr}")
-                self.emit(f"  store i64 {new_len}, i64* {len_v}")
                 next_i = self.new_tmp()
                 self.emit(f"  {next_i} = add i32 {i_val}, 1")
-                self.emit(f"  store i32 {next_i}, i32* {idx_tmp}")
+                self.emit(f"  store i32 {next_i}, i32* {idx_ptr}")
                 self.emit(f"  br label %{loop_lbl}")
                 self.emit(f"{loop_lbl}_end:")
                 self.emit(f"  br label %{loop_end}")
@@ -3624,6 +3926,22 @@ class CodeGen:
         self.emit(f"  {val} = load {ir_t}, {ir_t}* {fptr}")
         return val, ir_t
 
+    def _check_arg_count(self, fn_name, params, args):
+        """BUG (found via syntax sweep): calling a function with the wrong
+        number of arguments silently succeeded, on the REAL compiler — extra
+        arguments were dropped, missing ones defaulted to zero, with NO
+        diagnostic. Confirmed: `add(a: i32, b: i32)` called as `add(1,2,3)`
+        silently computed 1+2 (dropped the 3); called as `add(1)` silently
+        computed 1+0. The debugger's SEPARATE static-analyzer pass already
+        catches this correctly — but `python3 compiler.py foo.rub` (and
+        `xeon build --no-debug`, an explicitly documented, legitimate way to
+        skip that analyzer) has zero protection, so a silently-wrong binary
+        was fully reachable. Matches the analyzer's own message wording."""
+        if len(args) != len(params):
+            raise RubidiumTypeError(
+                f"Function '{fn_name}' expects {len(params)} argument(s), got {len(args)}."
+            )
+
     def emit_call_expr(self, node):
         # Chained collection access: nested(0)(1) parses as FnCall(FnCall("nested",[0]),[1])
         # Evaluate the inner call first, then do collection_get for the outer args.
@@ -3664,6 +3982,9 @@ class CodeGen:
                 self_val = self.new_tmp()
                 self.emit(f"  {self_val} = load {struct_t}*, {struct_t}** {self_ptr}")
                 fn_def = self.functions[ir_method]
+                # fn_def.params has the implicit __self prepended — the
+                # user-visible call (e.g. heal(40)) never includes it.
+                self._check_arg_count(node.name, fn_def.params[1:], node.args)
                 param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_def.params]
                 ret_ir = self.rubi_type_to_ir(fn_def.ret_type) if fn_def.ret_type else "i64"
                 args_ir = [f"{struct_t}* {self_val}"]
@@ -3755,6 +4076,31 @@ class CodeGen:
             func_call_node = node.args[0]
             tid_v, tid_t   = self.emit_expr(node.args[1])
             tid_v = self.coerce(tid_v, tid_t, "i64")
+            self._emit_slot_bounds_check(tid_v, 1024, "Thread")
+            # BUG (found via syntax sweep): `syntax` documents "A thread ID
+            # can only be reused after that thread has finished," but nothing
+            # enforced it — thread(fn(), id) unconditionally overwrote
+            # _thread_handles[id] with the new pthread handle, even while the
+            # PREVIOUS thread using that id was still running. The old OS
+            # thread keeps running (it isn't killed), but its handle is now
+            # unreachable through the tracked array: a later thread.wait(id)
+            # or thread.running(id) silently operates on the NEW thread
+            # instead — wrong synchronization with no diagnostic. The runtime
+            # already has the check needed to detect this (used for
+            # thread.running()); use it here to turn "you violated the
+            # documented ID-reuse rule" into a clean, catchable runtime error
+            # instead of silently corrupting the tracking array.
+            is_running = self.new_tmp()
+            self.emit(f"  {is_running} = call i1 @_thread_is_running(i64 {tid_v})")
+            ok_l = self.new_label("threadok")
+            busy_l = self.new_label("threadbusy")
+            self.emit(f"  br i1 {is_running}, label %{busy_l}, label %{ok_l}")
+            self.emit(f"{busy_l}:")
+            err_lbl, err_len = self.intern_str("Thread ID already in use — reuse only after that thread has finished")
+            err_ptr = self.new_tmp()
+            self.emit(f"  {err_ptr} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
+            self._emit_raise_or_propagate(err_ptr)
+            self.emit(f"{ok_l}:")
             # Store handle: _thread_handles[tid]
             h_ptr = self.new_tmp()
             self.emit(f"  {h_ptr} = getelementptr [1024 x i64], [1024 x i64]* @_thread_handles, i64 0, i64 {tid_v}")
@@ -3822,6 +4168,7 @@ class CodeGen:
         if node.name == "thread_result":
             tid_v, tid_t = self.emit_expr(node.args[0])
             tid_v = self.coerce(tid_v, tid_t, "i64")
+            self._emit_slot_bounds_check(tid_v, 1024, "Thread")
             r_ptr = self.new_tmp(); r_val = self.new_tmp()
             self.emit(f"  {r_ptr} = getelementptr [1024 x %Box*], [1024 x %Box*]* @_thread_results, i64 0, i64 {tid_v}")
             self.emit(f"  {r_val} = load %Box*, %Box** {r_ptr}")
@@ -3846,6 +4193,7 @@ class CodeGen:
                     f"(pass it in as a parameter instead)"
                 )
             fn_obj = self.functions[target_name]
+            self._check_arg_count(node.name, fn_obj.params or [], node.args)
             # BUG (GLFW FFI report): FFI-bound functions (`fn lib symbol(...) as
             # name`) are DEFINED by emit_ffi_bind using _ffi_type_to_ir, which
             # maps `Any` to i64 (a raw pointer-sized integer — correct ABI for a
@@ -4327,13 +4675,37 @@ class CodeGen:
                             return self.emit_collection_set_on_field(node, field_val, field_t)
                         else:
                             return self.emit_collection_add_on_field(node, field_val, field_t)
-                    # For other methods, treat as method call on the field value
-                    # Create a synthetic MethodCall node to continue processing
-                    node.obj = Var(f"_field_temp_{field_name}")
-                    # Store field value in a temp and continue
-                    tmp = self.new_tmp()
-                    self.emit(f"  {tmp} = alloca {field_t}")
-                    self.emit(f"  store {field_t} {field_val}, {field_t}* {tmp}")
+                    # For other methods (e.g. `p.data.has("a")`), treat as a
+                    # method call on the field value: reroute node.obj to a
+                    # synthetic local holding it, then fall through to the
+                    # normal Var-based method-call handling below.
+                    #
+                    # OPEN-D: this synthetic Var used to be backed by a plain
+                    # self.new_tmp() SSA name (e.g. %t7), but every lookup of
+                    # a Var goes through get_var_ptr(), which unconditionally
+                    # expects a LOCAL variable's pointer to be named
+                    # "%ptr_<name>" and the name to be registered in
+                    # local_vars_stack. Neither was true here, so emit_expr
+                    # on the reassigned node.obj a few lines down always
+                    # raised "Undefined variable '_field_temp_<field>'" —
+                    # this whole fallback path was unreachable for any method
+                    # without special-cased handling above (e.g. .has() on a
+                    # class field accessed via dotted syntax, `p.data(0)` was
+                    # unaffected since indexed access is handled earlier).
+                    # Naming the alloca "%ptr_<name>" and registering the name
+                    # in local_vars_stack (guarded by _alloca_emitted the same
+                    # way every other local is, so calling this twice in one
+                    # function — e.g. `p.data.has("a")` then `p.data.has("b")`
+                    # later in the same body — doesn't redefine the SSA value)
+                    # makes it a real, lookup-able local like any other.
+                    temp_name = f"_field_temp_{field_name}"
+                    node.obj = Var(temp_name)
+                    ptr_str = f"%ptr_{temp_name}"
+                    if temp_name not in self._alloca_emitted:
+                        self.emit(f"  {ptr_str} = alloca {field_t}")
+                        self._alloca_emitted.add(temp_name)
+                    self.emit(f"  store {field_t} {field_val}, {field_t}* {ptr_str}")
+                    self.local_vars_stack[-1][temp_name] = field_t
                     # Continue to fallback handling below
 
         # 3. Handle Class Method Calls
@@ -4343,6 +4715,9 @@ class CodeGen:
 
             if mangled in self.functions:
                 fn = self.functions[mangled]
+                # fn.params has the implicit __self prepended — the
+                # user-visible call (p.method(args)) never includes it.
+                self._check_arg_count(f"{obj_name}.{node.method}", fn.params[1:], node.args)
                 struct_t = self.class_ir_type(class_name)
                 ptr_str, _ = self.get_var_ptr(obj_name)
 
@@ -4386,6 +4761,7 @@ class CodeGen:
                     return self.emit_call_expr(FnCall(merged, node.args))
             if target_name in self.functions:
                 fn_obj = self.functions[target_name]
+                self._check_arg_count(f"{obj_name}.{node.method}", fn_obj.params or [], node.args)
                 # OPEN-12: coerce each arg to the callee's declared param type
                 # (same class of bug as OPEN-11, here on the module-namespaced
                 # function-call path — `tb.show(wrap_line)`). Without this, a
@@ -4441,6 +4817,7 @@ class CodeGen:
             for target in (f"{ns_name}_{attr_name}_{node.method}", f"{ns_name}_{node.method}", node.method):
                 if target in self.functions:
                     fn_obj = self.functions[target]
+                    self._check_arg_count(f"{ns_name}.{attr_name}.{node.method}", fn_obj.params or [], node.args)
                     # OPEN-12: coerce args to declared param types (see the
                     # module-function path above — same fix).
                     param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_obj.params] if fn_obj.params else []
@@ -4643,6 +5020,7 @@ class CodeGen:
         # Not a string — treat as a module-namespaced function call (e.g. math.add -> math_add)
         target_name = f"{obj_name}_{node.method}"
         if target_name in self.functions:
+            self._check_arg_count(f"{obj_name}.{node.method}", self.functions[target_name].params or [], node.args)
             args_ir = []
             for a in node.args:
                 v, t = self.emit_expr(a); args_ir.append(f"{t} {v}")
@@ -4809,8 +5187,39 @@ class CodeGen:
         return "0", "i64"
 
     def emit_type_cast(self, node):
-        val, from_t = self.emit_expr(node.expr)
+        # bugs.log OPEN-H / OPEN-J: `Null as str` on a runtime-tagged scalar
+        # local/global used to leak the raw sentinel bit pattern instead of
+        # "Null" — same root cause as OPEN-J's comparison bug (no runtime
+        # signal to tell "genuinely Null" apart from "bits that merely
+        # equal the sentinel"), fixed the same way: check the real flag
+        # instead of formatting whatever bits the scalar holds. Only
+        # intercepts a cast on a tagged Var; everything else (literals,
+        # expressions, untagged vars — params/class fields, OPEN-J Phase 2)
+        # goes through _emit_type_cast_body unchanged.
         to_t = self.rubi_type_to_ir(node.target_type)
+        if to_t == "i8*" and isinstance(node.expr, Var):
+            flag_ptr = self.get_null_flag_ptr(node.expr.name)
+            if flag_ptr is not None:
+                flag = self.new_tmp()
+                self.emit(f"  {flag} = load i1, i1* {flag_ptr}")
+                null_l, real_l, done_l = self.new_label("cnull"), self.new_label("cnum"), self.new_label("cdone")
+                self.emit(f"  br i1 {flag}, label %{null_l}, label %{real_l}")
+                self.emit(f"{null_l}:")
+                nl_lbl, nl_len = self.intern_str("Null")
+                nptr = self.new_tmp()
+                self.emit(f"  {nptr} = getelementptr [{nl_len} x i8], [{nl_len} x i8]* {nl_lbl}, i64 0, i64 0")
+                self.emit(f"  br label %{done_l}")
+                self.emit(f"{real_l}:")
+                real_val, _ = self._emit_type_cast_body(node, to_t)
+                self.emit(f"  br label %{done_l}")
+                self.emit(f"{done_l}:")
+                merged = self.new_tmp()
+                self.emit(f"  {merged} = phi i8* [ {nptr}, %{null_l} ], [ {real_val}, %{real_l} ]")
+                return merged, "i8*"
+        return self._emit_type_cast_body(node, to_t)
+
+    def _emit_type_cast_body(self, node, to_t):
+        val, from_t = self.emit_expr(node.expr)
         tmp = self.new_tmp()
         if from_t == to_t: return val, to_t
         # Box* casts: delegate to coerce() which handles unbox_f/unbox_i/unbox_s
@@ -4865,7 +5274,111 @@ class CodeGen:
         val = self.coerce(val, vt, block_ir)
         return val, block_ir
 
+    def _cur_block_label(self):
+        """The label of the basic block currently being appended to — the
+        most recently emitted 'name:' line. Needed for `phi` nodes, which
+        must name the EXACT predecessor block a value flows in from — not
+        just whatever label a branch was emitted to, since that block may
+        have branched further internally by the time control reaches the
+        phi (e.g. the right-hand side of `and`/`or` containing its own
+        guarded access or nested and/or)."""
+        for line in reversed(self.fn_lines):
+            s = line.strip()
+            if s.endswith(":") and not s.startswith(";"):
+                return s[:-1]
+        return "entry"
+
+    def _emit_short_circuit(self, node):
+        """BUG (found via syntax sweep): `and`/`or` did not short-circuit —
+        emit_binop's very first line unconditionally evaluated BOTH operands
+        before any operator-specific logic ran, so `False and boom()` still
+        called and crashed inside boom(). Short-circuiting is a foundational,
+        universally-expected semantic for these operators (every language
+        that has and/or short-circuits) and is the standard way to write a
+        guard in Rubidium itself (`x != Null and x.field > 0`,
+        `items.len() > 0 and items(0) == y`) — without it, guards like that
+        crash instead of protecting anything.
+
+        Implemented with real branching: the right side is only evaluated
+        when the left side didn't already decide the result (False for
+        `and`, True for `or`)."""
+        l, lt = self.emit_expr(node.left)
+        l_bool = self.to_bool(l, lt)
+        left_block = self._cur_block_label()
+        rhs_l = self.new_label("sc_rhs")
+        result_l = self.new_label("sc_result")
+        if node.op == "and":
+            self.emit(f"  br i1 {l_bool}, label %{rhs_l}, label %{result_l}")
+        else:  # or
+            self.emit(f"  br i1 {l_bool}, label %{result_l}, label %{rhs_l}")
+        self.emit(f"{rhs_l}:")
+        r, rt = self.emit_expr(node.right)
+        r_bool = self.to_bool(r, rt)
+        rhs_end_block = self._cur_block_label()
+        self.emit(f"  br label %{result_l}")
+        self.emit(f"{result_l}:")
+        tmp = self.new_tmp()
+        self.emit(f"  {tmp} = phi i1 [ {l_bool}, %{left_block} ], [ {r_bool}, %{rhs_end_block} ]")
+        return tmp, "i1"
+
+    def _emit_checked_arith(self, op, l, r, common):
+        """Real overflow-checked +, -, * for integers (see the BUG note
+        above the llvm.*.with.overflow declarations near the top of this
+        file). Detects overflow via LLVM's with.overflow intrinsics, then
+        clamps to the type's min/max and reports the spec's documented
+        non-fatal runtime warning — the exact same clamp-and-warn contract
+        coerce()'s narrowing path already implements, just now also applied
+        directly at the arithmetic site instead of only when a result
+        happens to get narrowed by a later assignment."""
+        intrinsic = {"+": "sadd", "-": "ssub", "*": "smul"}[op]
+        struct_t = f"{{ {common}, i1 }}"
+        agg = self.new_tmp()
+        self.emit(f"  {agg} = call {struct_t} @llvm.{intrinsic}.with.overflow.{common}({common} {l}, {common} {r})")
+        raw = self.new_tmp(); ovf = self.new_tmp()
+        self.emit(f"  {raw} = extractvalue {struct_t} {agg}, 0")
+        self.emit(f"  {ovf} = extractvalue {struct_t} {agg}, 1")
+
+        # Clamp direction (MAX vs MIN) must come from the OPERANDS' signs,
+        # never from the raw wrapped result (which is meaningless once
+        # overflow has actually happened). Standard signed-overflow rules:
+        #   add: both operands >= 0 -> true sum is too big  -> clamp MAX
+        #        both operands <  0 -> true sum is too small -> clamp MIN
+        #        (mixed signs can never overflow addition)
+        #   sub (l - r): l>=0, r<0 -> l - r behaves like l + |r| -> clamp MAX
+        #                l<0, r>=0 -> clamp MIN
+        #                (same-sign operands can never overflow subtraction)
+        #   mul: operands same sign -> true product positive -> clamp MAX
+        #        operands different sign -> true product negative -> clamp MIN
+        min_v, max_v = self._int_bounds(common)
+        l_neg = self.new_tmp(); self.emit(f"  {l_neg} = icmp slt {common} {l}, 0")
+        r_neg = self.new_tmp(); self.emit(f"  {r_neg} = icmp slt {common} {r}, 0")
+        l_nonneg = self.new_tmp(); self.emit(f"  {l_nonneg} = xor i1 {l_neg}, true")
+        r_nonneg = self.new_tmp(); self.emit(f"  {r_nonneg} = xor i1 {r_neg}, true")
+
+        toward_max = self.new_tmp()
+        if op == "+":
+            self.emit(f"  {toward_max} = and i1 {l_nonneg}, {r_nonneg}")
+        elif op == "-":
+            self.emit(f"  {toward_max} = and i1 {l_nonneg}, {r_neg}")
+        else:  # "*"
+            self.emit(f"  {toward_max} = icmp eq i1 {l_neg}, {r_neg}")
+
+        clamped = self.new_tmp()
+        self.emit(f"  {clamped} = select i1 {toward_max}, {common} {max_v}, {common} {min_v}")
+        result = self.new_tmp()
+        self.emit(f"  {result} = select i1 {ovf}, {common} {clamped}, {common} {raw}")
+
+        ovf32 = self.new_tmp()
+        self.emit(f"  {ovf32} = zext i1 {ovf} to i32")
+        tn_lbl, tn_len = self.intern_str(common)
+        tn_ptr = self.new_tmp()
+        self.emit(f"  {tn_ptr} = getelementptr [{tn_len} x i8], [{tn_len} x i8]* {tn_lbl}, i64 0, i64 0")
+        self.emit(f"  call void @rub_overflow_check(i32 {ovf32}, i8* {tn_ptr})")
+        return result
+
     def emit_binop(self, node):
+        if node.op in ("and", "or"):
+            return self._emit_short_circuit(node)
         l, lt = self.emit_expr(node.left); r, rt = self.emit_expr(node.right)
 
         # If either side is Box*, unbox to a concrete type first.
@@ -4960,11 +5473,16 @@ class CodeGen:
         l = self.coerce(l, lt, common); r = self.coerce(r, rt, common)
         tmp = self.new_tmp()
         if is_int:
-            if node.op in ("and","or"):
-                li = self.to_bool(l, common); ri = self.to_bool(r, common)
-                instr = "and" if node.op == "and" else "or"
-                self.emit(f"  {tmp} = {instr} i1 {li}, {ri}")
-                return tmp, "i1"
+            # `and`/`or` are handled earlier in emit_binop, via
+            # _emit_short_circuit — never reached here.
+            # BUG (found via syntax sweep): +, -, * used to be plain,
+            # unchecked LLVM add/sub/mul — real overflow-checked-and-clamped
+            # arithmetic now runs for these (see the llvm.*.with.overflow
+            # declarations and _emit_checked_arith above emit_binop). i1
+            # (bool) has no overflow concept, matching coerce()'s narrowing
+            # path, which also excludes i1.
+            if node.op in ("+", "-", "*") and common != "i1":
+                return self._emit_checked_arith(node.op, l, r, common), common
             instr = {"+":"add","-":"sub","*":"mul","/":"sdiv","%":"srem"}.get(node.op)
             if instr:
                 if node.op in ("/", "%"):
@@ -4995,8 +5513,22 @@ class CodeGen:
                 # what was concretely broken/reported.
                 l_d = self.coerce(l, common, "double")
                 r_d = self.coerce(r, common, "double")
-                self.emit(f"  {tmp} = call double @_rubidium_pow(double {l_d}, double {r_d})")
-                return tmp, "double"
+                pow_d = self.new_tmp()
+                self.emit(f"  {pow_d} = call double @_rubidium_pow(double {l_d}, double {r_d})")
+                # BUG (found via syntax sweep): this used to unconditionally
+                # return "double" even for two INTEGER operands, unlike
+                # every other operator in this branch (+,-,*,/,%), which all
+                # return `common` (an int type). That made an int**int result
+                # get formatted with the generic FLOAT print path — invisible
+                # for small results (test.rub's own `2 ** 3` example prints
+                # "8" either way), but for a result large enough that %g
+                # switches to scientific notation, `print(2 ** 30)` showed
+                # "1.07374e+09" instead of the plain integer
+                # "1073741824" the debugger (and every other operator)
+                # already gave. Convert back to the integer common type,
+                # matching every sibling operator's return type.
+                self.emit(f"  {tmp} = fptosi double {pow_d} to {common}")
+                return tmp, common
             # Handle binary root operator (n */ value) -> value ** (1/n)
             if node.op == "*/":
                 l_d = self.coerce(l, common, "double")
@@ -5047,9 +5579,32 @@ class CodeGen:
                 tmp = self.new_tmp()
                 self.emit(f"  {tmp} = add i1 0, {'1' if result else '0'}")
                 return tmp, "i1"
-            # Null op Variable — fall through to runtime comparison.
+            # Null op Variable — if it's a runtime-tagged scalar local/global
+            # (bugs.log OPEN-J), resolve with a REAL runtime check instead of
+            # falling through to a raw sentinel-bit comparison below, which
+            # can't tell "genuinely Null" apart from "merely computed/
+            # clamped to the same bit pattern" (that exact collision is
+            # OPEN-J), and is blind to Null-ness assigned on only one branch
+            # of a runtime if/else (the old compile-time-only null_valued
+            # set loses track of that; a real flag load does not).
+            if isinstance(non_null, Var):
+                flag_ptr = self.get_null_flag_ptr(non_null.name)
+                if flag_ptr is not None:
+                    flag = self.new_tmp()
+                    self.emit(f"  {flag} = load i1, i1* {flag_ptr}")
+                    null_result = {"==": True, "!=": False, "<": False, ">": False, "<=": True, ">=": True}[node.op]
+                    if left_is_null:
+                        nonnull_result = {"==": False, "!=": True, "<": True, ">": False, "<=": True, ">=": False}[node.op]
+                    else:
+                        nonnull_result = {"==": False, "!=": True, "<": False, ">": True, "<=": False, ">=": True}[node.op]
+                    tmp = self.new_tmp()
+                    self.emit(f"  {tmp} = select i1 {flag}, i1 {'1' if null_result else '0'}, i1 {'1' if nonnull_result else '0'}")
+                    return tmp, "i1"
+            # Untagged variable (param/class field/loop var — OPEN-J Phase 2)
+            # — fall through to runtime comparison, unchanged from before.
             # Variable assigned Null stores 0, so 0 == 0 → True correctly for == and !=.
-            # Note: Null < variable (ordinal) won't work correctly without runtime tagging (see bugs.log).
+            # Note: ordinal comparisons here still can't distinguish genuine
+            # Null from a same-bit-pattern clamped value (bugs.log OPEN-J).
 
         l, lt = self.emit_expr(node.left); r, rt = self.emit_expr(node.right)
         # BUG-7: the Null literal carries the pseudo-type "null" (see OPEN-4 in

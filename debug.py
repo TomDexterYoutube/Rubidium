@@ -321,6 +321,227 @@ class _Continue(Exception): pass
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# OPEN-B / OPEN-C: type-tagged collection values (index / dict / dict+)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# OPEN-C: Rubidium's scalar types are distinct even when their VALUES compare
+# equal in Python — an i32 `1` and a bool `True` are different keys, matching
+# the compiled runtime's box_equal (which returns False the instant two
+# Box*'s ->type tags differ, before ever comparing ->i/->f). Representing a
+# key or list element as a bare Python value let Python's OWN equality rules
+# leak through instead: Python's `1 == True` and `1 == 1.0`, so
+# `[1: "int", True: "bool"]` silently collapsed to one dict entry, and
+# `[1,2,3].has(True)` returned True where the compiled binary returns False.
+#
+# OPEN-B: `dict`/`index` and `dict+` were both plain Python dicts with
+# nothing recording which one a given value actually was. `().add(newkey)`
+# on the WHOLE collection therefore always used dict's rule (new key's value
+# starts Null) even for dict+, whose spec'd rule is different (new key starts
+# as an EMPTY dict+, since dict+ nests). The resulting Null then tripped an
+# unrelated, correct rule — "adding to a Null-valued slot promotes it to a
+# list" (`[Null].add(x) -> [x]`) — turning a nested dict+ level into a
+# corrupted single-element list and crashing on the next access into it.
+
+def _rtype_tag(value):
+    """The Rubidium scalar type a Python value stands in for, mirroring the
+    compiled runtime's Box ->type tag. Order matters: bool must be checked
+    before int, since Python's bool IS an int subclass."""
+    if value is None:               return 'null'
+    if isinstance(value, bool):     return 'bool'
+    if isinstance(value, int):      return 'int'
+    if isinstance(value, float):    return 'float'
+    if isinstance(value, str):      return 'str'
+    return type(value)              # collections/instances: exact Python type
+
+
+def _rtype_eq(a, b):
+    """Type-strict equality for a collection ELEMENT or KEY comparison — the
+    interpreter's equivalent of the compiled runtime's box_equal. Two values
+    of different Rubidium types are never equal, even if Python's own `==`
+    would say otherwise; same-type values (including nested lists/dicts, via
+    the `type_tag` fallback above) compare structurally as before."""
+    if _rtype_tag(a) != _rtype_tag(b):
+        return False
+    return a == b
+
+
+# bugs.log OPEN-K: the compiled binary's str.len()/.char()/.set()/.slice()/
+# .insert()/.replace() all index raw UTF-8 BYTES (str_slice, rub_str_char,
+# etc. in compiler.py's C runtime walk a char*), matching systems-language
+# convention (predictable O(1) access) rather than Python's codepoint-
+# indexed str. "café" is 4 codepoints but 5 UTF-8 bytes; str.char(3) on the
+# compiled binary reads the FIRST byte of "é"'s 2-byte encoding — not a
+# valid character on its own. surrogateescape lets a single such byte
+# round-trip through a Python str (as a lone surrogate codepoint) so it can
+# still flow through normal string ops and come back out as the identical
+# raw byte when written to stdout — see _rub_write below.
+def _rub_bytes(s):
+    return str(s).encode("utf-8", errors="surrogateescape")
+
+
+def _rub_str_len(s):
+    return len(_rub_bytes(s))
+
+
+def _rub_str_char(s, idx):
+    b = _rub_bytes(s)
+    if 0 <= idx < len(b):
+        return b[idx:idx + 1].decode("utf-8", errors="surrogateescape")
+    return ""
+
+
+def _rub_str_slice(s):
+    return [b.to_bytes(1, "big").decode("utf-8", errors="surrogateescape") for b in _rub_bytes(s)]
+
+
+def _rub_str_set(s, idx, value):
+    b = bytearray(_rub_bytes(s))
+    vb = _rub_bytes(value)
+    if not vb or not (0 <= idx < len(b)):
+        return s
+    # BUGFIX parity: the C runtime's rub_str_set loads exactly ONE byte from
+    # the replacement (`char_val = load i8, i8* val_v`) with no length check
+    # at all — passing a multi-byte value silently truncates to its first
+    # byte rather than erroring, so match that instead of validating length.
+    b[idx] = vb[0]
+    return bytes(b).decode("utf-8", errors="surrogateescape")
+
+
+def _rub_str_insert(s, idx, value):
+    b = _rub_bytes(s)
+    vb = _rub_bytes(value)
+    idx = max(0, min(idx, len(b)))
+    return (b[:idx] + vb + b[idx:]).decode("utf-8", errors="surrogateescape")
+
+
+def _rub_str_replace(s, old, new):
+    old_b = _rub_bytes(old)
+    if not old_b:
+        # bugs.log: str_replace treats an empty needle as a no-op (the C
+        # runtime's strstr-based loop never terminates on one otherwise) —
+        # matched here already for str.replace elsewhere; same rule applies
+        # byte-for-byte now that this walks bytes instead of codepoints.
+        return s
+    b = _rub_bytes(s)
+    new_b = _rub_bytes(new)
+    return b.replace(old_b, new_b).decode("utf-8", errors="surrogateescape")
+
+
+def _rub_write(text, end="\n"):
+    """Write Rubidium program output (print/println) as raw bytes instead of
+    through Python's default strict-UTF-8 stdout encoding — a str value
+    containing a lone surrogate-escaped byte (from _rub_str_char/_rub_str_slice
+    splitting a multi-byte codepoint) would otherwise raise UnicodeEncodeError
+    on print(). surrogateescape round-trips ordinary text unchanged and only
+    changes behavior for those rescued bytes, so this is safe for all output."""
+    sys.stdout.flush()  # push any buffered print() text down first — writing
+                        # straight to the raw buffer below would otherwise
+                        # jump ahead of it and reorder output
+    sys.stdout.buffer.write(str(text).encode("utf-8", errors="surrogateescape") + end.encode("utf-8"))
+    sys.stdout.buffer.flush()
+
+
+class RKey:
+    """A hashable wrapper around one index/dict/dict+ KEY that hashes and
+    compares by (Rubidium type, value) instead of raw Python equality/hash —
+    see OPEN-C above. `RDict` (below) wraps every key it stores in one of
+    these and unwraps on every read, so nothing outside this pair of classes
+    ever sees an RKey directly."""
+    __slots__ = ('tag', 'value')
+
+    def __init__(self, value):
+        if isinstance(value, RKey):     # defensive: never double-wrap
+            self.tag, self.value = value.tag, value.value
+        else:
+            self.tag, self.value = _rtype_tag(value), value
+
+    def __eq__(self, other):
+        if isinstance(other, RKey):
+            return self.tag == other.tag and self.value == other.value
+        return NotImplemented
+
+    def __hash__(self):
+        try:
+            return hash((self.tag, self.value))
+        except TypeError:            # an unhashable key value (e.g. a list) —
+            return hash((self.tag, id(self.value)))  # fall back to identity
+
+    def __repr__(self):
+        return repr(self.value)
+
+
+class RDict(dict):
+    """The runtime value of a Rubidium `index`, `dict`, or `dict+` variable.
+    A thin `dict` subclass — `isinstance(x, dict)` stays True for it
+    everywhere else in this file, so every existing dict-typed code path
+    (class instances, module/namespace stubs, file handles — all also plain
+    dicts distinguished by sentinel keys) is completely unaffected — that
+    adds:
+
+      .kind    — 'dict' | 'index' | 'dictplus' (OPEN-B: lets `.add(newkey)`
+                 pick the right default value for the collection it's
+                 actually mutating)
+      key wrapping — every key is stored as an RKey (OPEN-C), transparently:
+                 every method below unwraps back to the raw value, so
+                 `obj[k]`, `k in obj`, `for k in obj`, `.get(k)` etc. all read
+                 and write exactly the way they did against a plain dict.
+    """
+    __slots__ = ('kind',)
+
+    def __init__(self, *args, kind='dict', **kwargs):
+        super().__init__()
+        self.kind = kind
+        if args or kwargs:
+            for k, v in dict(*args, **kwargs).items():
+                self[k] = v
+
+    def __setitem__(self, key, value):
+        super().__setitem__(RKey(key), value)
+
+    def __getitem__(self, key):
+        return super().__getitem__(RKey(key))
+
+    def __delitem__(self, key):
+        super().__delitem__(RKey(key))
+
+    def __contains__(self, key):
+        return super().__contains__(RKey(key))
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def pop(self, key, *default):
+        try:
+            v = self[key]
+        except KeyError:
+            if default:
+                return default[0]
+            raise
+        del self[key]
+        return v
+
+    def __iter__(self):
+        for k in super().__iter__():
+            yield k.value
+
+    def keys(self):
+        return [k.value for k in super().keys()]
+
+    def items(self):
+        return [(k.value, v) for k, v in super().items()]
+
+    def __deepcopy__(self, memo):
+        new = RDict(kind=self.kind)
+        memo[id(self)] = new
+        for k, v in super().items():
+            new[copy.deepcopy(k.value, memo)] = copy.deepcopy(v, memo)
+        return new
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Debugger  –  lightweight interpreter / runtime-crash detector
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -337,6 +558,7 @@ class Debugger:
         self._source_lines  = source_lines or []
         self._lmap          = {}      # ('var'|'fn'|'class'|'for', name) -> line
         self._try_depth     = 0       # >0 means inside a try block; errors raise instead of print
+        self._loop_depth    = 0       # >0 means inside a loop in THIS function — see Break/Continue below
         self._math_block_type = None  # typed math block `(expr): TYPE` — governs division/result type
         self._dynvars       = {}      # runtime SY reflection backing store — see DynResolve/DynVarDecl
         self._os_active     = set()   # open os.start(id) session ids — see OsStart/OsRun/OsDrop
@@ -688,6 +910,19 @@ class Debugger:
                 "mutable": True,
             })
         saved, self.scope = self.scope, fn_scope
+        # BUG (found via syntax sweep): `break`/`continue` are lexically
+        # scoped to a loop within the SAME function on the compiler side
+        # (loop_end_stack/loop_cond_stack are per-function state, reset by
+        # each emit_fn call — a function called from inside a loop starts
+        # with empty stacks, so its own break/continue can never affect the
+        # CALLER's loop). The interpreter's _Break/_Continue are raised as
+        # plain Python exceptions with no such boundary, so without this
+        # reset a `break` inside a function that happens to be called from
+        # within a loop would propagate up and incorrectly break the
+        # CALLER's loop instead of raising an error. Save/reset/restore
+        # around every call so a callee starts with no visible enclosing
+        # loop, matching the compiler.
+        saved_loop_depth, self._loop_depth = self._loop_depth, 0
         result = None
         try:
             for stmt in fn_def.body:
@@ -696,6 +931,7 @@ class Debugger:
             result = r.value
         finally:
             self.scope = saved
+            self._loop_depth = saved_loop_depth
         return result
 
 
@@ -916,37 +1152,60 @@ class Debugger:
         elif isinstance(node, ast.Print):
             value = self.evaluate(node.value)
             out   = self._format_value(value)
-            print(out)
+            _rub_write(out)
             self.output.append(out)
 
         elif isinstance(node, ast.Println):
             value = self.evaluate(node.value)
             out   = self._format_value(value)
-            print(f"\r{out}", end="")
+            _rub_write(f"\r{out}", end="")
             self.output.append(out)
 
         # ── If ────────────────────────────────────────────────────────────────
         elif isinstance(node, ast.If):
             cond = self.evaluate(node.cond)
             body = node.then_body if cond else (node.else_body or [])
-            for stmt in body:
-                self.execute(stmt)
+            # bugs.log: `if`/`while`/`for` bodies used to run directly against
+            # self.scope with no child Scope of their own — a `let local` shadow
+            # of an outer/global name permanently overwrote that name in the
+            # ENCLOSING scope instead of being dropped when the block ended
+            # (confirmed against the compiled binary, which restores the outer
+            # value correctly). Push a real child scope for the block, same
+            # pattern already used for function/try/file bodies.
+            block_scope = Scope(parent=self.scope)
+            saved, self.scope = self.scope, block_scope
+            try:
+                for stmt in body:
+                    self.execute(stmt)
+            finally:
+                self.scope = saved
 
         # ── While ─────────────────────────────────────────────────────────────
         elif isinstance(node, ast.While):
             count = 0
-            while self.evaluate(node.cond):
-                try:
-                    for stmt in node.body:
-                        self.execute(stmt)
-                except _Break:
-                    break
-                except _Continue:
-                    pass
-                count += 1
-                if count > 100_000:
-                    self.error("Possible infinite loop (exceeded 100 000 iterations)")
-                    break
+            self._loop_depth += 1
+            # See the If branch above — one child scope for the whole loop
+            # (reused across iterations, consistent with `let`'s own
+            # "redeclare drops and recreates" rule for a body-local declared
+            # again on the next pass), restored once the loop exits.
+            block_scope = Scope(parent=self.scope)
+            saved, self.scope = self.scope, block_scope
+            try:
+                while self.evaluate(node.cond):
+                    try:
+                        for stmt in node.body:
+                            self.execute(stmt)
+                    except _Break:
+                        break
+                    except _Continue:
+                        pass
+                    count += 1
+                    if count > 100_000:
+                        self.error("Possible infinite loop (exceeded 100 000 iterations)")
+                        break
+            finally:
+                self.scope = saved
+                self._loop_depth -= 1
 
         # ── For ───────────────────────────────────────────────────────────────
         elif isinstance(node, ast.For):
@@ -958,9 +1217,24 @@ class Debugger:
             raise _Return(self.evaluate(node.value))
 
         elif isinstance(node, ast.Break):
+            # BUG (found via syntax sweep): with no enclosing loop, the bare
+            # _Break exception used to propagate all the way up to run()'s
+            # generic handler, which stringified it as "Unhandled runtime
+            # crash: _Break: " — a raw Python exception class name leaking
+            # into the user-facing message, and a much less useful diagnostic
+            # than what the (separate, static) analyzer already produces for
+            # the exact same construct ("'break' used outside of a loop").
+            # The compiler now rejects this at COMPILE time (same wording);
+            # match that here instead of crashing at runtime.
+            if self._loop_depth <= 0:
+                self.error("'break' used outside of a loop")
+                return
             raise _Break()
 
         elif isinstance(node, ast.Continue):
+            if self._loop_depth <= 0:
+                self.error("'continue' used outside of a loop")
+                return
             raise _Continue()
 
         # ── Raise ─────────────────────────────────────────────────────────────
@@ -1129,6 +1403,9 @@ class Debugger:
         elif isinstance(node, ast.FileExists):
             pass  # handled as an expression via evaluate(); nothing to do as a statement
 
+        elif isinstance(node, ast.FileList):
+            pass  # handled as an expression via evaluate(); nothing to do as a statement
+
         elif isinstance(node, ast.FileDelete):
             path = str(self.evaluate(node.path_expr))
             if os.path.exists(path): os.remove(path)
@@ -1148,6 +1425,28 @@ class Debugger:
     # ── For-loop helper ───────────────────────────────────────────────────────
 
     def _exec_for(self, node):
+        # BUG (found via syntax sweep, see _call_fn): the loop body may
+        # legally contain break/continue, so this whole method counts as
+        # "inside a loop" for the duration — wrapping the entire body (every
+        # early-return error path included) is simpler and less error-prone
+        # than incrementing/decrementing at each exit point individually.
+        self._loop_depth += 1
+        # bugs.log: same missing-child-scope bug as If/While (see that fix) —
+        # _exec_for_inner declares the loop variable and runs the body
+        # directly against self.scope, so both the loop variable AND any
+        # `let local` inside the body used to leak into the enclosing scope
+        # permanently instead of being dropped when the loop ends. One scope
+        # for the whole loop (reused every iteration, matching `let`'s own
+        # redeclare rule), restored once the loop exits.
+        block_scope = Scope(parent=self.scope)
+        saved, self.scope = self.scope, block_scope
+        try:
+            self._exec_for_inner(node)
+        finally:
+            self.scope = saved
+            self._loop_depth -= 1
+
+    def _exec_for_inner(self, node):
         if node.iterable is not None:
             # for x in <collection>
             iterable = self.evaluate(node.iterable)
@@ -1173,6 +1472,40 @@ class Debugger:
                     f"'for {node.var} in ...' — value of type "
                     f"'{self.rub_type(iterable)}' is not iterable"
                 )
+                return
+            if isinstance(iterable, list):
+                # BUG (found via syntax sweep): a plain Python `for item in
+                # iterable:` walks the LIVE list, so appending to it from
+                # inside the loop body made the new element show up in the
+                # SAME pass — diverging from the compiled binary, which
+                # snapshots the length ONCE before the loop starts (see
+                # emit_for's `len_val = call i32 @collection_len(...)`,
+                # computed a single time) and never revisits it. Confirmed:
+                # `items().add(99)` at the last original element made the
+                # debugger visit the new 99 in the same loop; the compiled
+                # binary never did. Snapshot the length the same way; an
+                # index that's gone out of range by the time it's reached
+                # (the list shrank) reads as `0`, matching
+                # collection_get_at's own safe-default behavior for exactly
+                # that case — for-loop element access never raises even when
+                # the collection is mutated mid-iteration, by design.
+                n = len(iterable)
+                i = 0
+                while i < n:
+                    item = iterable[i] if i < len(iterable) else 0
+                    self.scope.declare(node.var, {
+                        "value": item, "type": self.rub_type(item),
+                        "dropped": False, "mutable": False,
+                    })
+                    try:
+                        for stmt in node.body:
+                            self.execute(stmt)
+                    except _Break:
+                        return
+                    except _Continue:
+                        i += 1
+                        continue
+                    i += 1
                 return
             for item in iterable:
                 self.scope.declare(node.var, {
@@ -1228,6 +1561,28 @@ class Debugger:
         if isinstance(node, ast.FileExists):
             path = self.evaluate(node.path_expr)
             return os.path.exists(str(path)) if path is not None else False
+
+        if isinstance(node, ast.FileList):
+            # BUG (found via syntax sweep): FileList had NO handling
+            # anywhere in this file — `file.list(path)` silently evaluated
+            # to None (the generic fallthrough for an unrecognized node),
+            # so any use of it (per the spec's own example, `let items =
+            # file.list("data/")`) crashed the moment the result was used
+            # ("Method '.len()' called on None") — where the compiled
+            # binary returns a real directory listing. Matches
+            # file_list_dir in compiler.py exactly: a `list` of entry
+            # NAMES (not full paths), "." and ".." excluded, and a
+            # directory entry gets a trailing "/" appended (files don't) —
+            # "used like linux ls command" per spec.
+            path = self.evaluate(node.path_expr)
+            entries = []
+            try:
+                for name in os.listdir(str(path)):
+                    full = os.path.join(str(path), name)
+                    entries.append(name + "/" if os.path.isdir(full) else name)
+            except OSError:
+                pass
+            return entries
 
         if isinstance(node, ast.LinkArg):
             # Link Rule: pass-by-reference. _call_fn binds params directly
@@ -1311,6 +1666,23 @@ class Debugger:
                 import math; return math.sqrt(val) if val is not None else None
             return val
 
+        if isinstance(node, ast.BinOp) and node.op in ("and", "or"):
+            # BUG (found via syntax sweep): `and`/`or` did not short-circuit
+            # — the generic BinOp path unconditionally evaluated BOTH
+            # operands before any operator-specific logic ran, so
+            # `False and boom()` still called and errored inside boom().
+            # Matches the compiler-side fix (_emit_short_circuit in
+            # codegen.py): the right side is only evaluated when the left
+            # side didn't already decide the result.
+            left = self.evaluate(node.left)
+            if node.op == "and":
+                if not bool(left):
+                    return False
+            else:  # or
+                if bool(left):
+                    return True
+            return bool(self.evaluate(node.right))
+
         if isinstance(node, ast.BinOp):
             left  = self.evaluate(node.left)
             right = self.evaluate(node.right)
@@ -1336,13 +1708,35 @@ class Debugger:
                 self.error("Division by zero", highlight="/"); return None
             if node.op == "*/" and left == 0:
                 self.error("Division by zero", highlight="*/"); return None
+            # BUG (found via syntax sweep): _clamp_int only ever ran at a
+            # variable DECLARATION/ASSIGNMENT boundary — Python ints are
+            # unbounded, so ordinary same-typed arithmetic (`x + y` for two
+            # declared `i32` variables) computed the TRUE, unbounded result
+            # with no clamping at all, diverging from the compiler (which
+            # had the identical gap — see the codegen.py fix — and is now
+            # fixed there). Best-effort match: when BOTH operands resolve to
+            # a KNOWN declared int type (a bare Var lookup — NOT a literal,
+            # which the compiler itself treats as unconstrained/at-least-i64
+            # and promotes past, so guessing a type for it here could clamp
+            # too early and diverge from the compiler in the OTHER
+            # direction), clamp the arithmetic result immediately at the
+            # wider of the two types, matching promote_type's own rule.
+            if node.op in ("+", "-", "*") and not isinstance(left, str) and not isinstance(right, str):
+                _common_t = self._binop_int_common_type(node)
+            else:
+                _common_t = None
             try:
                 if node.op == "+":
                     if isinstance(left, str) or isinstance(right, str):
                         return str(left or "") + str(right or "")
-                    return left + right
-                if node.op == "-":   return left - right
-                if node.op == "*":   return left * right
+                    result = left + right
+                    return self._clamp_int(result, _common_t) if _common_t else result
+                if node.op == "-":
+                    result = left - right
+                    return self._clamp_int(result, _common_t) if _common_t else result
+                if node.op == "*":
+                    result = left * right
+                    return self._clamp_int(result, _common_t) if _common_t else result
                 if node.op == "/":
                     # Typed math block with a float type: compute at that
                     # precision, i.e. float division even if both operands are
@@ -1359,13 +1753,33 @@ class Debugger:
                     # n */ value -> value's n-th root (matches the unary
                     # `*/value` sqrt case, generalized to any degree).
                     return right ** (1.0 / left)
-                if node.op == "**":  return left ** right
+                if node.op == "**":
+                    # BUG (found via syntax sweep): matches the compiler's
+                    # fix — int**int now truncates toward zero to an integer
+                    # (mirroring how int/int already truncates rather than
+                    # giving a float), UNLESS wrapped in a typed math block
+                    # requesting float precision. Without this, the ORIGINAL
+                    # bug this was fixing (an int**int result large enough
+                    # to print in scientific notation, e.g. `2 ** 30`) was
+                    # invisible here only because Python's ** already keeps
+                    # a non-negative-exponent int**int as an exact Python
+                    # int with no float involved — the divergence was purely
+                    # in the COMPILER's formatting, not the debugger's value.
+                    # This keeps both sides on the identical rule going
+                    # forward, including for a NEGATIVE exponent (Python's
+                    # ** auto-promotes that specific case to float — 0.5 for
+                    # `2 ** -1` — which int() then truncates to 0, matching
+                    # the compiler's fptosi truncation exactly).
+                    if self._math_block_type and self._math_block_type[0] == 'f':
+                        return float(left) ** float(right)
+                    if isinstance(left, int) and isinstance(right, int):
+                        return int(left ** right)
+                    return left ** right
                 if node.op == "%":
                     if right == 0:
                         self.error("Division by zero", highlight="%"); return None
                     return left % right
-                if node.op == "and": return bool(left) and bool(right)
-                if node.op == "or":  return bool(left) or bool(right)
+                # `and`/`or` are handled earlier, above — never reached here.
             except Exception as e:
                 self.error(f"Operation '{node.op}' failed: {e}")
             return None
@@ -1384,6 +1798,24 @@ class Debugger:
                     if node.op == "<=": return left is None          # Null <= anything
                     if node.op == ">=": return right is None         # anything >= Null
                     return False
+                # BUG (found via syntax sweep): two class instances with
+                # IDENTICAL field values compared unequal in the compiled
+                # binary — `syntax` documents recursive, field-wise equality
+                # for COLLECTIONS explicitly, but says nothing for classes,
+                # and codegen's emit_compare has no class-specific case, so
+                # it falls through to the generic path and compares the raw
+                # %class_X* STRUCT POINTERS (two separately-constructed
+                # instances are always different addresses, even with equal
+                # fields). The debugger represented class instances as plain
+                # Python dicts, so `==` used Python's OWN dict equality —
+                # structural, not by-identity — and disagreed with the
+                # compiled binary on every instance comparison. Match the
+                # compiler's actual (if arguably accidental) behavior:
+                # identity, not field-wise structural equality.
+                if (isinstance(left, dict) and isinstance(right, dict)
+                        and "__class__" in left and "__class__" in right):
+                    if node.op == "==": return left is right
+                    if node.op == "!=": return left is not right
                 if node.op == "==":  return left == right
                 if node.op == "!=":  return left != right
                 if node.op == ">":   return left > right
@@ -1402,7 +1834,11 @@ class Debugger:
                 # BUG-6: f128+ are binary128, not double (syntax lines 275-281).
                 if t in ("f32","f64") or t in WIDE_FLOAT_TYPES:
                     return _apply_float_type(val, t)
-                if t == "str":   return str(val)
+                # bugs.log OPEN-H: str(None) leaked Python's own "None"
+                # instead of the language's "Null" — now that the compiler
+                # side is fixed and consistent (OPEN-J's runtime null-tag),
+                # there's no more ambiguity about which string is correct.
+                if t == "str":   return "Null" if val is None else str(val)
                 if t == "bool":  return bool(val)
             except Exception as e:
                 self.error(f"Type cast to '{t}' failed: {e}")
@@ -1436,7 +1872,14 @@ class Debugger:
             return [self.evaluate(x) for x in node.elements]
 
         if isinstance(node, ast.DictExpr):
-            result = {}
+            # OPEN-B/OPEN-C: build a type-tagged, kind-tagged RDict instead of
+            # a plain dict — see the class docstring above Debugger. The
+            # parser marks is_dictplus recursively on every nested `{...}`
+            # literal inside a `dict+`, so a nested block here already comes
+            # back correctly tagged too, with no extra work.
+            kind = ('dictplus' if getattr(node, 'is_dictplus', False) else
+                    'index' if getattr(node, 'is_index', False) else 'dict')
+            result = RDict(kind=kind)
             for k, v in node.pairs:
                 result[self.evaluate(k)] = self.evaluate(v)
             return result
@@ -1594,10 +2037,10 @@ class Debugger:
             return None
         if fname == "print":
             if args:
-                print(self._format_value(args[0]))
+                _rub_write(self._format_value(args[0]))
             return None
         if fname == "println":
-            if args: print(f"\r{self._format_value(args[0])}", end="")
+            if args: _rub_write(f"\r{self._format_value(args[0])}", end="")
             return None
         if fname == "input":
             return ""
@@ -2035,21 +2478,28 @@ class Debugger:
 
         # ── str methods ───────────────────────────────────────────────────────
         if isinstance(obj, str):
-            if method == "len":      return len(obj)
+            # bugs.log OPEN-K: byte-indexed to match the compiled binary's
+            # C-runtime string functions — see _rub_str_* helpers above.
+            if method == "len":      return _rub_str_len(obj)
             if method == "char":
                 idx = int(args[0]) if args else 0
-                return obj[idx] if 0 <= idx < len(obj) else ""
-            if method == "slice":    return list(obj)
+                return _rub_str_char(obj, idx)
+            if method == "slice":    return _rub_str_slice(obj)
             if method == "has":      return args[0] in obj if args else False
-            if method == "replace":  return obj.replace(str(args[0]), str(args[1])) if len(args) >= 2 else obj
+            if method == "replace":
+                if len(args) >= 2:
+                    return _rub_str_replace(obj, args[0], args[1])
+                return obj
             if method == "split":    return obj.split(str(args[0])) if args else list(obj)
             if method == "combine":  return obj
             if method == "insert":
-                idx = int(args[0])
-                return obj[:idx] + str(args[1]) + obj[idx:] if len(args) >= 2 else obj
+                if len(args) >= 2:
+                    return _rub_str_insert(obj, int(args[0]), args[1])
+                return obj
             if method == "set":
-                idx = int(args[0])
-                return obj[:idx] + str(args[1])[0] + obj[idx+1:] if len(args) >= 2 else obj
+                if len(args) >= 2:
+                    return _rub_str_set(obj, int(args[0]), args[1])
+                return obj
             if method == "to":
                 t = str(args[0]) if args else ""
                 try:
@@ -2062,7 +2512,10 @@ class Debugger:
         # ── list methods ──────────────────────────────────────────────────────
         if isinstance(obj, list):
             if method == "len":     return len(obj)
-            if method == "has":     return args[0] in obj if args else False
+            # OPEN-C: `in` uses Python's own ==, where 1 == True == 1.0 — so
+            # e.g. [1,2,3].has(True) returned True. box_equal in the compiled
+            # runtime type-checks first; _rtype_eq mirrors that.
+            if method == "has":     return any(_rtype_eq(x, args[0]) for x in obj) if args else False
             if method == "combine": return "".join(str(x) for x in obj)
             if method == "add":
                 if len(obj) == 1 and obj[0] is None:
@@ -2087,11 +2540,21 @@ class Debugger:
             if method == "add":
                 if len(args) == 1:
                     # dict().add("key") — creates a new top-level key.
-                    # Per spec the key's value starts as Null. The paired
-                    # _eval_method_call special-case above upgrades it to a
-                    # list the first time something is added to it, so we
-                    # don't need a placeholder [] here anymore (bugs.log #3).
-                    obj[args[0]] = None
+                    if isinstance(obj, RDict) and obj.kind == 'dictplus':
+                        # OPEN-B: dict+ nests, so a new key's default value is
+                        # an EMPTY dict+ (spec: "The new key is created as an
+                        # empty dict+"), NOT Null. Using Null here made the
+                        # unrelated "[Null].add(x) -> [x]" rule fire the next
+                        # time this key was navigated into and mutated,
+                        # silently replacing the nested dict+ with a
+                        # single-element list and corrupting the structure.
+                        obj[args[0]] = RDict(kind='dictplus')
+                    else:
+                        # Per spec the key's value starts as Null. The paired
+                        # _eval_method_call special-case above upgrades it to
+                        # a list the first time something is added to it, so
+                        # we don't need a placeholder [] here (bugs.log #3).
+                        obj[args[0]] = None
                 elif len(args) >= 2:
                     obj[args[0]] = args[1]
                 return None
@@ -2215,6 +2678,38 @@ class Debugger:
         "i1024": (-(2**1023),  2**1023 - 1),
         "i2048": (-(2**2047),  2**2047 - 1),
     }
+
+    def _binop_operand_int_type(self, node):
+        """Best-effort: the DECLARED Rubidium int type of one BinOp operand,
+        or None if it can't be determined statically from the AST shape. A
+        Number LITERAL deliberately returns None (not a guessed type) — the
+        compiler itself treats a bare literal as unconstrained (infers it at
+        i64 or wider, see codegen's Number inference), so guessing a
+        narrower type for it here could clamp too early and diverge from
+        the compiler in the opposite direction from the bug being fixed."""
+        if isinstance(node, ast.Var):
+            info = self.scope.lookup(node.name)
+            vt = info.get('type') if info else None
+            return vt if vt in self._INT_BOUNDS else None
+        return None
+
+    _INT_WIDTH_ORDER = ["i32", "i64", "i128", "i256", "i512", "i1024", "i2048"]
+
+    def _binop_int_common_type(self, node):
+        """The type to clamp a `+`/`-`/`*` BinOp's result at immediately,
+        mirroring the compiler's promote_type (wider operand type wins) —
+        or None when either side isn't a known-typed variable (see
+        _binop_operand_int_type), in which case the PRE-EXISTING behavior
+        (clamp only if/when the result is later narrowed by an assignment)
+        is left untouched rather than risking an incorrect early clamp."""
+        lt = self._binop_operand_int_type(node.left)
+        rt = self._binop_operand_int_type(node.right)
+        if not lt or not rt:
+            return None
+        try:
+            return lt if self._INT_WIDTH_ORDER.index(lt) >= self._INT_WIDTH_ORDER.index(rt) else rt
+        except ValueError:
+            return None
 
     def _clamp_int(self, value, vtype):
         bounds = self._INT_BOUNDS.get(vtype)
@@ -2471,7 +2966,16 @@ class Analyzer:
         key isn't a simple literal (e.g. a variable) and can't be checked
         statically."""
         if isinstance(node, ast.Number):
-            return ('num', node.value)
+            # OPEN-C follow-up: distinct tags for int vs float — Python's own
+            # `1 == 1.0` would otherwise make this static check (the
+            # interpreter itself is fixed via RKey/_rtype_eq above) treat an
+            # i32 key `1` and a float key `1.0` as the same literal key, the
+            # same way 'bool' already keeps `1` and `True` apart below. Stays
+            # a 2-tuple, like every other branch here — callers display
+            # lit[1] as the raw key value (e.g. f"{lit[1]!r}"), which a wider
+            # tuple would have broken.
+            tag = 'num_float' if isinstance(node.value, float) else 'num_int'
+            return (tag, node.value)
         if isinstance(node, ast.Str):
             return ('str', node.value)
         if isinstance(node, ast.Bool):

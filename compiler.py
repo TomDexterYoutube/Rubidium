@@ -1103,6 +1103,19 @@ char* unbox_s_dup(Box* b) {
     return strdup((b && b->type == 2 && b->s) ? b->s : "");
 }
 
+// BUG (found via syntax sweep): `let t = s` for plain `str` variables used to
+// just copy the raw pointer — s and t ended up aliased, and dropping either
+// side left the other dangling (a real heap-use-after-free, confirmed under
+// AddressSanitizer). codegen now strdup()s on variable-to-variable string
+// assignment to give the target its own independent buffer (THE DEEP COPY
+// RULE is a GENERAL rule, not scoped to collections). Plain strdup(NULL) is
+// undefined behavior in C, and NULL here means the source has already been
+// .drop()'d — propagate NULL through rather than crashing or masking it as
+// an empty string.
+char* rub_strdup_safe(char* s) {
+    return s ? strdup(s) : NULL;
+}
+
 Box* collection_get_at(Box* col_box, int idx) {
     if (!col_box) return box_i(0);
     if (col_box->type == 2) {
@@ -1798,6 +1811,18 @@ Box* file_list_dir(const char* path) {
 char* str_replace(const char* str, const char* old, const char* new_str) {
     if(!str || !old) return strdup(str ? str : "");
     size_t old_len = strlen(old);
+    // BUG (found via syntax sweep): an EMPTY `old` string is a genuine
+    // infinite loop, confirmed hanging: strstr(p, "") matches at the
+    // CURRENT position on every call (an empty needle matches everywhere),
+    // and `p += old_len` with old_len==0 never advances p, so the
+    // occurrence-counting loop below never terminates — `.replace("", "X")`
+    // on any string hangs the program forever. There's no single obvious
+    // "correct" semantics for replacing an empty string (languages differ:
+    // e.g. Python inserts between every character), and the spec doesn't
+    // address it, so this treats it as a safe no-op — the string comes back
+    // unchanged — rather than hanging or guessing at a new behavior nobody
+    // asked for.
+    if(old_len == 0) return strdup(str);
     size_t new_len = strlen(new_str);
     size_t count = 0;
     const char* p = str;
