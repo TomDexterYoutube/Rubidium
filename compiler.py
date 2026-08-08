@@ -1333,6 +1333,59 @@ char* list_combine(Box* col_box) {
     out[pos] = '\0';
     return out;
 }
+
+// FFI buffer conversion (syntax's FFI BUFFERS section): bridges a
+// type-forced Rubidium `list` to/from a flat, contiguous C-style buffer —
+// the layout a C function expecting an "array" (glBufferData and similar)
+// actually wants, with no Box wrapper and no per-element indirection.
+// elem_kind is a small compile-time-known tag: 0=i32, 1=i64, 2=f32, 3=f64
+// — the only widths a real C ABI uses; codegen picks it from the list's
+// forced element type (self.element_types) and passes it as a constant.
+void* list_to_flat_buffer(Box* list_box, int elem_kind) {
+    if (!list_box || list_box->type != 3) return NULL;
+    int* magic = (int*)list_box->p;
+    if (!magic || *magic != 1) return NULL;
+    RList* l = (RList*)list_box->p;
+    size_t elem_sz = (elem_kind == 0) ? sizeof(int) :
+                      (elem_kind == 1) ? sizeof(long long) :
+                      (elem_kind == 2) ? sizeof(float) : sizeof(double);
+    void* buf = malloc(l->count > 0 ? (size_t)l->count * elem_sz : 1);
+    for (int i = 0; i < l->count; i++) {
+        Box* e = l->items[i];
+        if (elem_kind == 0)      ((int*)buf)[i]       = (int)(e ? e->i : 0);
+        else if (elem_kind == 1) ((long long*)buf)[i]  = (e ? e->i : 0);
+        else if (elem_kind == 2) ((float*)buf)[i]      = (float)(e ? e->f : 0.0);
+        else                     ((double*)buf)[i]     = (e ? e->f : 0.0);
+    }
+    return buf;
+}
+// Reverse direction: read `count` elements of the given kind from a flat C
+// buffer directly INTO an existing, already-`mut`, already type-forced
+// Rubidium list — replaces whatever the list held before. Mutates in place
+// (like .add()/.set() already do) rather than returning a brand new value,
+// so no new "assign the result of a builtin" plumbing is needed in codegen.
+void flat_buffer_into_list(void* ptr, long long count, int elem_kind, Box* target_list_box) {
+    if (!target_list_box || target_list_box->type != 3) return;
+    int* magic = (int*)target_list_box->p;
+    if (!magic || *magic != 1) return;
+    RList* l = (RList*)target_list_box->p;
+    for (int i = 0; i < l->count; i++) box_drop(l->items[i]);
+    l->count = 0;
+    if (!ptr || count <= 0) return;
+    if ((long long)l->cap < count) {
+        l->cap = (int)count;
+        l->items = realloc(l->items, (size_t)l->cap * sizeof(Box*));
+    }
+    for (long long i = 0; i < count; i++) {
+        Box* e;
+        if (elem_kind == 0)      e = box_i(((int*)ptr)[i]);
+        else if (elem_kind == 1) e = box_i(((long long*)ptr)[i]);
+        else if (elem_kind == 2) e = box_f((double)((float*)ptr)[i]);
+        else                     e = box_f(((double*)ptr)[i]);
+        l->items[i] = e;
+    }
+    l->count = (int)count;
+}
 // -------------------------------------------------------
 #include <unistd.h>
 #include <sys/wait.h>

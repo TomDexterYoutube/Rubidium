@@ -399,6 +399,12 @@ class CodeGen:
     _NULL_SENTINEL = "-2147483648"
     _NULL_SENTINEL_FLOAT = "0xFFF0000000000000"  # IEEE -infinity, exact across float/double
 
+    # syntax: FFI BUFFERS — .as_ffi_buffer()/.from_ffi_buffer() only support
+    # the widths a real C ABI actually uses; wider Rubidium int/float types
+    # (i128+/f128+) already can't round-trip through the boxed-scalar 64-bit
+    # `i`/`f` fields (same existing limitation noted for print/coerce_to_box).
+    _FFI_BUFFER_KINDS = {"i32": 0, "i64": 1, "f32": 2, "f64": 3}
+
     _INT_IR = {"i32": "i32", "i64": "i64", "i128": "i128",
                "i256": "i256", "i512": "i512", "i1024": "i1024", "i2048": "i2048"}
     _FLT_IR = {"f32": "float", "f64": "double",
@@ -722,6 +728,8 @@ class CodeGen:
             "declare i64 @strtol(i8*, i8**, i32)", "declare i64 @atol(i8*)",
             "declare i8* @strndup(i8*, i64)", "declare i32 @fclose(i8*)",
             "declare i8* @list_combine(%Box*)",
+            "declare i8* @list_to_flat_buffer(%Box*, i32)",   # syntax: FFI BUFFERS
+            "declare void @flat_buffer_into_list(i8*, i64, i32, %Box*)",
             "declare %Box* @box_deep_copy(%Box*)",
             "declare i8* @fopen(i8*, i8*)", "declare i64 @fread(i8*, i64, i64, i8*)",
             "declare i64 @fwrite(i8*, i64, i64, i8*)", "declare i64 @fseek(i8*, i64, i32)",
@@ -1120,6 +1128,7 @@ class CodeGen:
             
             if node.method == "len": return "i64"
             if node.method == "char": return "i8*"
+            if node.method == "as_ffi_buffer": return "i8*"
             if node.method in ("contains", "has"): return "i1"
             if node.method == "combine": return "i8*"
             if node.method in ("concat", "set", "insert", "replace"): return "i8*"
@@ -1501,10 +1510,108 @@ class CodeGen:
             self._emit_default_return(ret_ir, False)
         self._fn_error_exit_label = None
         self.emit("}\n")
+        # syntax: FFI CALLBACKS — the real function above is done; now also
+        # generate its C-ABI trampoline, buffered into the same
+        # _pending_trampolines mechanism so it flushes right below.
+        if node.is_callback:
+            self._emit_callback_trampoline(node)
         # Flush any trampolines generated during this function
         if self._pending_trampolines:
             self.fn_lines += self._pending_trampolines
             self._pending_trampolines = []
+
+    def _emit_callback_trampoline(self, node):
+        """syntax: FFI CALLBACKS. Emits `@{name}_c_trampoline` — a plain-C-ABI
+        wrapper C can call directly. Its entire body just marshals arguments
+        and makes a normal internal call to the real function (@name, already
+        compiled just above), reusing exactly the same call-emission a
+        Rubidium-to-Rubidium call site already uses — so none of Rubidium's
+        own per-call setup (temp-arena marks, error propagation, all handled
+        inside @name's own emit_fn-generated body) needs to be duplicated
+        here. Mirrors emit_ffi_bind's trampoline, which does the same thing
+        in the opposite direction (Rubidium calling into C)."""
+        c_param_types = [self._ffi_type_to_ir(pt) for _, pt in node.params]
+        internal_param_types = [self.rubi_type_to_ir(pt) for _, pt in node.params]
+        c_ret_t = self._ffi_type_to_ir(node.ret_type) if node.ret_type else "i64"
+        internal_ret_t = self.rubi_type_to_ir(node.ret_type) if node.ret_type else "i64"
+
+        tramp_name = f"{node.name}_c_trampoline"
+        params_ir = ", ".join(f"{t} %p{i}" for i, t in enumerate(c_param_types))
+        pending = [f"\ndefine {c_ret_t} @{tramp_name}({params_ir}) {{", "entry:"]
+
+        # BUGFIX (found under AddressSanitizer testing this feature): every
+        # other function's body gets a temp-arena mark/release pair from
+        # emit_body (see _emit_temp_mark/_emit_temp_release) — this
+        # trampoline builds its IR into a local `pending` list rather than
+        # through self.emit(), which is exactly why emit_ffi_bind's own
+        # trampoline does the same manual replication rather than calling
+        # those self.emit()-based helpers (they'd inject into the OUTER
+        # function currently being compiled, not this one). Without a mark
+        # here, the box_i() call below (for an Any-typed param) was
+        # confirmed leaking 48 bytes per invocation — nothing ever freed it.
+        mark_tmp = self.new_tmp()
+        pending.append(f"  {mark_tmp} = call i64 @rub_temp_mark()")
+
+        # Marshal each C-typed incoming arg into what the real function
+        # expects. Every declared type maps identically under
+        # _ffi_type_to_ir/rubi_type_to_ir EXCEPT Any (i64 at the C boundary,
+        # %Box* internally, same as any other Any-typed value) — box it the
+        # same way box_i() already boxes any other raw integer/handle, and
+        # track it the same way _track_temp() tracks any other freshly
+        # boxed value so the release below actually finds it.
+        call_args = []
+        for i, (c_t, internal_t) in enumerate(zip(c_param_types, internal_param_types)):
+            if c_t == internal_t:
+                call_args.append(f"{internal_t} %p{i}")
+            else:
+                box_tmp = self.new_tmp()
+                pending.append(f"  {box_tmp} = call %Box* @box_i(i64 %p{i})")
+                tracked_tmp = self.new_tmp()
+                pending.append(f"  {tracked_tmp} = call %Box* @rub_temp_track(%Box* {box_tmp})")
+                call_args.append(f"{internal_t} {tracked_tmp}")
+
+        ret_tmp = self.new_tmp()
+        pending.append(f"  {ret_tmp} = call {internal_ret_t} @{node.name}({', '.join(call_args)})")
+
+        # If the real function propagated an uncaught error, there is no
+        # Rubidium caller to hand it further up to — C called this directly.
+        # Clear the flag and return a plain default rather than crashing the
+        # whole program from inside what may be a minor event-handler.
+        err_flag = self.new_tmp()
+        pending.append(f"  {err_flag} = load i1, i1* @_rub_error_flag")
+        err_l, ok_l = self.new_label("ctramp_err"), self.new_label("ctramp_ok")
+        pending.append(f"  br i1 {err_flag}, label %{err_l}, label %{ok_l}")
+        pending.append(f"{err_l}:")
+        pending.append(f"  store i1 0, i1* @_rub_error_flag")
+        pending.append(f"  call void @rub_temp_release_to(i64 {mark_tmp})")
+        if c_ret_t in ("float", "double"):
+            default_ret = "0.0"
+        elif c_ret_t == "fp128":
+            default_ret = "0xL00000000000000000000000000000000"
+        elif c_ret_t.endswith("*"):
+            default_ret = "null"
+        else:
+            default_ret = "0"
+        pending.append(f"  ret {c_ret_t} {default_ret}")
+        pending.append(f"{ok_l}:")
+
+        # BUG-3 note (same reasoning as any other caller of a Rubidium
+        # function): a returned %Box* is deliberately left tracked by the
+        # callee, sitting above THIS trampoline's own mark — it's this
+        # trampoline's job, as the caller, to free it. Unbox first (when the
+        # C return type differs), then release everything back to the mark
+        # — the boxed args above and, for an Any return, the now-copied-out
+        # returned box itself.
+        if internal_ret_t == c_ret_t:
+            pending.append(f"  call void @rub_temp_release_to(i64 {mark_tmp})")
+            pending.append(f"  ret {c_ret_t} {ret_tmp}")
+        else:
+            unbox_tmp = self.new_tmp()
+            pending.append(f"  {unbox_tmp} = call i64 @unbox_i(%Box* {ret_tmp})")
+            pending.append(f"  call void @rub_temp_release_to(i64 {mark_tmp})")
+            pending.append(f"  ret {c_ret_t} {unbox_tmp}")
+        pending.append("}")
+        self._pending_trampolines += pending
 
     def emit_body(self, stmts):
         # Push a new scope for this block
@@ -3845,11 +3952,34 @@ class CodeGen:
                 self.emit(f"  {elem_copy} = call %Box* @box_copy(%Box* {elem})")
                 return elem_copy, "%Box*"
             
+            # syntax: FFI CALLBACKS — a bare function name (no call
+            # parentheses) referencing a `fn callback` means "give me its
+            # trampoline's address," not "read a variable" — checked only
+            # once name resolution as an actual variable has failed (a
+            # variable of the same name, if one legitimately existed here,
+            # must still win — matches the language's own "names must be
+            # unique within a scope" rule, so the two can never genuinely
+            # collide anyway).
+            is_var = (any(node.name in scope for scope in self.local_vars_stack)
+                      or node.name in self.global_vars)
+            if not is_var:
+                fn_obj = self.functions.get(node.name)
+                if fn_obj is not None and getattr(fn_obj, "is_callback", False):
+                    # A function value in LLVM IR is a strongly-typed function
+                    # pointer (return type + full param list), not i8* — build
+                    # that exact type string, matching how emit_ffi_bind
+                    # builds fn_ptr_t for the same reason.
+                    c_param_types = [self._ffi_type_to_ir(pt) for _, pt in fn_obj.params]
+                    c_ret_t = self._ffi_type_to_ir(fn_obj.ret_type) if fn_obj.ret_type else "i64"
+                    fn_ptr_t = f"{c_ret_t} ({', '.join(c_param_types)})*" if c_param_types else f"{c_ret_t} ()*"
+                    addr = self.new_tmp()
+                    self.emit(f"  {addr} = ptrtoint {fn_ptr_t} @{fn_obj.name}_c_trampoline to i64")
+                    return addr, "i64"
             ptr_str, ir_t = self.get_var_ptr(node.name)
             tmp = self.new_tmp()
             self.emit(f"  {tmp} = load {ir_t}, {ir_t}* {ptr_str}")
             return tmp, ir_t
-            
+
         if isinstance(node, FieldAccess): return self.emit_field_access(node.obj, node.field)
         if isinstance(node, MathBlock): return self.emit_math_block(node)
         if isinstance(node, BinOp): return self.emit_binop(node)
@@ -4221,6 +4351,27 @@ class CodeGen:
                     # even coerce into correctly.
                     if is_ffi and param_rubi_types[i] == "Any" and isinstance(a, None_):
                         v = "0"
+                    elif is_ffi and target_t == "i64" and t == "i8*":
+                        # BUG (found building syntax's FFI BUFFERS feature):
+                        # the generic coerce() path for i8*->i64 calls
+                        # @atol() — correct for "parse this string's TEXT as
+                        # a number" (e.g. .to(i64) on a str), but an i8* value
+                        # crossing into an Any-typed FFI parameter is a raw
+                        # pointer, not text to parse: an FFI-bound function
+                        # expecting `Any` almost always wants the pointer's
+                        # ADDRESS (a void* in C terms), same as a .as_ffi_buffer()
+                        # result. atol() on a buffer of raw float bytes reads
+                        # them as if they were an ASCII decimal string —
+                        # confirmed crashing (SIGSEGV) end-to-end. This path
+                        # was never previously exercised: every existing FFI
+                        # call site passes str-typed params directly (already
+                        # i8*, no i64 coercion needed) or an explicit Null
+                        # literal (handled above) into Any slots — ptrtoint
+                        # (reinterpret the address, don't parse it) is correct
+                        # for every case that actually reaches here.
+                        tmp_pi = self.new_tmp()
+                        self.emit(f"  {tmp_pi} = ptrtoint i8* {v} to i64")
+                        v = tmp_pi
                     else:
                         v = self.coerce(v, t, target_t)
                     t = target_t
@@ -4890,7 +5041,50 @@ class CodeGen:
             tmp = self.new_tmp()
             self.emit(f"  {tmp} = call i32 @collection_len(%Box* {obj_val})")
             return tmp, "i32"
-        
+
+        # syntax: FFI BUFFERS — .as_ffi_buffer() flattens a type-forced list
+        # into a raw C-compatible buffer for FFI calls (glBufferData and
+        # similar). Only valid on a list whose element type was FORCED with
+        # `: TYPE` (self.element_types), since codegen needs to know the
+        # per-element width to lay it out flat.
+        if obj_t == "%Box*" and node.method == "as_ffi_buffer" and not node.args:
+            elem_t = self.element_types.get(obj_name)
+            kind = self._FFI_BUFFER_KINDS.get(elem_t)
+            if kind is None:
+                raise RubidiumTypeError(
+                    f"'{obj_name}.as_ffi_buffer()': list must have a forced "
+                    f"element type of i32/i64/f32/f64 to convert to an FFI "
+                    f"buffer (e.g. `let {obj_name}: list: f32 = [...]`), "
+                    f"got {elem_t!r}"
+                )
+            tmp = self.new_tmp()
+            self.emit(f"  {tmp} = call i8* @list_to_flat_buffer(%Box* {obj_val}, i32 {kind})")
+            return tmp, "i8*"
+
+        # syntax: FFI BUFFERS — the reverse: read a raw C buffer a foreign
+        # function wrote into (e.g. a shader-log or pixel-readback buffer)
+        # back into this already-declared, type-forced `mut` list, replacing
+        # its previous contents in place — same mutation convention as
+        # .add()/.set(), so no new "assign the result of a builtin" codegen
+        # path is needed.
+        if obj_t == "%Box*" and node.method == "from_ffi_buffer" and len(node.args) == 2:
+            elem_t = self.element_types.get(obj_name)
+            kind = self._FFI_BUFFER_KINDS.get(elem_t)
+            if kind is None:
+                raise RubidiumTypeError(
+                    f"'{obj_name}.from_ffi_buffer()': list must have a forced "
+                    f"element type of i32/i64/f32/f64 (e.g. `let mut "
+                    f"{obj_name}: list: f32 = [...]`), got {elem_t!r}"
+                )
+            if obj_name not in self.mutable_vars:
+                raise RubidiumTypeError(f"Immutable '{obj_name}' — from_ffi_buffer() mutates the list in place, declare it with mut")
+            ptr_v, ptr_t = self.emit_expr(node.args[0])
+            ptr_v = self.coerce(ptr_v, ptr_t, "i8*")
+            count_v, count_t = self.emit_expr(node.args[1])
+            count_v = self.coerce(count_v, count_t, "i64")
+            self.emit(f"  call void @flat_buffer_into_list(i8* {ptr_v}, i64 {count_v}, i32 {kind}, %Box* {obj_val})")
+            return "0", "i64"
+
         # Collection .combine() — join all items as a string
         if obj_t == "%Box*" and node.method == "combine" and not node.args:
             tmp = self.new_tmp()

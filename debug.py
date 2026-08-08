@@ -1628,6 +1628,21 @@ class Debugger:
                 return node.name
             info = self.scope.lookup(node.name)
             if info is None:
+                # syntax: FFI CALLBACKS — a bare reference to a `fn callback`
+                # is valid Rubidium (it means "give me this function's C
+                # trampoline address," not "read a variable"), but the
+                # debugger has no real C-ABI trampoline to hand back and no
+                # ctypes-based callback marshaling yet — give a clear,
+                # specific message instead of the generic (and here
+                # misleading) "used before declaration."
+                fn_def = self._fn_defs.get(node.name)
+                if fn_def is not None and getattr(fn_def, "is_callback", False):
+                    self.error(
+                        f"'{node.name}' is a callback function (fn callback) — "
+                        f"passing it as a value isn't supported in debug mode yet; "
+                        f"compile and run the real binary to test callback behavior"
+                    )
+                    return None
                 self.error(f"Variable '{node.name}' used before declaration")
                 return None
             if info.get("dropped"):

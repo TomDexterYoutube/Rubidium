@@ -104,11 +104,18 @@ class While:
         self.body = body
 
 class FnDef:
-    def __init__(self, name, params, ret_type, body):
+    def __init__(self, name, params, ret_type, body, is_callback=False):
         self.name = name
         self.params = params
         self.ret_type = ret_type
         self.body = body
+        # syntax: FFI CALLBACKS — `fn callback name(...) { ... }`. Kept as a
+        # flag on ordinary FnDef (rather than a separate AST node type) so
+        # every existing FnDef-handling call site across the parser/codegen/
+        # debugger/multi-file-import machinery keeps working unchanged; only
+        # codegen's function-emission and bare-name-as-value resolution
+        # need to actually branch on it.
+        self.is_callback = is_callback
 
 class FnCall:
     def __init__(self, name, args):
@@ -275,6 +282,7 @@ class FFIBind:
         self.params      = params
         self.ret_type    = ret_type
         self.alias       = alias    # Rubidium-side callable name; falls back to symbol_name
+
 
 # File handle nodes
 class FileOpen:

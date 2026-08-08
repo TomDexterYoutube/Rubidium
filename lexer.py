@@ -52,6 +52,12 @@ TOKEN_SPEC = [
     ("TYPE",     r"\bstr\+|\bdict\+|\bSY\b|\b(?:i32|i64|i128|i256|i512|i1024|i2048|f32|f64|f128|f256|f512|f1024|f2048|str|bool|list|index|dict|Any)\b"),
     ("LOCAL",    r"\blocal\b"),
     ("OPEN",     r"\bopen\b"),
+    # syntax: FFI CALLBACKS — `fn callback name(...) { ... }`, a soft
+    # keyword the same way local/open/file are (its own token type, matched
+    # before the generic IDENT catch-all, so it can't double as a variable
+    # or function name — but only meaningful right after `fn`, everywhere
+    # else it's simply unavailable as an identifier).
+    ("CALLBACK", r"\bcallback\b"),
 
     ("IDENT",    r"[a-zA-Z_][a-zA-Z0-9_]*"),
 

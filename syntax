@@ -1420,6 +1420,151 @@ import math_tools as mt
 mt.sin(1.0)
 mt.sqrt(25.0)
 
+# -----------------------------------------
+# FFI BUFFERS
+# -----------------------------------------
+
+# Every Rubidium `list` is really a small managed box behind the scenes —
+# that's what lets .add(), .set(), mixed types like ["hello", 2.5, True],
+# and automatic memory tracking all work. C has no idea what that box is.
+# When a C function's documentation says it wants "an array," it means
+# something dumb and rigid: a bare row of numbers sitting one after another
+# in memory, plus a separate count of how many there are. .as_ffi_buffer()
+# is the translator between those two worlds.
+
+# You'll only need this at the boundary where you're handing data to (or
+# reading data back from) a C library that talks about an "array," a
+# "buffer," or a pointer + a count together — never for ordinary Rubidium
+# code.
+
+# Step 1: build the data as a normal list, but FORCE its element type with
+# `: TYPE` — required, not optional, for the next step. It tells the
+# compiler exactly what C primitive each element becomes once flattened.
+# Only i32, i64, f32, and f64 are supported (the widths a real C ABI
+# actually uses).
+
+let verts: list: f32 = [0.0, 1.0, 0.0, -1.0, -1.0, 0.0]
+
+# Step 2: .as_ffi_buffer() copies every value out of the list's internal
+# box into one flat, contiguous block of memory — exactly the shape a C
+# function expects. What you get back is a raw memory address, not a list
+# anymore — no .add()/.set()/.len() on it, it's only for FFI calls.
+
+let buf = verts.as_ffi_buffer()
+
+# Step 3: pass it straight into the C function. Most C libraries that want
+# a buffer also want the ELEMENT COUNT (not the byte size) — verts.len()
+# gives you that; check the specific function's own docs for whether it
+# wants a count or a byte size instead (multiply by the element's byte
+# width yourself if so).
+
+glBufferData(GL_ARRAY_BUFFER, verts.len(), buf, GL_STATIC_DRAW)
+
+# Step 4: once you're truly done with the buffer, free it. Rubidium never
+# frees this for you automatically — same "you must .drop() it yourself"
+# rule as everything else, it just can't silently disappear at scope end
+# the way a `let local` would since it isn't a normal Rubidium value.
+
+buf.drop()
+
+# The reverse direction — when a C function WRITES data back into a buffer
+# you give it (reading a shader compile log, pixel data, etc.): declare a
+# `mut`, type-forced list sized to hold what you expect back, turn IT into
+# a buffer the same way, hand that buffer to the C function, then read the
+# buffer back into the list with .from_ffi_buffer() — this replaces the
+# list's contents in place, the same mutation convention as .add()/.set().
+
+let mut result: list: f32 = [0.0, 0.0, 0.0, 0.0, 0.0]   # sized for 5 floats
+let rbuf = result.as_ffi_buffer()
+some_c_function_that_fills_a_buffer(rbuf, 5)
+result.from_ffi_buffer(rbuf, 5)
+rbuf.drop()
+
+# Rules:
+# - .as_ffi_buffer() only works on a list whose type was forced with
+#   `: TYPE`. A plain `list` (or one with mixed types) is a compile error —
+#   Rubidium needs to know the element type to know its byte width.
+# - The value from .as_ffi_buffer() is only useful for FFI calls — it is
+#   not a list.
+# - You are responsible for .drop()-ing it when done.
+# - .from_ffi_buffer(pointer, count) requires the receiving list to be
+#   declared `mut`.
+
+# -----------------------------------------
+# FFI CALLBACKS
+# -----------------------------------------
+
+# Everything the FFI section above does is Rubidium being the one in
+# charge — you call a C function, it runs, it hands an answer back, done.
+# A callback flips that around: you're telling a C library "here's a piece
+# of code — don't run it now, hang onto it, and call it YOURSELF later,
+# whenever something happens." GLFW doesn't know when you're going to press
+# a key. So instead, you hand GLFW the address of a function ahead of
+# time, and GLFW calls it the instant a key is pressed — possibly seconds
+# or minutes from now, from code you don't control the timing of at all.
+
+# Why this needs its own keyword instead of just "get the address": a
+# normal Rubidium function is compiled expecting to be called BY OTHER
+# RUBIDIUM CODE, which quietly sets a few things up every time a function
+# is called — memory bookkeeping, and a way to report errors back up the
+# chain. Think of it like an employee who needs their desk, badge, and
+# tools ready before their shift starts — Rubidium sets all of that up
+# automatically every time you call a function, without you ever seeing it
+# happen. If C just called your function's raw address directly, none of
+# that setup would happen. `fn callback` exists so you never have to think
+# about this — it quietly builds a small "receptionist" in front of your
+# function that does Rubidium's setup first, then calls your real code,
+# every single time C calls in.
+
+# `fn callback` is just like a normal `fn`, with a body and everything —
+# the ONLY difference is the word `callback` right after `fn`. That one
+# word tells the compiler "a C library is going to call this directly, at
+# some unpredictable point in the future — build the receptionist for it."
+# Because of this, `callback` is a reserved word — it can't be used as a
+# variable or parameter name anywhere, the same as `local`/`open`/`file`.
+
+# The parameter types here are NOT your choice — they have to match
+# EXACTLY what the C library's own documentation says it will pass to your
+# function. C decides the shape; Rubidium just needs to be told what it
+# is, the same way you already tell it the shape of a C function you're
+# calling INTO (fn ffi_lib my_c_function(msg: str) -> i32 as my_function).
+
+fn callback my_key_handler(window: Any, key: i32, scancode: i32, action: i32, mods: i32) -> Any {
+    print(i"key pressed: {key}")
+}
+
+# Handing GLFW the callback: write the function's NAME, with no
+# parentheses and no arguments. Parentheses would CALL it right now,
+# today, once — which isn't what you want. Leaving them off means "here's
+# the function itself, hang onto it and call it yourself later." This is
+# the one new piece of syntax here: everywhere else in Rubidium, a bare
+# function name with no call is an error — but for a name declared with
+# `fn callback`, it's how you hand it off.
+
+glfw.set_key_callback(win, my_key_handler)
+
+# From this point on, you don't call my_key_handler yourself at all — GLFW
+# does, on its own schedule, every time a key event happens, for as long
+# as your program keeps polling for events (glfwPollEvents()). Nothing
+# else about writing the function's BODY is different from any other
+# Rubidium function — print(), global variables, everything works
+# normally inside it, specifically because the generated receptionist
+# already did the setup before your code runs.
+
+# Rules:
+# - Use `fn callback` instead of plain `fn` ONLY for a function you're
+#   going to hand to a C library as an event handler. Every other function
+#   stays exactly as `fn` as always.
+# - The parameter types and return type must match what the C library
+#   will actually call your function with — the compiler cannot check this
+#   for you, the same way it can't check a regular FFI binding's signature.
+# - Write the function name with NO parentheses when handing it to a C
+#   library expecting a callback. With parentheses, it's an ordinary
+#   function call, right now, once.
+# - Not yet supported: calling/passing a `fn callback` in debug mode
+#   (`xeon run --debug` / the debugger) — compile and run the real binary
+#   to test callback behavior.
+
 # =========================================
 # MODULES & IMPORTS
 # =========================================

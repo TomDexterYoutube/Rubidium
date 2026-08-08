@@ -224,6 +224,45 @@ class Parser:
 
     def fn_def(self):
         self.match("FN")
+        # syntax: FFI CALLBACKS — `fn callback name(params) -> ret { body }`.
+        # A real function (has a body, unlike FFIBind below) that ALSO gets a
+        # C-ABI trampoline generated for it in codegen, so its address can be
+        # handed to a C library expecting an event-handler function pointer.
+        # Detected by the CALLBACK token right after `fn` — must be checked
+        # before the SY-reflection logic below, since a callback is always
+        # declared with a real name, never a `(sy_name)` substitution.
+        if self.peek() and self.peek()[0] == "CALLBACK":
+            self.match("CALLBACK")
+            name = self.match("IDENT")
+            params = []
+            self.match("LPAREN")
+            while self.peek() and self.peek()[0] != "RPAREN":
+                pname = self.match("IDENT") or self.match("TYPE") or self.match("FILE")
+                # BUGFIX (found bringing up FFI CALLBACKS): if a param name is
+                # a token type nothing above matches (a keyword — e.g. the
+                # word `callback` itself, now reserved, used as a param
+                # name), pname is None and NOTHING in this iteration
+                # consumes a token — self.peek() never changes and the loop
+                # spins forever. Confirmed hanging on
+                # `fn callback h(callback: Any) {...}`. Same class of bug as
+                # the missing-LPAREN case already fixed below for plain
+                # functions — raise a clear error instead of hanging.
+                if pname is None:
+                    raise SyntaxError(f"Expected a parameter name at line {self.line_no}, got {self.peek()}")
+                self.match("COLON")
+                ptype = self.match("TYPE") or self.match("IDENT")
+                params.append((pname, ptype))
+                if self.peek() and self.peek()[0] == "COMMA":
+                    self.match("COMMA")
+            self.match("RPAREN")
+            ret_type = None
+            if self.peek() and self.peek()[1] == "->":
+                self.match("OP")
+                ret_type = self.match("TYPE")
+            self.match("LBRACE")
+            body = self.block()
+            self.match("RBRACE")
+            return FnDef(name, params, ret_type, body, is_callback=True)
         # BUGFIX/FEATURE (bugs.log #2): `fn (function_name) { ... }` — dynamic
         # function name substituted from a previously-declared SY symbol.
         # BUGFIX (bugs.log #9): record the holder name (before substitution)
@@ -244,6 +283,17 @@ class Parser:
             params = []
             while self.peek() and self.peek()[0] != "RPAREN":
                 pname = self.match("IDENT") or self.match("TYPE")
+                # BUGFIX (found bringing up FFI CALLBACKS): a param name that
+                # matches neither token type (a keyword — e.g. `callback`,
+                # now reserved, as an FFI param name — a very natural thing
+                # to call a function-pointer parameter) leaves pname None
+                # and consumes nothing, so self.peek() never changes and
+                # this loop spins forever. Confirmed hanging on
+                # `fn lib f(callback: Any) as f`. Same class of bug as the
+                # missing-LPAREN case already fixed below for plain
+                # functions — raise a clear error instead of hanging.
+                if pname is None:
+                    raise SyntaxError(f"Expected a parameter name at line {self.line_no}, got {self.peek()}")
                 self.match("COLON")
                 # BUGFIX (bugs.log #18): a class-typed parameter (e.g.
                 # `x: Warehouse`) is tokenized as IDENT, not TYPE — TYPE only
@@ -282,6 +332,14 @@ class Parser:
             while self.peek() and self.peek()[0] != "RPAREN":
                 # Parameter name can be an identifier or a keyword (like file, var, etc.)
                 pname = self.match("IDENT") or self.match("TYPE") or self.match("FILE") or self.match("VAR")
+                # BUGFIX (found bringing up FFI CALLBACKS): a param name
+                # that matches none of the above (a keyword — e.g.
+                # `callback`, now reserved) leaves pname None and consumes
+                # nothing, so this loop spins forever instead of erroring.
+                # Same class of bug as the missing-LPAREN case just above —
+                # raise a clear error instead of hanging.
+                if pname is None:
+                    raise SyntaxError(f"Expected a parameter name at line {self.line_no}, got {self.peek()}")
                 self.match("COLON")
                 # BUGFIX (bugs.log #18): see the identical fix in the FFI
                 # binding branch above — class-typed parameters are
