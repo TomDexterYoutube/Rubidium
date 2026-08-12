@@ -1,6 +1,7 @@
 from rub_ast import *
 from decimal import Decimal
 from fractions import Fraction
+import re
 
 extern_decls = '''
 declare i32 @pthread_create(i64*, i64*, i8* (i8*)*, i8*)
@@ -368,6 +369,68 @@ class CodeGen:
             return out
         return val
 
+    def _null_safe_str(self, val):
+        """BUGFIX (found reviewing user code, same root cause as the str-vs-
+        Null comparison crash): a `str` value can genuinely be a real null
+        i8* pointer at runtime (that IS what Null means for str — see
+        coerce()'s "null" handling), but nearly every string method
+        (_emit_string_method_impl below) hands the receiver AND its string-
+        typed arguments straight to a raw libc call — strlen/strstr/atol/
+        strtod/strcpy/strcat/strncpy — with no null check. Any of those on a
+        NULL argument is undefined behavior; confirmed segfaulting on
+        .len()/.has()/.to()/.set()/.insert() called on (or with) a Null
+        string, in ordinary spec-legal code, not just a contrived case.
+        Substitutes a pointer to an interned empty string whenever the
+        value is null, via a `select` (no branching/control-flow needed) —
+        matches the "Null treated as empty string" convention str_replace/
+        str_slice already use internally, just applied uniformly instead of
+        ad hoc per function."""
+        empty_lbl, empty_len = self.intern_str("")
+        empty_ptr = self.new_tmp()
+        self.emit(f"  {empty_ptr} = getelementptr [{empty_len} x i8], [{empty_len} x i8]* {empty_lbl}, i64 0, i64 0")
+        is_null = self.new_tmp()
+        self.emit(f"  {is_null} = icmp eq i8* {val}, null")
+        safe = self.new_tmp()
+        self.emit(f"  {safe} = select i1 {is_null}, i8* {empty_ptr}, i8* {val}")
+        return safe
+
+    def _emit_str_index_bounds_check(self, safe_ptr, idx_i, allow_at_end=False):
+        """BUGFIX (found investigating the Null-safety fixes above — a
+        SEPARATE, non-Null-specific bug): .char()/.set()/.insert() compute
+        a raw `getelementptr` into the string's buffer from a caller-
+        supplied index with NO bounds check at all — `text.set(50, "Z")`
+        on a 2-character string silently writes 50 bytes past a 3-byte
+        malloc'd buffer. Confirmed real heap corruption: a moderate
+        out-of-bounds offset landed inside the allocator's own bookkeeping
+        without AddressSanitizer flagging it as a use-after/heap-overflow
+        (the corrupted bytes just weren't read back in that particular
+        repro), and a large offset segfaults outright — undefined behavior
+        either way, not something to leave silently reachable. Raises the
+        spec's own documented "Invalid index access" runtime error (see
+        syntax's Runtime Error Examples) instead, catchable via try/error
+        like any other. `allow_at_end`: insert()'s "before an index" can
+        legally target the position just past the last character (spec:
+        `text.insert(5, "!")` on 5-char "Hello" inserts at the very end);
+        char()/set() read/overwrite an existing character, so they require
+        a STRICTLY in-bounds index."""
+        len_v = self.new_tmp()
+        self.emit(f"  {len_v} = call i64 @strlen(i8* {safe_ptr})")
+        too_low = self.new_tmp()
+        self.emit(f"  {too_low} = icmp slt i64 {idx_i}, 0")
+        too_high = self.new_tmp()
+        pred = "sgt" if allow_at_end else "sge"
+        self.emit(f"  {too_high} = icmp {pred} i64 {idx_i}, {len_v}")
+        oob = self.new_tmp()
+        self.emit(f"  {oob} = or i1 {too_low}, {too_high}")
+        ok_l, bad_l = self.new_label("stridx_ok"), self.new_label("stridx_oob")
+        self.emit(f"  br i1 {oob}, label %{bad_l}, label %{ok_l}")
+        self.emit(f"{bad_l}:")
+        err_lbl, err_len = self.intern_str("Invalid index access")
+        err_ptr = self.new_tmp()
+        self.emit(f"  {err_ptr} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
+        self._emit_raise_or_propagate(err_ptr)
+        self.emit(f"{ok_l}:")
+
     def _escape_temp(self, val, ir_t):
         """Move a value OUT of the temporary arena because it will outlive the
         block that produced it — it is being stored in a global / class field,
@@ -399,12 +462,6 @@ class CodeGen:
     _NULL_SENTINEL = "-2147483648"
     _NULL_SENTINEL_FLOAT = "0xFFF0000000000000"  # IEEE -infinity, exact across float/double
 
-    # syntax: FFI BUFFERS — .as_ffi_buffer()/.from_ffi_buffer() only support
-    # the widths a real C ABI actually uses; wider Rubidium int/float types
-    # (i128+/f128+) already can't round-trip through the boxed-scalar 64-bit
-    # `i`/`f` fields (same existing limitation noted for print/coerce_to_box).
-    _FFI_BUFFER_KINDS = {"i32": 0, "i64": 1, "f32": 2, "f64": 3}
-
     _INT_IR = {"i32": "i32", "i64": "i64", "i128": "i128",
                "i256": "i256", "i512": "i512", "i1024": "i1024", "i2048": "i2048"}
     _FLT_IR = {"f32": "float", "f64": "double",
@@ -427,6 +484,12 @@ class CodeGen:
     _INT_BITS = {"i32": 32, "i64": 64, "i128": 128,
                  "i256": 256, "i512": 512, "i1024": 1024, "i2048": 2048}
 
+    # syntax: FFI C TYPES — FFI.type(list) only supports the widths a real C
+    # ABI actually uses; wider Rubidium int/float types (i128+/f128+) already
+    # can't round-trip through the boxed-scalar 64-bit `i`/`f` fields (same
+    # existing limitation noted for print/coerce_to_box).
+    _FFI_BUFFER_KINDS = {"i32": 0, "i64": 1, "f32": 2, "f64": 3}
+
     def _int_bounds(self, ir_type):
         """Return (min, max) representable signed values for an integer IR type."""
         bits = self._INT_BITS[ir_type]
@@ -445,13 +508,114 @@ class CodeGen:
         if t in self._TYPE_RANK: return t
         return "i64"
 
+    def _is_ffi_type_call(self, t):
+        """True if t LOOKS LIKE an attempted `FFI.type(...)` call — valid or
+        not. Used to give a clear error for a malformed one (a string
+        argument, e.g. FFI.type("list"), the old removed spelling; zero/
+        extra args) instead of letting it silently fall through to whatever
+        generic-type handling treats an unrecognized value as."""
+        return isinstance(t, MethodCall) and t.method == "type" \
+            and isinstance(t.obj, Var) and t.obj.name == "FFI"
+
+    def _c_type_name(self, t):
+        """If t is an `FFI.type(name)` marker parsed at an FFI-bind
+        parameter-type position (the argument is a bare Rubidium type
+        keyword, e.g. `list` — TYPE tokens parse as Var(name), same as any
+        other "TYPE token used as an argument" spot), return its name
+        string, else None (including when it LOOKS like an attempted
+        FFI.type(...) call but is malformed — see _is_ffi_type_call)."""
+        if self._is_ffi_type_call(t) and t.args and isinstance(t.args[0], Var):
+            return t.args[0].name
+        return None
+
     def _ffi_type_to_ir(self, t):
         """Like rubi_type_to_ir, but for FFI signatures. 'Any' here means an opaque
         C pointer or int-sized value (e.g. GLFWwindow*, int) — mapping it to
         Rubidium's %Box* (an internal boxed-value struct pointer) would be an ABI
         mismatch with the foreign function, which knows nothing about Boxes."""
+        c_type_name = self._c_type_name(t)
+        if c_type_name == "list": return "i8*"
+        # syntax: FFI C TYPES — FFI.type(X) for any other X (a scalar type
+        # with an already-well-defined raw ABI shape, e.g. FFI.type(i32)) is
+        # just an explicit spelling of that same type — same IR either way.
+        if c_type_name is not None: return self._ffi_type_to_ir(c_type_name)
         if t == "Any": return "i64"
+        if t == "void": return "void"
         return self.rubi_type_to_ir(t)
+
+    # syntax: FFI C TYPES — a Rubidium type with no defined raw-ABI layout
+    # (Rubidium's own boxed list/index/dict/dict+ collections, or a bare
+    # user-defined class/struct instance) can't cross an FFI call as-is —
+    # no foreign C-ABI-based language has a matching shape for an internal
+    # %Box*/struct. Without this check the type silently fell back to a
+    # plain i64 (see rubi_type_to_ir's fallback), passing a garbage
+    # pointer-sized integer instead of erroring. FFI.type(...) (recognized
+    # via _c_type_name above) is the documented escape hatch for the one
+    # shape that IS convertible today (list).
+    _FFI_ABI_ILLEGAL_BARE_TYPES = {"list", "index", "dict", "dict+"}
+
+    # syntax: FFI C TYPES — index/dict/dict+ have no defined raw-ABI layout
+    # for FFI.type(...) to convert them into. Unlike `list` (homogeneous,
+    # ordered, a forced element type + count maps directly onto a C array),
+    # index has arbitrary-typed keys, dict's values are themselves variable-
+    # length lists, and dict+ nests to unbounded depth — none of that fits
+    # the flat "pointer + count" shape list gets. Not implemented; explicit
+    # rejection instead of the silent %Box*/garbage-i64 fallback these used
+    # to get by slipping past this check inside an FFI.type(...) wrapper.
+    _FFI_TYPE_UNSUPPORTED_COLLECTIONS = {"index", "dict", "dict+"}
+
+    def _check_ffi_param_types(self, fn_display_name, params):
+        for pname, ptype in params:
+            c_type_name = self._c_type_name(ptype)
+            if c_type_name is not None:
+                # FFI.type(...) only actually CONVERTS `list` (see
+                # _ffi_type_to_ir) — everything else it accepts is a
+                # passthrough of an already-ABI-safe scalar. A class
+                # instance wrapped in it is still illegal: wrapping doesn't
+                # give it a raw-ABI layout it doesn't otherwise have.
+                if c_type_name in self.class_defs:
+                    raise RubidiumTypeError(
+                        f"FFI binding '{fn_display_name}': parameter '{pname}' "
+                        f"has type 'FFI.type({c_type_name})', but '{c_type_name}' is "
+                        f"a class instance with no defined raw-ABI layout — "
+                        f"FFI.type(...) converts a list, not a class instance."
+                    )
+                if c_type_name in self._FFI_TYPE_UNSUPPORTED_COLLECTIONS:
+                    raise RubidiumTypeError(
+                        f"FFI binding '{fn_display_name}': parameter '{pname}' "
+                        f"has type 'FFI.type({c_type_name})' — {c_type_name} isn't "
+                        f"supported by FFI.type(...); only list is convertible today."
+                    )
+                # syntax: void means "no value at all" — meaningful only as
+                # an FFI binding's RETURN type (a real C function with no
+                # return value slot). A parameter always receives a real
+                # argument on every call, so "a parameter of no value" has
+                # no meaning here either, same as it has none in C itself.
+                if c_type_name == "void":
+                    raise RubidiumTypeError(
+                        f"FFI binding '{fn_display_name}': parameter '{pname}' "
+                        f"has type 'FFI.type(void)' — void isn't a valid parameter "
+                        f"type (only a return type). Remove this parameter if the "
+                        f"foreign function doesn't take it, or declare it 'Any' and "
+                        f"pass Null if it expects a real argument that just carries "
+                        f"no value."
+                    )
+                continue
+            if self._is_ffi_type_call(ptype):
+                raise RubidiumTypeError(
+                    f"FFI binding '{fn_display_name}': parameter '{pname}' has a "
+                    f"malformed FFI.type(...) — it takes exactly one bare type "
+                    f"keyword argument (e.g. FFI.type(list), FFI.type(i32)), not "
+                    f"a string or a missing/extra argument."
+                )
+            if ptype in self._FFI_ABI_ILLEGAL_BARE_TYPES or ptype in self.class_defs:
+                raise RubidiumTypeError(
+                    f"FFI binding '{fn_display_name}': parameter '{pname}' "
+                    f"has type '{ptype}', which can't cross an FFI call directly "
+                    f"— there's no defined raw-ABI layout for a Rubidium "
+                    f"{'collection' if ptype in self._FFI_ABI_ILLEGAL_BARE_TYPES else 'class instance'}. "
+                    f"Use a primitive/pointer type, or FFI.type(list) for a list."
+                )
 
     def promote_type(self, a, b):
         """Return the higher-ranked IR type for mixed-width arithmetic."""
@@ -591,6 +755,33 @@ class CodeGen:
 
     def class_ir_type(self, class_name): return f"%class_{class_name}"
 
+    def _class_instantiate_candidate(self, value_node):
+        """bugs.log OPEN-O: the class name a VarDecl's RHS MIGHT be
+        instantiating, for any of the three syntactic shapes that can mean
+        "construct an instance" — a same-file bare call (`player()`, parsed
+        as a plain FnCall), an already-recognized ClassInstantiate node, or
+        an IMPORTED, namespaced call (`shapes.circle()`, parsed as
+        MethodCall(Var("shapes"), "circle", args)). For the namespaced
+        case, resolves "shapes" through import_aliases to the real module
+        name and combines it with the module prefix compiler.py's
+        multi-file merge already gives every class — the exact same
+        convention functions/variables already use for cross-file
+        namespaced access, just never wired up for classes: the merge pass
+        renames `circle` to `shapes_circle` internally, but nothing
+        previously rewrote the CALL SITE to match, so an imported class
+        was unreachable by any name. Returns None if value_node isn't any
+        of these shapes; the caller still needs to check the result
+        against self.class_defs, same as before — this only resolves the
+        NAME to check."""
+        if isinstance(value_node, ClassInstantiate):
+            return value_node.class_name
+        if isinstance(value_node, FnCall) and isinstance(value_node.name, str):
+            return value_node.name
+        if isinstance(value_node, MethodCall) and isinstance(value_node.obj, Var):
+            real_mod = self.import_aliases.get(value_node.obj.name, value_node.obj.name)
+            return f"{real_mod}_{value_node.method}"
+        return None
+
     def emit_class_type(self, cls):
         field_types = []
         for f in cls.fields:
@@ -713,6 +904,7 @@ class CodeGen:
             "declare void @print_bignum_or_null(i64*, i32)",
             "declare i8* @bignum_to_str(i64*, i32)",
             "declare void @print_int_plain(i64)",       # OPEN-4: no Null-sentinel check
+            "declare void @rub_clear_screen()",         # syntax: PRINT & INPUT — clear()
             "declare void @print_i128_plain(i128)",
             "declare void @print_bignum_plain(i64*, i32)",
             "declare void @print_fp128_exact(i64, i64)",  # float precision fix: raw fp128 bits (lo, hi)
@@ -720,6 +912,7 @@ class CodeGen:
             "declare i8* @malloc(i64)", "declare void @free(i8*)", "declare i64 @strlen(i8*)",
             "declare i32 @scanf(i8*, ...)", "declare i8* @fgets(i8*, i32, i8*)",
             "declare i8* @strcpy(i8*, i8*)", "declare i32 @strcmp(i8*, i8*)",
+            "declare i32 @rub_strcmp_null_safe(i8*, i8*)",
             "declare i8* @strcat(i8*, i8*)", "declare i8* @strstr(i8*, i8*)",
             "declare i8* @rub_strdup_safe(i8*)",  # BUG: str variable-to-variable assignment aliasing
             "declare i8* @strncpy(i8*, i8*, i64)",
@@ -728,8 +921,7 @@ class CodeGen:
             "declare i64 @strtol(i8*, i8**, i32)", "declare i64 @atol(i8*)",
             "declare i8* @strndup(i8*, i64)", "declare i32 @fclose(i8*)",
             "declare i8* @list_combine(%Box*)",
-            "declare i8* @list_to_flat_buffer(%Box*, i32)",   # syntax: FFI BUFFERS
-            "declare void @flat_buffer_into_list(i8*, i64, i32, %Box*)",
+            "declare i8* @list_to_flat_buffer(%Box*, i32)",   # syntax: FFI C TYPES — FFI.type(list)
             "declare %Box* @box_deep_copy(%Box*)",
             "declare i8* @fopen(i8*, i8*)", "declare i64 @fread(i8*, i64, i64, i8*)",
             "declare i64 @fwrite(i8*, i64, i64, i8*)", "declare i64 @fseek(i8*, i64, i32)",
@@ -813,10 +1005,59 @@ class CodeGen:
         )
 
     def _inject_init_call(self):
+        # BUG (reported via an agent's investigation, and independently
+        # confirmed to have nothing to do with either bare-bool operands or
+        # loops — the minimal repro is `fn main() { print(True and False) }`,
+        # no variables, no loop, first statement in the file): this patch
+        # retroactively inserts a conditional-branch block right after
+        # main()'s `entry:` label, splicing it between `entry` and whatever
+        # was ALREADY generated as the rest of the body. Any `phi` already
+        # emitted in that body — `and`/`or`'s short-circuit codegen
+        # (_emit_short_circuit) is the only thing that emits one this early
+        # — was built by _cur_block_label(), which correctly found "entry"
+        # as the current block AT THE TIME it ran (before this patch
+        # existed). Once this patch runs, `entry` no longer falls straight
+        # through into the body — it now branches to `_rub_init_ok_l` first
+        # — so a phi still claiming `%entry` as a predecessor names a block
+        # that doesn't actually branch directly to it anymore: invalid IR
+        # (clang's parser crashed outright on it rather than a clean
+        # diagnostic). Confirmed happening for ANY and/or — literal, bare
+        # variable, or comparison operands all equally trigger it — the
+        # actual condition is just "and/or is the first branch-introducing
+        # construct anywhere in main() before this patch runs to fix it up."
+        # Fix: rewrite any phi predecessor that says `%entry` to the block
+        # that is now the REAL direct predecessor, `_rub_init_ok_l`, once
+        # the injection point has been passed. Scoped to inside main() only
+        # (via in_main/injected) — a phi's own literal `%entry` in any OTHER
+        # function refers to THAT function's own untouched entry block and
+        # must not be touched.
+        #
+        # BUGFIX (found immediately after the fix above, via my own
+        # regression testing — and/or as the first statement of a plain
+        # function or class method defined anywhere in the SAME file):
+        # self.fn_lines holds every function's IR concatenated together in
+        # one list, not just main()'s — in_main/injected are plain booleans
+        # that, once set True while scanning through main(), never got
+        # reset back to False on exiting it. Any OTHER function compiled
+        # after main() (in emission order) that ALSO happens to have and/or
+        # as its first branching statement has its own, entirely legitimate
+        # `%entry` phi reference (that function's own untouched entry block
+        # — _inject_init_call only ever patches main()) — but the stale
+        # still-True flags made the substitution above fire on it anyway,
+        # rewriting a correct reference into `%_rub_init_ok_l`, a label
+        # that doesn't exist in that function at all ("use of undefined
+        # value '%_rub_init_ok_l'"). Reset in_main the moment a bare `}`
+        # closes whatever `define` is currently open — LLVM IR never nests
+        # braces within a function body, so the first standalone `}` after
+        # `define i32 @main() {` reliably marks leaving it.
         patched = []; in_main = False; injected = False
         for line in self.fn_lines:
+            if in_main and injected and " phi " in line and "%entry" in line:
+                line = re.sub(r"%entry(?=\s*\])", "%_rub_init_ok_l", line)
             patched.append(line)
             if line.strip() == "define i32 @main() {": in_main = True
+            elif in_main and line.strip() == "}":
+                in_main = False; injected = False
             elif in_main and not injected and line.strip() == "entry:":
                 patched.append("  call void @_rubidium_init_rng()")
                 patched.append("  call i64 @_rubidium_init()")
@@ -1128,7 +1369,6 @@ class CodeGen:
             
             if node.method == "len": return "i64"
             if node.method == "char": return "i8*"
-            if node.method == "as_ffi_buffer": return "i8*"
             if node.method in ("contains", "has"): return "i1"
             if node.method == "combine": return "i8*"
             if node.method in ("concat", "set", "insert", "replace"): return "i8*"
@@ -1275,9 +1515,9 @@ class CodeGen:
         for node in stmts:
             if isinstance(node, VarDecl):
                 if node.is_local: continue
-                if isinstance(node.value, (ClassInstantiate, FnCall)):
-                    raw_cn = node.value.class_name if isinstance(node.value, ClassInstantiate) else node.value.name
-                    if raw_cn in self.class_defs:
+                if isinstance(node.value, (ClassInstantiate, FnCall, MethodCall)):
+                    raw_cn = self._class_instantiate_candidate(node.value)  # bugs.log OPEN-O
+                    if raw_cn and raw_cn in self.class_defs:
                         # BUGFIX (bugs.log #12): this pre-scan pass runs BEFORE
                         # real codegen and recurses into every function body
                         # (including main()). Real codegen registers
@@ -1339,6 +1579,12 @@ class CodeGen:
                 cn = node.value.class_name
             elif isinstance(node.value, FnCall) and node.value.name in self.class_defs:
                 cn = node.value.name
+            elif isinstance(node.value, MethodCall):
+                # bugs.log OPEN-O: imported, namespaced class instantiation
+                # (`shapes.circle()`) — see _class_instantiate_candidate.
+                candidate = self._class_instantiate_candidate(node.value)
+                if candidate and candidate in self.class_defs:
+                    cn = candidate
             
             if cn:
                 ir_t = f"{self.class_ir_type(cn)}*"
@@ -1412,9 +1658,9 @@ class CodeGen:
         for node in stmts:
             if isinstance(node, VarDecl):
                 if only_local and not node.is_local: continue
-                if isinstance(node.value, (ClassInstantiate, FnCall)):
-                    raw_cn = node.value.class_name if isinstance(node.value, ClassInstantiate) else node.value.name
-                    if raw_cn in self.class_defs or f"main_{raw_cn}" in self.class_defs:
+                if isinstance(node.value, (ClassInstantiate, FnCall, MethodCall)):
+                    raw_cn = self._class_instantiate_candidate(node.value)  # bugs.log OPEN-O
+                    if raw_cn and (raw_cn in self.class_defs or f"main_{raw_cn}" in self.class_defs):
                         continue
                 ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
                 type_map.setdefault(node.name, set()).add(ir_t)
@@ -1764,12 +2010,12 @@ class CodeGen:
             is_class = False
             cn = ""
             is_class_copy_src = None  # set when source is an existing instance var
-            if isinstance(node.value, (ClassInstantiate, FnCall)):
-                raw_cn = node.value.class_name if isinstance(node.value, ClassInstantiate) else (node.value.name if isinstance(node.value.name, str) else "")
-                if raw_cn in self.class_defs:
+            if isinstance(node.value, (ClassInstantiate, FnCall, MethodCall)):
+                raw_cn = self._class_instantiate_candidate(node.value)  # bugs.log OPEN-O
+                if raw_cn and raw_cn in self.class_defs:
                     cn = raw_cn
                     is_class = True
-                elif f"main_{raw_cn}" in self.class_defs:
+                elif raw_cn and f"main_{raw_cn}" in self.class_defs:
                     cn = f"main_{raw_cn}"
                     is_class = True
             elif isinstance(node.value, Var) and node.value.name in self.instances:
@@ -1829,7 +2075,7 @@ class CodeGen:
                     if is_class_copy_src:
                         self.emit_class_copy(ptr_str, cn, is_class_copy_src)
                     else:
-                        init_args = node.value.args if isinstance(node.value, FnCall) else []
+                        init_args = node.value.args if isinstance(node.value, (FnCall, MethodCall)) else []  # bugs.log OPEN-O
                         self.emit_class_init(ptr_str, cn, init_args)
                     return False
 
@@ -1882,7 +2128,7 @@ class CodeGen:
                     if is_class_copy_src:
                         self.emit_class_copy(ptr_str, cn, is_class_copy_src)
                     else:
-                        init_args = node.value.args if isinstance(node.value, (FnCall, ClassInstantiate)) else []
+                        init_args = node.value.args if isinstance(node.value, (FnCall, ClassInstantiate, MethodCall)) else []  # bugs.log OPEN-O
                         self.emit_class_init(ptr_str, cn, init_args)
                     return False
                 ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
@@ -1934,7 +2180,7 @@ class CodeGen:
                     self.instances[node.name] = cn
                     self.declare_global(node.name, f"{struct_t}*")
                     if node.mutable: self.mutable_vars.add(node.name)
-                    init_args = node.value.args if isinstance(node.value, FnCall) else []
+                    init_args = node.value.args if isinstance(node.value, (FnCall, MethodCall)) else []  # bugs.log OPEN-O
                     ir_name = f"_var_{node.name}" if node.name in ("pow", "sin", "cos", "tan", "sqrt", "log", "log10", "exp", "fabs", "floor", "ceil", "round") else node.name
                     if is_class_copy_src:
                         self.emit_class_copy(f"@{ir_name}", cn, is_class_copy_src)
@@ -2106,6 +2352,16 @@ class CodeGen:
                     result, _ = self.emit_string_method(obj_val, node.method, node.args)
                     ptr_str, _ = self.get_var_ptr(node.obj.name)
                     self.emit(f"  store i8* {result}, i8** {ptr_str}")
+                    # BUGFIX (found reviewing user code): .set()/.insert()/
+                    # .replace() always produce a real, non-null buffer (even
+                    # an empty one) — but this mutation path never updates
+                    # self.null_valued, so a variable that started as Null
+                    # still shows "Null" from print()/`as str` afterward
+                    # (both keyed off that compile-time set), even though
+                    # its actual value is now a real string. Confirmed:
+                    # `let mut n: str = Null; n.set(0, "x"); print(n)`
+                    # printed "Null" despite n == Null correctly being False.
+                    self.null_valued.discard(node.obj.name)
                     return False
             self.emit_method_call_expr(node)
         elif isinstance(node, ElementDrop):
@@ -3238,7 +3494,10 @@ class CodeGen:
         empty_ptr = self.new_tmp()
         self.emit(f"  {empty_ptr} = getelementptr [{elen} x i8], [{elen} x i8]* {empty_lbl}, i64 0, i64 0")
         cmp_res = self.new_tmp()
-        self.emit(f"  {cmp_res} = call i32 @strcmp(i8* {line_s}, i8* {empty_ptr})")
+        # Defensive: rub_strcmp_null_safe (not plain strcmp) in case
+        # file_readln ever returns NULL rather than an empty string — see
+        # the identical reasoning at emit_compare's i8*-vs-i8* case.
+        self.emit(f"  {cmp_res} = call i32 @rub_strcmp_null_safe(i8* {line_s}, i8* {empty_ptr})")
         self.emit(f"  {cond} = icmp eq i32 {cmp_res}, 0")
         self.emit(f"  br i1 {cond}, label %{end_l}, label %{body_l}\n{body_l}:")
 
@@ -3674,9 +3933,23 @@ class CodeGen:
           3. Calls it with the provided args
         We store the binding so calling symbol(args) works normally afterwards.
         """
+        # syntax: FFI C TYPES — reject any parameter type with no defined
+        # raw-ABI layout before emitting anything against it.
+        self._check_ffi_param_types(node.alias or node.symbol_name, node.params)
+
         # Build param IR types
         param_ir_types = [self._ffi_type_to_ir(pt) for _, pt in node.params]
-        ret_ir = self._ffi_type_to_ir(node.ret_type) if node.ret_type else "i64"
+        # bugs.log: an FFI binding with no `-> ret` was previously assumed
+        # to return i64 here, but debug.py's ctypes-based FFI call already
+        # assumed void (`fn.restype = None if not bind['ret'] else ...`,
+        # debug.py) for the identical omitted-return-type case — the
+        # compiler and debugger disagreed on what an omitted return type
+        # means. `void` (explicit or omitted) now means what it means in C:
+        # a real foreign function that returns nothing, matching the vast
+        # majority of OpenGL/GLFW-style APIs (glClear, glBindBuffer,
+        # glfwPollEvents, ...) which were previously unusable without
+        # reading a garbage i64 out of the return register.
+        ret_ir = self._ffi_type_to_ir(node.ret_type) if node.ret_type else "void"
         fn_ptr_t = f"{ret_ir} ({', '.join(param_ir_types)})*" if param_ir_types else f"{ret_ir} ()*"
         # Rubidium-callable name: use 'as' alias when provided, else fall back to C symbol name
         fn_name = node.alias if node.alias else node.symbol_name
@@ -3729,7 +4002,11 @@ class CodeGen:
         pending.append(f"  {is_null} = icmp eq i64 {raw_fp}, 0")
         pending.append(f"  br i1 {is_null}, label %{bad_lbl}, label %{ok_lbl}")
         pending.append(f"{bad_lbl}:")
-        if ret_ir in ("float", "double"):
+        if ret_ir == "void":
+            # `ret void 0`/`ret void null` are invalid IR — a void return
+            # takes no value at all.
+            pending.append("  ret void")
+        elif ret_ir in ("float", "double"):
             pending.append(f"  ret {ret_ir} 0.0")
         elif ret_ir in ("i8*", "%Box*") or ret_ir.endswith("*"):
             pending.append(f"  ret {ret_ir} null")
@@ -3743,9 +4020,16 @@ class CodeGen:
 
         # Call the foreign function
         args_str = ", ".join(f"{pt} %p{i}" for i, pt in enumerate(param_ir_types))
-        call_tmp = f"%ffi_ret_{self.new_tmp()[1:]}"
-        pending.append(f"  {call_tmp} = call {ret_ir} {fp_cast}({args_str})")
-        pending.append(f"  ret {ret_ir} {call_tmp}")
+        if ret_ir == "void":
+            # `%tmp = call void ...` is invalid IR — a void call's result
+            # can't be assigned to a register at all, unlike every other
+            # return type.
+            pending.append(f"  call void {fp_cast}({args_str})")
+            pending.append("  ret void")
+        else:
+            call_tmp = f"%ffi_ret_{self.new_tmp()[1:]}"
+            pending.append(f"  {call_tmp} = call {ret_ir} {fp_cast}({args_str})")
+            pending.append(f"  ret {ret_ir} {call_tmp}")
         pending.append("}")
 
         self._pending_trampolines += pending
@@ -4120,9 +4404,19 @@ class CodeGen:
                 args_ir = [f"{struct_t}* {self_val}"]
                 for i, a in enumerate(node.args):
                     av, at = self.emit_expr(a)
-                    if i < len(param_types):
-                        av = self.coerce(av, at, param_types[i])
-                        at = param_types[i]
+                    # BUGFIX (RIG report): param_types[0] is __self's slot, so a
+                    # real user arg at position i must be checked against
+                    # param_types[i + 1], not param_types[i] — the old off-by-
+                    # one coerced every argument against the PREVIOUS param's
+                    # type (arg 0 against __self's struct type, arg 1 against
+                    # param 0's type, etc.), and silently dropped type-checking
+                    # for the last real argument entirely. This corrupted any
+                    # sibling call mixing types (e.g. an f64 arg coerced against
+                    # an i32 slot came out as garbage in the callee).
+                    pt_idx = i + 1
+                    if pt_idx < len(param_types):
+                        av = self.coerce(av, at, param_types[pt_idx])
+                        at = param_types[pt_idx]
                     args_ir.append(f"{at} {av}")
                 tmp = self.new_tmp()
                 self.emit(f"  {tmp} = call {ret_ir} @{ir_method}({', '.join(args_ir)})")
@@ -4139,6 +4433,12 @@ class CodeGen:
 
         if node.name == "input":
             return self.emit_expr(Input(node.args[0] if node.args else None))
+
+        # syntax: PRINT & INPUT — clear() wipes the whole terminal (println()
+        # already overwrites just the current line).
+        if node.name == "clear":
+            self.emit("  call void @rub_clear_screen()")
+            return "0", "i64"
 
         # C library math functions.
         # BUG-8: a USER-DEFINED function of the same name must win. This branch
@@ -4345,28 +4645,56 @@ class CodeGen:
                 v, t = self.emit_expr(a)
                 if i < len(param_types):
                     target_t = param_types[i]
+                    # syntax: FFI C TYPES — `FFI.type(list)` flattens a
+                    # type-forced Rubidium list into a raw C-compatible
+                    # buffer for this parameter, in place of you calling a
+                    # manual conversion method yourself.
+                    if is_ffi and self._c_type_name(param_rubi_types[i]) == "list":
+                        if not isinstance(a, Var):
+                            raise RubidiumTypeError(
+                                f"FFI.type(list) parameter requires a plain list variable, got {type(a).__name__}"
+                            )
+                        elem_t = self.element_types.get(a.name)
+                        kind = self._FFI_BUFFER_KINDS.get(elem_t)
+                        if kind is None:
+                            raise RubidiumTypeError(
+                                f"'{a.name}' passed to an FFI.type(list) parameter must be a list with a "
+                                f"forced element type of i32/i64/f32/f64 (e.g. `let {a.name}: list: f32 = [...]`), "
+                                f"got {elem_t!r}"
+                            )
+                        buf_tmp = self.new_tmp()
+                        self.emit(f"  {buf_tmp} = call i8* @list_to_flat_buffer(%Box* {v}, i32 {kind})")
+                        # BUG: list_to_flat_buffer mallocs a fresh buffer with
+                        # no Rubidium-level handle for the caller to .drop()
+                        # themselves (unlike the old .as_ffi_buffer(), this
+                        # conversion happens inline in argument evaluation) —
+                        # track it in the scope's temp arena the same way
+                        # every other freshly-malloc'd i8* result is (e.g.
+                        # box_to_cstr's _track_temp call above), so it's
+                        # freed automatically at the end of the block instead
+                        # of leaking on every call.
+                        v = self._track_temp(buf_tmp, "i8*")
                     # An explicit `Null` passed for an `Any` FFI parameter means
                     # the actual C NULL pointer (0), not Rubidium's %Box*
                     # Null-sentinel value — an FFI signature has no `%Box*` to
                     # even coerce into correctly.
-                    if is_ffi and param_rubi_types[i] == "Any" and isinstance(a, None_):
+                    elif is_ffi and param_rubi_types[i] == "Any" and isinstance(a, None_):
                         v = "0"
                     elif is_ffi and target_t == "i64" and t == "i8*":
-                        # BUG (found building syntax's FFI BUFFERS feature):
-                        # the generic coerce() path for i8*->i64 calls
+                        # BUG: the generic coerce() path for i8*->i64 calls
                         # @atol() — correct for "parse this string's TEXT as
                         # a number" (e.g. .to(i64) on a str), but an i8* value
                         # crossing into an Any-typed FFI parameter is a raw
                         # pointer, not text to parse: an FFI-bound function
                         # expecting `Any` almost always wants the pointer's
-                        # ADDRESS (a void* in C terms), same as a .as_ffi_buffer()
-                        # result. atol() on a buffer of raw float bytes reads
-                        # them as if they were an ASCII decimal string —
-                        # confirmed crashing (SIGSEGV) end-to-end. This path
-                        # was never previously exercised: every existing FFI
-                        # call site passes str-typed params directly (already
-                        # i8*, no i64 coercion needed) or an explicit Null
-                        # literal (handled above) into Any slots — ptrtoint
+                        # ADDRESS (a void* in C terms). atol() on a buffer of
+                        # raw bytes reads them as if they were an ASCII
+                        # decimal string — confirmed crashing (SIGSEGV)
+                        # end-to-end. This path was never previously
+                        # exercised: every existing FFI call site passes
+                        # str-typed params directly (already i8*, no i64
+                        # coercion needed) or an explicit Null literal
+                        # (handled above) into Any slots — ptrtoint
                         # (reinterpret the address, don't parse it) is correct
                         # for every case that actually reaches here.
                         tmp_pi = self.new_tmp()
@@ -4376,11 +4704,24 @@ class CodeGen:
                         v = self.coerce(v, t, target_t)
                     t = target_t
                 args_ir.append(f"{t} {v}")
-            tmp = self.new_tmp()
             fn_ret = fn_obj.ret_type
-            ret_ir = type_map(fn_ret) if fn_ret else "i64"
+            # bugs.log: an FFI binding with no `-> ret` means void (see
+            # emit_ffi_bind) — matches this same default there. Non-FFI
+            # internal functions keep the pre-existing i64 default
+            # unchanged, since that's an established, separate behavior.
+            ret_ir = type_map(fn_ret) if fn_ret else ("void" if is_ffi else "i64")
             # BUGFIX (bugs.log #1): call fn_obj.name, the actual emitted symbol,
             # which differs from target_name only for reserved-C-symbol collisions.
+            if ret_ir == "void":
+                # `%tmp = call void ...` is invalid IR — emit as a bare
+                # statement and hand back a harmless placeholder value for
+                # any expression-position caller (using a void FFI call's
+                # "result" is a spec-level user error, not something codegen
+                # needs to synthesize a real value for).
+                self.emit(f"  call void @{fn_obj.name}({', '.join(args_ir)})")
+                self._emit_error_propagation_check()
+                return "0", "i64"
+            tmp = self.new_tmp()
             self.emit(f"  {tmp} = call {ret_ir} @{fn_obj.name}({', '.join(args_ir)})")
             self._emit_error_propagation_check()
             return tmp, ret_ir
@@ -5042,49 +5383,6 @@ class CodeGen:
             self.emit(f"  {tmp} = call i32 @collection_len(%Box* {obj_val})")
             return tmp, "i32"
 
-        # syntax: FFI BUFFERS — .as_ffi_buffer() flattens a type-forced list
-        # into a raw C-compatible buffer for FFI calls (glBufferData and
-        # similar). Only valid on a list whose element type was FORCED with
-        # `: TYPE` (self.element_types), since codegen needs to know the
-        # per-element width to lay it out flat.
-        if obj_t == "%Box*" and node.method == "as_ffi_buffer" and not node.args:
-            elem_t = self.element_types.get(obj_name)
-            kind = self._FFI_BUFFER_KINDS.get(elem_t)
-            if kind is None:
-                raise RubidiumTypeError(
-                    f"'{obj_name}.as_ffi_buffer()': list must have a forced "
-                    f"element type of i32/i64/f32/f64 to convert to an FFI "
-                    f"buffer (e.g. `let {obj_name}: list: f32 = [...]`), "
-                    f"got {elem_t!r}"
-                )
-            tmp = self.new_tmp()
-            self.emit(f"  {tmp} = call i8* @list_to_flat_buffer(%Box* {obj_val}, i32 {kind})")
-            return tmp, "i8*"
-
-        # syntax: FFI BUFFERS — the reverse: read a raw C buffer a foreign
-        # function wrote into (e.g. a shader-log or pixel-readback buffer)
-        # back into this already-declared, type-forced `mut` list, replacing
-        # its previous contents in place — same mutation convention as
-        # .add()/.set(), so no new "assign the result of a builtin" codegen
-        # path is needed.
-        if obj_t == "%Box*" and node.method == "from_ffi_buffer" and len(node.args) == 2:
-            elem_t = self.element_types.get(obj_name)
-            kind = self._FFI_BUFFER_KINDS.get(elem_t)
-            if kind is None:
-                raise RubidiumTypeError(
-                    f"'{obj_name}.from_ffi_buffer()': list must have a forced "
-                    f"element type of i32/i64/f32/f64 (e.g. `let mut "
-                    f"{obj_name}: list: f32 = [...]`), got {elem_t!r}"
-                )
-            if obj_name not in self.mutable_vars:
-                raise RubidiumTypeError(f"Immutable '{obj_name}' — from_ffi_buffer() mutates the list in place, declare it with mut")
-            ptr_v, ptr_t = self.emit_expr(node.args[0])
-            ptr_v = self.coerce(ptr_v, ptr_t, "i8*")
-            count_v, count_t = self.emit_expr(node.args[1])
-            count_v = self.coerce(count_v, count_t, "i64")
-            self.emit(f"  call void @flat_buffer_into_list(i8* {ptr_v}, i64 {count_v}, i32 {kind}, %Box* {obj_val})")
-            return "0", "i64"
-
         # Collection .combine() — join all items as a string
         if obj_t == "%Box*" and node.method == "combine" and not node.args:
             tmp = self.new_tmp()
@@ -5241,6 +5539,11 @@ class CodeGen:
         return res, res_t
 
     def _emit_string_method_impl(self, obj_val, method, args):
+        # BUGFIX (see _null_safe_str above): the receiver could be a genuine
+        # Null str at runtime — sanitize once here so every method below
+        # (all of which eventually hand it to a raw libc string function)
+        # is safe uniformly, instead of patching each one individually.
+        obj_val = self._null_safe_str(obj_val)
         if method == "len":
             tmp = self.new_tmp()
             self.emit(f"  {tmp} = call i64 @strlen(i8* {obj_val})")
@@ -5249,6 +5552,7 @@ class CodeGen:
             # str.char(0) returns the character at 0-based index (per spec)
             idx_v, idx_t = self.emit_expr(args[0])
             idx_i = self.coerce(idx_v, idx_t, "i64")
+            self._emit_str_index_bounds_check(obj_val, idx_i)
             char_ptr = self.new_tmp()
             self.emit(f"  {char_ptr} = getelementptr i8, i8* {obj_val}, i64 {idx_i}")
             char_val = self.new_tmp()
@@ -5266,14 +5570,14 @@ class CodeGen:
             return result, "i8*"
         if method == "contains" and len(args) == 1:
             needle_v, needle_t = self.emit_expr(args[0])
-            needle_v = self.coerce(needle_v, needle_t, "i8*")
+            needle_v = self._null_safe_str(self.coerce(needle_v, needle_t, "i8*"))
             strstr_r, tmp = self.new_tmp(), self.new_tmp()
             self.emit(f"  {strstr_r} = call i8* @strstr(i8* {obj_val}, i8* {needle_v})")
             self.emit(f"  {tmp} = icmp ne i8* {strstr_r}, null")
             return tmp, "i1"
         if method == "has" and len(args) == 1:
             needle_v, needle_t = self.emit_expr(args[0])
-            needle_v = self.coerce(needle_v, needle_t, "i8*")
+            needle_v = self._null_safe_str(self.coerce(needle_v, needle_t, "i8*"))
             strstr_r, tmp = self.new_tmp(), self.new_tmp()
             self.emit(f"  {strstr_r} = call i8* @strstr(i8* {obj_val}, i8* {needle_v})")
             self.emit(f"  {tmp} = icmp ne i8* {strstr_r}, null")
@@ -5296,6 +5600,24 @@ class CodeGen:
         if method == "slice" and len(args) == 2:
             start_v, start_t = self.emit_expr(args[0]); end_v, end_t = self.emit_expr(args[1])
             start_v = self.coerce(start_v, start_t, "i64"); end_v = self.coerce(end_v, end_t, "i64")
+            # BUGFIX (same class as _emit_str_index_bounds_check above): an
+            # end < start (or either out of [0, len]) turns `length` negative,
+            # which strndup's size_t parameter reinterprets as an enormous
+            # unsigned value — a massive out-of-bounds read/crash, not just a
+            # Null-safety issue. end is allowed to equal len (an empty/
+            # to-the-end slice), matching insert()'s "at end" allowance.
+            self._emit_str_index_bounds_check(obj_val, start_v)
+            self._emit_str_index_bounds_check(obj_val, end_v, allow_at_end=True)
+            end_ok_l = self.new_label("slice_end_ok"); end_bad_l = self.new_label("slice_end_oob")
+            end_before_start = self.new_tmp()
+            self.emit(f"  {end_before_start} = icmp slt i64 {end_v}, {start_v}")
+            self.emit(f"  br i1 {end_before_start}, label %{end_bad_l}, label %{end_ok_l}")
+            self.emit(f"{end_bad_l}:")
+            slice_err_lbl, slice_err_len = self.intern_str("Invalid index access")
+            slice_err_ptr = self.new_tmp()
+            self.emit(f"  {slice_err_ptr} = getelementptr [{slice_err_len} x i8], [{slice_err_len} x i8]* {slice_err_lbl}, i64 0, i64 0")
+            self._emit_raise_or_propagate(slice_err_ptr)
+            self.emit(f"{end_ok_l}:")
             length, src_ptr, result = self.new_tmp(), self.new_tmp(), self.new_tmp()
             self.emit(f"  {length}  = sub i64 {end_v}, {start_v}")
             self.emit(f"  {src_ptr} = getelementptr i8, i8* {obj_val}, i64 {start_v}")
@@ -5303,6 +5625,7 @@ class CodeGen:
             return result, "i8*"
         if method == "concat" and len(args) == 1:
             other, _ = self.emit_expr(args[0])
+            other = self._null_safe_str(other)
             llen, rlen, total, total2, buf = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
             self.emit(f"  {llen}  = call i64 @strlen(i8* {obj_val})")
             self.emit(f"  {rlen}  = call i64 @strlen(i8* {other})")
@@ -5314,13 +5637,14 @@ class CodeGen:
             return buf, "i8*"
         if method == "split" and len(args) == 1:
             delim_v, delim_t = self.emit_expr(args[0])
-            delim_v = self.coerce(delim_v, delim_t, "i8*")
+            delim_v = self._null_safe_str(self.coerce(delim_v, delim_t, "i8*"))
             result = self.new_tmp()
             self.emit(f"  {result} = call %Box* @str_split(i8* {obj_val}, i8* {delim_v})")
             result = self._track_temp(result, "%Box*")   # BUG-3
             return result, "%Box*"
         if method == "combine" and len(args) == 1:
             other, _ = self.emit_expr(args[0])
+            other = self._null_safe_str(other)
             llen, rlen, total, total2, buf = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
             self.emit(f"  {llen}  = call i64 @strlen(i8* {obj_val})")
             self.emit(f"  {rlen}  = call i64 @strlen(i8* {other})")
@@ -5333,7 +5657,9 @@ class CodeGen:
         if method == "set" and len(args) == 2:
             idx_v, idx_t = self.emit_expr(args[0])
             val_v, val_t = self.emit_expr(args[1])
+            val_v = self._null_safe_str(val_v)
             idx_i = self.coerce(idx_v, idx_t, "i64")
+            self._emit_str_index_bounds_check(obj_val, idx_i)
             char_val = self.new_tmp()
             self.emit(f"  {char_val} = load i8, i8* {val_v}")
             llen, total, buf = self.new_tmp(), self.new_tmp(), self.new_tmp()
@@ -5348,7 +5674,9 @@ class CodeGen:
         if method == "insert" and len(args) == 2:
             idx_v, idx_t = self.emit_expr(args[0])
             val_v, val_t = self.emit_expr(args[1])
+            val_v = self._null_safe_str(val_v)
             idx_i = self.coerce(idx_v, idx_t, "i64")
+            self._emit_str_index_bounds_check(obj_val, idx_i, allow_at_end=True)
             llen, rlen, total, total2, buf = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
             self.emit(f"  {llen}  = call i64 @strlen(i8* {obj_val})")
             self.emit(f"  {rlen}  = call i64 @strlen(i8* {val_v})")
@@ -5369,6 +5697,10 @@ class CodeGen:
         if method == "replace" and len(args) == 2:
             old_v, old_t = self.emit_expr(args[0])
             new_v, new_t = self.emit_expr(args[1])
+            # BUGFIX: str_replace's own NULL guard (compiler.py) only covers
+            # `str`/`old` — `new_str` goes straight into strlen() unguarded,
+            # so `.replace("x", Null)` would crash the same way.
+            new_v = self._null_safe_str(new_v)
             result = self.new_tmp()
             self.emit(f"  {result} = call i8* @str_replace(i8* {obj_val}, i8* {old_v}, i8* {new_v})")
             return result, "i8*"
@@ -5475,11 +5807,28 @@ class CodeGen:
         just whatever label a branch was emitted to, since that block may
         have branched further internally by the time control reaches the
         phi (e.g. the right-hand side of `and`/`or` containing its own
-        guarded access or nested and/or)."""
-        for line in reversed(self.fn_lines):
-            s = line.strip()
-            if s.endswith(":") and not s.startswith(";"):
-                return s[:-1]
+        guarded access or nested and/or).
+
+        BUGFIX (found investigating an and/or compiler crash inside a for
+        loop): self.emit() appends its argument as ONE self.fn_lines entry
+        regardless of how many actual IR lines are packed into it —
+        emit_for/emit_while routinely emit a `br` and the label it jumps to
+        as a single call joined by '\\n' (e.g. `br i1 {cond}, label
+        %{body_l}, label %{end_l}\\n{body_l}:`). The old version treated
+        each fn_lines entry as exactly one line, so `entry.strip().endswith(
+        ":")` matched on the WHOLE combined string and returned everything
+        up to the trailing colon — including the leading `br` text — as the
+        "label". A phi built from that produced literal branch-instruction
+        text inside its predecessor list (`phi i1 [ %t8, %br i1 %t6, label
+        %fbody3, label %fend5`), invalid IR that crashed clang's parser
+        outright. Now splits each entry on '\\n' and scans those individual
+        lines too, so a combined entry's trailing label is found on its own,
+        cleanly separated from whatever instruction preceded it."""
+        for entry in reversed(self.fn_lines):
+            for line in reversed(entry.split("\n")):
+                s = line.strip()
+                if s.endswith(":") and not s.startswith(";"):
+                    return s[:-1]
         return "entry"
 
     def _emit_short_circuit(self, node):
@@ -5845,22 +6194,24 @@ class CodeGen:
         elif rt == "%Box*" and lt != "%Box*":
             r = self.coerce(r, rt, lt); rt = lt
         if lt == "i8*" and rt == "i8*":
+            # BUGFIX (found reviewing user code): a `str` value CAN
+            # genuinely be a real null i8* pointer at runtime — Rubidium's
+            # Null for `str` (see coerce()'s "null" handling) IS a null
+            # pointer, not a sentinel byte pattern like the int/float
+            # types use — reachable from an explicit `Null` literal (which
+            # the coercion above this point already retypes to match the
+            # OTHER side's "i8*", so it lands here, not in any dedicated
+            # null-literal branch) or from a `str` variable a prior branch
+            # left/reassigned to Null. Plain strcmp() on a NULL argument is
+            # undefined behavior — confirmed segfaulting glibc's
+            # implementation. rub_strcmp_null_safe (compiler.py) treats a
+            # NULL side as "smaller than any real string," matching Null's
+            # documented -infinity ordering for every other type, and
+            # never dereferences a null pointer.
             cmp_r, tmp = self.new_tmp(), self.new_tmp()
-            self.emit(f"  {cmp_r} = call i32 @strcmp(i8* {l}, i8* {r})")
+            self.emit(f"  {cmp_r} = call i32 @rub_strcmp_null_safe(i8* {l}, i8* {r})")
             pred = {"==":"eq","!=":"ne","<":"slt",">":"sgt","<=":"sle",">=":"sge"}[node.op]
             self.emit(f"  {tmp} = icmp {pred} i32 {cmp_r}, 0")
-            return tmp, "i1"
-        # Handle string vs Null comparison
-        if (lt == "i8*" and rt == "i64") or (lt == "i64" and rt == "i8*"):
-            tmp = self.new_tmp()
-            if lt == "i8*":
-                ptr = l
-                null_val = "null"
-            else:
-                ptr = r
-                null_val = "null"
-            pred = {"==":"eq","!=":"ne","<":"slt",">":"sgt","<=":"sle",">=":"sge"}[node.op]
-            self.emit(f"  {tmp} = icmp {pred} i8* {ptr}, {null_val}")
             return tmp, "i1"
         common = self.promote_type(lt, rt)
         l = self.coerce(l, lt, common); r = self.coerce(r, rt, common)
@@ -5902,7 +6253,31 @@ class CodeGen:
             v = self.coerce(val, t, "double")
             self.emit(f"  {tmp} = call %Box* @box_f(double {v})")
         elif t == "i8*":
-            self.emit(f"  {tmp} = call %Box* @box_s(i8* {val})")
+            # bugs.log: a str-typed Null is a genuine null i8* pointer at
+            # runtime (see _null_safe_str) — box_s() strdup()s it unguarded,
+            # so boxing a Null str (e.g. list.add(s) where s: str = Null)
+            # crashed. Can't just substitute an empty string like
+            # _null_safe_str does for string methods: box_equal/print_boxed
+            # distinguish a real Null (box type 6) from an empty string (box
+            # type 2, s="") — substituting would silently turn Null into ""
+            # once read back out of the collection. Branch instead, so a
+            # genuine null pointer boxes as an actual box_null().
+            is_null = self.new_tmp()
+            self.emit(f"  {is_null} = icmp eq i8* {val}, null")
+            null_l = self.new_label("box_s_null")
+            str_l = self.new_label("box_s_str")
+            join_l = self.new_label("box_s_join")
+            self.emit(f"  br i1 {is_null}, label %{null_l}, label %{str_l}")
+            self.emit(f"{null_l}:")
+            null_box = self.new_tmp()
+            self.emit(f"  {null_box} = call %Box* @box_null()")
+            self.emit(f"  br label %{join_l}")
+            self.emit(f"{str_l}:")
+            str_box = self.new_tmp()
+            self.emit(f"  {str_box} = call %Box* @box_s(i8* {val})")
+            self.emit(f"  br label %{join_l}")
+            self.emit(f"{join_l}:")
+            self.emit(f"  {tmp} = phi %Box* [ {null_box}, %{null_l} ], [ {str_box}, %{str_l} ]")
         elif t.startswith("%class_") and t.endswith("*"):
             # bugs.log OPEN-9: tag the box with this class's id so a value
             # retrieved back out of a collection can still be dispatched to

@@ -640,6 +640,13 @@ println("Done!")
 
 let user: str = input("Enter your name: ")
 
+# clear() — wipes the WHOLE terminal screen, not just the current line
+# (that's println()'s job). Takes no arguments.
+
+print("Hello!")
+clear()
+print("You won't see 'Hello!' anymore — the screen is blank now.")
+
 # =========================================
 # FILES
 # =========================================
@@ -1372,6 +1379,55 @@ fn ffi_lib my_c_function(msg: str) -> i32 as my_function
 my_function("hello from Rubidium")
 
 # -----------------------------------------
+# FFI C TYPES — AUTOMATIC CONVERSION
+# -----------------------------------------
+
+# A foreign function's parameters aren't Rubidium values — they're raw,
+# fixed-shape types: a bare array + count, a null-terminated char*, a plain
+# struct, none of which know anything about Rubidium's boxed list/dict/str
+# values. This is the same whether the .so was built from C, C++, or Rust —
+# what actually crosses the FFI boundary is only what the EXPORTED SYMBOL's
+# own C-ABI signature declares (a Rust function has to be written
+# `#[no_mangle] pub extern "C" fn(...)` with C-compatible parameter types to
+# be `dlsym`-callable at all), so Rubidium doesn't need to know which
+# language produced the library.
+
+# FFI.type(name) is used IN PLACE of a normal type in an `fn <lib> ...`
+# binding's parameter list to tell Rubidium "this parameter is really this
+# raw C-ABI shape" — the argument is a bare Rubidium type keyword, not a
+# string. For most types this is just an explicit spelling of that same
+# type (FFI.type(i32) means exactly what writing `i32` does — i32/i64/f32/
+# f64/bool/str/Any all already have a well-defined raw C-ABI layout on
+# their own). For `list` it's more than a spelling: Rubidium's own boxed
+# collections have no C or Rust equivalent, so FFI.type(list) is also the
+# one legal way to pass one — it converts whatever ordinary Rubidium list
+# you pass at the call site into a flat raw buffer automatically, instead
+# of you hand-rolling the conversion yourself. A collection type
+# (list/index/dict/dict+) or a bare class instance used WITHOUT this
+# wrapper is a compile error — there's no defined layout to fall back to.
+
+let lib_c = FFI("lib/lib.so")
+
+let verts: list: f32 = [0.0, 1.0, 0.0, -1.0, -1.0, 0.0]
+
+fn lib_c test(var: FFI.type(list))
+
+# Call it with that list — Rubidium flattens it into the raw C array `test`
+# actually expects before the call, no manual buffer-prep step needed on
+# your end. Only i32/i64/f32/f64 are supported (the widths a real C ABI
+# actually uses), and the list must have its element type FORCED with
+# `: TYPE` as above — required, not optional, so Rubidium knows the
+# per-element width to lay it out flat.
+
+test(verts)
+
+# Caveat: i128 and up, and f128 and up, are NOT guaranteed identical across
+# languages the way the types above are. Rust's own docs call i128/u128's
+# FFI ABI unspecified (unlike GCC/Clang's de facto-stable __int128, which
+# is what these map to), and stable Rust has no public 128-bit float type
+# at all — avoid these widths in a binding against a non-C library.
+
+# -----------------------------------------
 # FFI FUNCTION RENAMING
 # -----------------------------------------
 
@@ -1419,76 +1475,6 @@ import math_tools as mt
 
 mt.sin(1.0)
 mt.sqrt(25.0)
-
-# -----------------------------------------
-# FFI BUFFERS
-# -----------------------------------------
-
-# Every Rubidium `list` is really a small managed box behind the scenes —
-# that's what lets .add(), .set(), mixed types like ["hello", 2.5, True],
-# and automatic memory tracking all work. C has no idea what that box is.
-# When a C function's documentation says it wants "an array," it means
-# something dumb and rigid: a bare row of numbers sitting one after another
-# in memory, plus a separate count of how many there are. .as_ffi_buffer()
-# is the translator between those two worlds.
-
-# You'll only need this at the boundary where you're handing data to (or
-# reading data back from) a C library that talks about an "array," a
-# "buffer," or a pointer + a count together — never for ordinary Rubidium
-# code.
-
-# Step 1: build the data as a normal list, but FORCE its element type with
-# `: TYPE` — required, not optional, for the next step. It tells the
-# compiler exactly what C primitive each element becomes once flattened.
-# Only i32, i64, f32, and f64 are supported (the widths a real C ABI
-# actually uses).
-
-let verts: list: f32 = [0.0, 1.0, 0.0, -1.0, -1.0, 0.0]
-
-# Step 2: .as_ffi_buffer() copies every value out of the list's internal
-# box into one flat, contiguous block of memory — exactly the shape a C
-# function expects. What you get back is a raw memory address, not a list
-# anymore — no .add()/.set()/.len() on it, it's only for FFI calls.
-
-let buf = verts.as_ffi_buffer()
-
-# Step 3: pass it straight into the C function. Most C libraries that want
-# a buffer also want the ELEMENT COUNT (not the byte size) — verts.len()
-# gives you that; check the specific function's own docs for whether it
-# wants a count or a byte size instead (multiply by the element's byte
-# width yourself if so).
-
-glBufferData(GL_ARRAY_BUFFER, verts.len(), buf, GL_STATIC_DRAW)
-
-# Step 4: once you're truly done with the buffer, free it. Rubidium never
-# frees this for you automatically — same "you must .drop() it yourself"
-# rule as everything else, it just can't silently disappear at scope end
-# the way a `let local` would since it isn't a normal Rubidium value.
-
-buf.drop()
-
-# The reverse direction — when a C function WRITES data back into a buffer
-# you give it (reading a shader compile log, pixel data, etc.): declare a
-# `mut`, type-forced list sized to hold what you expect back, turn IT into
-# a buffer the same way, hand that buffer to the C function, then read the
-# buffer back into the list with .from_ffi_buffer() — this replaces the
-# list's contents in place, the same mutation convention as .add()/.set().
-
-let mut result: list: f32 = [0.0, 0.0, 0.0, 0.0, 0.0]   # sized for 5 floats
-let rbuf = result.as_ffi_buffer()
-some_c_function_that_fills_a_buffer(rbuf, 5)
-result.from_ffi_buffer(rbuf, 5)
-rbuf.drop()
-
-# Rules:
-# - .as_ffi_buffer() only works on a list whose type was forced with
-#   `: TYPE`. A plain `list` (or one with mixed types) is a compile error —
-#   Rubidium needs to know the element type to know its byte width.
-# - The value from .as_ffi_buffer() is only useful for FFI calls — it is
-#   not a list.
-# - You are responsible for .drop()-ing it when done.
-# - .from_ffi_buffer(pointer, count) requires the receiving list to be
-#   declared `mut`.
 
 # -----------------------------------------
 # FFI CALLBACKS

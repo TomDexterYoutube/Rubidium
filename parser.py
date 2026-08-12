@@ -104,6 +104,18 @@ class Parser:
             return tok[1]
         return None
 
+    def _reject_void(self, t, where):
+        """`void` is only meaningful as an FFI binding's return type (a real
+        C function that returns nothing) — everywhere else in Rubidium every
+        value has a concrete type, so `void` as a variable/parameter/normal-
+        function-return type has no sensible meaning. Reject it explicitly
+        here rather than letting it silently fall through codegen's type
+        mapping (which would default it to i64, a confusing wrong-looking-
+        right result instead of a clear error)."""
+        if t == "void":
+            raise SyntaxError(f"'void' is only valid as an FFI binding's return type, not {where} (line {self.line_no})")
+        return t
+
     def match_attr(self):
         """Match any token as a method/field name after a dot.
         Keywords like 'range', 'int', 'float', 'type' are valid method names
@@ -217,7 +229,31 @@ class Parser:
         fields = []; methods = []
         while self.peek() and self.peek()[0] != "RBRACE":
             if self.peek()[0] == "LET": fields.append(self.var_decl())
-            elif self.peek()[0] == "FN": methods.append(self.fn_def())
+            elif self.peek()[0] == "FN":
+                m = self.fn_def()
+                # BUGFIX (found continuing the syntax sweep): `fn callback`
+                # inside a class body silently compiled — is_callback was
+                # never checked by _emit_class_method (only emit_fn, used
+                # for top-level functions, generates a trampoline), so NO
+                # trampoline was ever produced, and the method is registered
+                # under its mangled name (e.g. `foo__handler`), not the bare
+                # `handler` the bare-name-as-value lookup would search for —
+                # meaning this could never actually work as a callback by
+                # any path, with no error to say so. A class method also has
+                # an implicit `__self` instance parameter a C trampoline has
+                # no way to supply in the first place (real per-instance C
+                # callback binding needs an explicit userdata-pointer
+                # convention this feature doesn't have) — reject it clearly
+                # instead of silently accepting something that can never work.
+                if getattr(m, "is_callback", False):
+                    raise SyntaxError(
+                        f"'fn callback {m.name}' at line {self.line_no}: callbacks "
+                        f"are not supported inside a class — a class method "
+                        f"implicitly needs its instance, which a C function pointer "
+                        f"has no way to supply. Declare it as a top-level "
+                        f"`fn callback` instead."
+                    )
+                methods.append(m)
             else: self.advance()
         self.match("RBRACE")
         return ClassDef(name, fields, methods)
@@ -251,6 +287,7 @@ class Parser:
                     raise SyntaxError(f"Expected a parameter name at line {self.line_no}, got {self.peek()}")
                 self.match("COLON")
                 ptype = self.match("TYPE") or self.match("IDENT")
+                if ptype: self._reject_void(ptype, "a callback parameter type")
                 params.append((pname, ptype))
                 if self.peek() and self.peek()[0] == "COMMA":
                     self.match("COMMA")
@@ -259,6 +296,7 @@ class Parser:
             if self.peek() and self.peek()[1] == "->":
                 self.match("OP")
                 ret_type = self.match("TYPE")
+                if ret_type: self._reject_void(ret_type, "a callback's return type")
             self.match("LBRACE")
             body = self.block()
             self.match("RBRACE")
@@ -295,15 +333,27 @@ class Parser:
                 if pname is None:
                     raise SyntaxError(f"Expected a parameter name at line {self.line_no}, got {self.peek()}")
                 self.match("COLON")
-                # BUGFIX (bugs.log #18): a class-typed parameter (e.g.
-                # `x: Warehouse`) is tokenized as IDENT, not TYPE — TYPE only
-                # covers built-in type keywords. self.match("TYPE") alone
-                # would silently fail here (consuming nothing), leaving the
-                # class-name token unconsumed; the next loop iteration would
-                # then misparse it as an entirely separate bogus parameter,
-                # corrupting the whole list and shifting every later
-                # parameter's positional binding.
-                ptype = self.match("TYPE") or self.match("IDENT")
+                # FFI.type(list) — a raw-C-ABI-shape marker instead of a
+                # normal type name (the argument is a bare Rubidium type
+                # keyword — TYPE tokens already parse as Var(name) via
+                # factor()'s "TYPE tokens used as arguments" branch, e.g.
+                # "404".to(i32)). Parse it through the general expression
+                # parser (it naturally stops at the ")"/"," that follows the
+                # type(...) call, same as any other trailer chain) so it
+                # comes back as MethodCall(Var("FFI"), "type", [Var(name)]).
+                if self.peek() and self.peek()[0] == "IDENT" and self.peek()[1] == "FFI":
+                    ptype = self.expr()
+                else:
+                    # BUGFIX (bugs.log #18): a class-typed parameter (e.g.
+                    # `x: Warehouse`) is tokenized as IDENT, not TYPE — TYPE only
+                    # covers built-in type keywords. self.match("TYPE") alone
+                    # would silently fail here (consuming nothing), leaving the
+                    # class-name token unconsumed; the next loop iteration would
+                    # then misparse it as an entirely separate bogus parameter,
+                    # corrupting the whole list and shifting every later
+                    # parameter's positional binding.
+                    ptype = self.match("TYPE") or self.match("IDENT")
+                    if ptype: self._reject_void(ptype, "an FFI parameter type")
                 params.append((pname, ptype))
                 if self.peek() and self.peek()[0] == "COMMA":
                     self.match("COMMA")
@@ -311,7 +361,17 @@ class Parser:
             ret_type = None
             if self.peek() and self.peek()[1] == "->":
                 self.match("OP")
-                ret_type = self.match("TYPE")
+                # FFI.type(name) is valid here too, same as a parameter type
+                # — e.g. `-> FFI.type(i32)`.
+                if self.peek() and self.peek()[0] == "IDENT" and self.peek()[1] == "FFI":
+                    ret_type = self.expr()
+                else:
+                    # `void` IS valid here — an FFI binding's return type is the
+                    # one place it means what it means in C: a real foreign
+                    # function that returns nothing (e.g. most of OpenGL/GLFW's
+                    # API: glClear, glBindBuffer, glfwPollEvents, ...). See
+                    # emit_ffi_bind/the FnCall-emission call site in codegen.py.
+                    ret_type = self.match("TYPE")
             alias = None
             if self.peek() and self.peek()[0] == "AS":
                 self.match("AS")
@@ -345,6 +405,7 @@ class Parser:
                 # binding branch above — class-typed parameters are
                 # tokenized as IDENT, not TYPE.
                 ptype = self.match("TYPE") or self.match("IDENT")
+                if ptype: self._reject_void(ptype, "a function parameter type")
                 params.append((pname, ptype))
                 if self.peek() and self.peek()[0] == "COMMA":
                     self.match("COMMA")
@@ -353,6 +414,7 @@ class Parser:
         if self.peek() and self.peek()[1] == "->":
             self.match("OP")
             ret_type = self.match("TYPE")
+            if ret_type: self._reject_void(ret_type, "a function's return type")
         self.match("LBRACE")
         body = self.block()
         self.match("RBRACE")
@@ -443,6 +505,7 @@ class Parser:
                 vtype = self.match("TYPE")
             elif self.peek() and self.peek()[0] == "TYPE":
                 vtype = self.match("TYPE")
+            if vtype: self._reject_void(vtype, "a variable type")
             if vtype in ("list", "index", "dict") and self.peek() and self.peek()[0] == "COLON":
                 self.match("COLON")
                 self.match("TYPE")
@@ -486,11 +549,13 @@ class Parser:
             vtype = self.match("TYPE")
         elif self.peek() and self.peek()[0] == "TYPE":
             vtype = self.match("TYPE")
+        if vtype: self._reject_void(vtype, "a variable type")
         # Optional element-type annotation for collections: let x: list: i32 = [0,10,32]
         element_type = None
         if vtype in ("list", "index", "dict") and self.peek() and self.peek()[0] == "COLON":
             self.match("COLON")
             element_type = self.match("TYPE")
+            if element_type: self._reject_void(element_type, "a collection element type")
         self.match("OP")
         value = self.expr()
         # BUGFIX (bugs.log #13): see the identical fix in the DynVarDecl path
@@ -799,7 +864,9 @@ class Parser:
     def cast_expr(self):
         left = self.factor()
         while self.peek() and self.peek()[0] == "AS":
-            self.match("AS"); left = TypeCast(left, self.match("TYPE"))
+            self.match("AS"); cast_t = self.match("TYPE")
+            if cast_t: self._reject_void(cast_t, "a cast target type")
+            left = TypeCast(left, cast_t)
         return left
     def arithmetic(self):
         left = self.term()
@@ -992,6 +1059,7 @@ class Parser:
                     and _nxt and _nxt[0] == "TYPE"):
                 self.match("COLON")
                 block_type = self.match("TYPE")
+                if block_type: self._reject_void(block_type, "a math block's precision type")
                 e = MathBlock(e, block_type)
             # BUGFIX (bugs.log #10): postfix `.method()`/field chaining was
             # only wired up for specific primary-expression shapes (bare

@@ -291,6 +291,34 @@ void print_int_or_null(long long v) {
 // any legacy path but the print() codegen path uses this now.
 void print_int_plain(long long v) { printf("%lld\n", v); fflush(stdout); }
 
+// syntax: PRINT & INPUT — clear() wipes the whole terminal, not just the
+// current line (that's what println()'s \r-overwrite already does). "\x1b[2J"
+// clears the visible screen, "\x1b[H" moves the cursor back to the top-left
+// — the same portable ANSI sequence `clear`/`cls`-equivalent tools use;
+// works on Linux/Mac terminals and modern (Windows 10+) Windows consoles.
+void rub_clear_screen(void) { printf("\x1b[2J\x1b[H"); fflush(stdout); }
+
+// BUG (found reviewing user code — a str variable that can genuinely be
+// Null at runtime, either an explicit `Null` literal or a `str` variable
+// left/reassigned to Null by earlier control flow, compared with ==/!=/</>
+// etc. against another string): every i8*-vs-i8* comparison codegen path
+// called plain strcmp() directly — passing a real NULL pointer to strcmp()
+// is undefined behavior, confirmed segfaulting glibc's implementation
+// (which dereferences it to read bytes). A `str`'s Null is represented as
+// an actual null i8* pointer (see coerce()'s "null" handling), so this was
+// reachable from ordinary, spec-legal code, not just a contrived case.
+// Null-safe replacement: two NULLs are equal, one NULL sorts before any
+// real string ("Null behaves as -infinity" — see syntax's NULL BEHAVIOR
+// section, already the rule for every other type), otherwise a normal
+// strcmp. Used everywhere codegen previously called strcmp() directly on
+// two `str` values.
+int rub_strcmp_null_safe(const char* a, const char* b) {
+    if (a == b) return 0;
+    if (!a) return -1;
+    if (!b) return 1;
+    return strcmp(a, b);
+}
+
 // BUGFIX/FEATURE (bugs.log #17): print() used to always narrow to i64
 // before printing, so even correctly-computed i128 arithmetic (see the
 // codegen-side promote_type fix) couldn't actually be verified/displayed
@@ -1027,7 +1055,56 @@ static __thread RTemp*    _rub_tmp     = NULL;
 static __thread long long _rub_tmp_n   = 0;
 static __thread long long _rub_tmp_cap = 0;
 
+// BUG (found stress-testing FFI CALLBACKS under AddressSanitizer, but not
+// specific to callbacks at all — confirmed with a plain `thread(...)`/
+// `thread.wait()` program too): _rub_tmp/_rub_tmp_n/_rub_tmp_cap are
+// `__thread` (compiler-level TLS) with no destructor hook, so the arena's
+// OWN backing array is never freed when a thread actually terminates —
+// only when the whole PROCESS exits. Confirmed leaking 2048 bytes (the
+// initial backing-array size) per thread that finishes, for ANY thread
+// that ever tracks a temporary: Rubidium's own `thread()`-spawned workers,
+// and an FFI callback fired from a C-spawned pthread Rubidium never
+// created. A pthread_key_create() destructor solves this, but calling
+// pthread_getspecific()/pthread_setspecific() on every single push/forget/
+// mark/release would add real per-call overhead to code this arena's own
+// original BUG-3 fix was written specifically to keep fast (a tight loop
+// went from 400MB/300k iterations to 1.8MB) — so the arena itself stays
+// exactly as fast __thread storage as before; a pthread_key_t is used
+// ONLY to register a once-per-thread destructor, guarded by a __thread
+// flag so every push after the first pays nothing beyond that one bool
+// check. The destructor runs ON the terminating thread itself, so it can
+// read that thread's own (still __thread) arena variables directly — no
+// value needs to round-trip through pthread_set/getspecific at all.
+static pthread_key_t _rub_tmp_dtor_key;
+static pthread_once_t _rub_tmp_dtor_once = PTHREAD_ONCE_INIT;
+static __thread int _rub_tmp_dtor_registered = 0;
+
+static void _rub_tmp_thread_dtor(void* unused) {
+    (void)unused;
+    // Defensive: emit_body's own mark/release already empties this before
+    // any thread function returns in the normal case, but free whatever
+    // is still here rather than leaking it if something didn't.
+    for (long long i = 0; i < _rub_tmp_n; i++) {
+        if (!_rub_tmp[i].p) continue;
+        if (_rub_tmp[i].is_box) box_drop((Box*)_rub_tmp[i].p);
+        else free(_rub_tmp[i].p);
+    }
+    free(_rub_tmp);
+    _rub_tmp = NULL; _rub_tmp_n = 0; _rub_tmp_cap = 0;
+}
+
+static void _rub_tmp_dtor_key_init(void) {
+    pthread_key_create(&_rub_tmp_dtor_key, _rub_tmp_thread_dtor);
+}
+
 static void _rub_tmp_push(void* p, int is_box) {
+    if (!_rub_tmp_dtor_registered) {
+        pthread_once(&_rub_tmp_dtor_once, _rub_tmp_dtor_key_init);
+        // The stored value just needs to be non-NULL for the destructor to
+        // fire on thread exit — pthread ignores what it actually points to.
+        pthread_setspecific(_rub_tmp_dtor_key, (void*)1);
+        _rub_tmp_dtor_registered = 1;
+    }
     if (!p) return;
     if (_rub_tmp_n == _rub_tmp_cap) {
         _rub_tmp_cap = _rub_tmp_cap ? _rub_tmp_cap * 2 : 128;
@@ -1334,10 +1411,10 @@ char* list_combine(Box* col_box) {
     return out;
 }
 
-// FFI buffer conversion (syntax's FFI BUFFERS section): bridges a
-// type-forced Rubidium `list` to/from a flat, contiguous C-style buffer —
-// the layout a C function expecting an "array" (glBufferData and similar)
-// actually wants, with no Box wrapper and no per-element indirection.
+// FFI c_list conversion (syntax's FFI C TYPES section): flattens a
+// type-forced Rubidium `list` into a raw, contiguous C-compatible buffer for
+// an `FFI.c_type("c_list")` parameter — the layout a C function expecting an
+// "array" actually wants, with no Box wrapper and no per-element indirection.
 // elem_kind is a small compile-time-known tag: 0=i32, 1=i64, 2=f32, 3=f64
 // — the only widths a real C ABI uses; codegen picks it from the list's
 // forced element type (self.element_types) and passes it as a constant.
@@ -1359,33 +1436,7 @@ void* list_to_flat_buffer(Box* list_box, int elem_kind) {
     }
     return buf;
 }
-// Reverse direction: read `count` elements of the given kind from a flat C
-// buffer directly INTO an existing, already-`mut`, already type-forced
-// Rubidium list — replaces whatever the list held before. Mutates in place
-// (like .add()/.set() already do) rather than returning a brand new value,
-// so no new "assign the result of a builtin" plumbing is needed in codegen.
-void flat_buffer_into_list(void* ptr, long long count, int elem_kind, Box* target_list_box) {
-    if (!target_list_box || target_list_box->type != 3) return;
-    int* magic = (int*)target_list_box->p;
-    if (!magic || *magic != 1) return;
-    RList* l = (RList*)target_list_box->p;
-    for (int i = 0; i < l->count; i++) box_drop(l->items[i]);
-    l->count = 0;
-    if (!ptr || count <= 0) return;
-    if ((long long)l->cap < count) {
-        l->cap = (int)count;
-        l->items = realloc(l->items, (size_t)l->cap * sizeof(Box*));
-    }
-    for (long long i = 0; i < count; i++) {
-        Box* e;
-        if (elem_kind == 0)      e = box_i(((int*)ptr)[i]);
-        else if (elem_kind == 1) e = box_i(((long long*)ptr)[i]);
-        else if (elem_kind == 2) e = box_f((double)((float*)ptr)[i]);
-        else                     e = box_f(((double*)ptr)[i]);
-        l->items[i] = e;
-    }
-    l->count = (int)count;
-}
+
 // -------------------------------------------------------
 #include <unistd.h>
 #include <sys/wait.h>
