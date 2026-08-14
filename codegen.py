@@ -3163,31 +3163,44 @@ class CodeGen:
             self.emit(f'  call i32 @fflush(i8* null)')
 
     def emit_println(self, value):
-        # println prints without newline; subsequent calls overwrite same line via \r
+        # println prints without newline; subsequent calls overwrite same
+        # line via \r.
+        # BUGFIX: \r alone only moves the cursor back to column 0 — it does
+        # NOT erase anything already on that terminal line. When a println
+        # call's text is SHORTER than the previous call's (e.g. the first
+        # frame of a new typewriter loop, right after the long final frame
+        # of the previous one), the previous line's leftover trailing
+        # characters stayed on screen, visually overlapping with the new,
+        # shorter text instead of being replaced by it — confirmed garbled
+        # output at exactly that kind of loop boundary. Append the ANSI
+        # "clear from cursor to end of line" sequence (\x1b[K) after the
+        # text so every call fully replaces the previous one, matching the
+        # spec's own description: "Calling it again replaces the previous
+        # output."
         val, val_t = self.emit_expr(value)
         if val_t in ("i32", "i64", "i1", "i128", "i256", "i512", "i1024", "i2048"):
-            fmt, flen = self.intern_str("\r%lld")
+            fmt, flen = self.intern_str("\r%lld\x1b[K")
             ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
             cv = self.coerce(val, val_t, "i64")
             self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, i64 {cv})')
             self.emit(f'  call i32 @fflush(i8* null)')
         elif val_t in ("float", "double", "fp128"):
-            fmt, flen = self.intern_str("\r%g")
+            fmt, flen = self.intern_str("\r%g\x1b[K")
             ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
             dv = self.coerce(val, val_t, "double")
             self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, double {dv})')
             self.emit(f'  call i32 @fflush(i8* null)')
         elif val_t == "i8*":
-            fmt, flen = self.intern_str("\r%s")
+            fmt, flen = self.intern_str("\r%s\x1b[K")
             ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
             self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, i8* {val})')
             self.emit(f'  call i32 @fflush(i8* null)')
         elif val_t == "%Box*":
             # Box printing for println — use printf with \r instead of puts
-            fmt, flen = self.intern_str("\r<value>")
+            fmt, flen = self.intern_str("\r<value>\x1b[K")
             ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
             self.emit(f'  call i32 @printf(i8* {ptr})')
