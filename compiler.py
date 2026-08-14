@@ -2473,7 +2473,10 @@ def parse_file(filepath, parsed_files, combined_ast, is_main=False, mod_name_ove
     
     combined_ast.extend(ast)
 
-def compile_files(source_files, output=None, shared_lib=False):
+NATIVE_CHOICES = ("current", "amd64", "amd32", "arm32", "arm64")
+
+
+def compile_files(source_files, output=None, shared_lib=False, native=None):
     def _find_imports_in_ast(ast_nodes):
         """Recursively find Import nodes in AST (including nested in functions)."""
         imports = []
@@ -2520,14 +2523,90 @@ def compile_files(source_files, output=None, shared_lib=False):
             f_c.write(RUNTIME_C)
             c_path = f_c.name
 
+        def _clang_cmd(flags):
+            base = ["clang", "-shared", "-fPIC", ir_path, c_path, "-o", output_bin] if shared_lib \
+                else ["clang", ir_path, c_path, "-o", output_bin]
+            return base + flags + ["-pthread", "-ldl", "-lm"]
+
+        # `native` selects what the binary is tuned/targeted for:
+        #   "current" — tune for THIS machine's exact CPU (-march=native).
+        #               Fastest, but not portable to other machines.
+        #   "amd64" / "amd32" / "arm64" / "arm32" — cross-target a generic
+        #               baseline for that whole architecture family (no
+        #               per-CPU tuning), so the binary just works on any
+        #               machine of that family instead of only this one.
+        #               "amd64"/"amd32" cover both Intel and AMD chips —
+        #               x86-64 and 32-bit x86 respectively are the same ISA
+        #               on either vendor, there's no separate Intel name.
+        # None (the default) — plain host-default codegen, same as before
+        # this option existed.
+        CROSS_TARGETS = {
+            "amd64": ["--target=x86_64-linux-gnu"],
+            "amd32": ["--target=i386-linux-gnu"],
+            "arm64": ["--target=aarch64-linux-gnu"],
+            "arm32": ["--target=arm-linux-gnueabihf"],
+        }
+        # Cross-target flags define WHICH architecture we're building for —
+        # unlike LTO/native-tuning below, these can never be dropped as a
+        # "safety" fallback: silently losing --target on a retry wouldn't
+        # make the build safer, it would silently build for the wrong
+        # architecture while still reporting success.
+        target_flags = CROSS_TARGETS.get(native, [])
+
+        # Extra flags that make the binary faster but carry their own crash
+        # risk, layered on top of the base -O level:
+        #   -flto         cross-TU inlining between the generated IR and
+        #                 RUNTIME_C (currently compiled/linked as separate
+        #                 translation units, so hot runtime helpers like
+        #                 box_s/list_append can't be inlined without it).
+        #                 Always on — it's link-time, not a new opt level.
+        #   -march=native tunes codegen for this exact CPU. Only added for
+        #                 native == "current" (wired up from `xeon build
+        #                 --native current`) — meaningless (and invalid)
+        #                 together with a cross-target above.
+        tuning_flags = ["-flto"] + (["-march=native"] if native == "current" else [])
+
+        # An internal compiler crash inside clang/LLVM's own optimizer (as
+        # opposed to a normal "your IR/code is wrong" diagnostic) shows up as
+        # a distinct signature in stderr — a stack dump and a request to file
+        # an LLVM bug report — rather than a plain error message. This is a
+        # known class of register-allocator/vectorizer crash unrelated to
+        # whether the Rubidium source is valid (the static analyzer already
+        # passed it); we can't patch LLVM itself from here, but we can back
+        # off through a ladder of progressively safer (and slower) flag sets
+        # until one of them doesn't trip whatever pass is crashing, instead
+        # of jumping straight from full -O2 to unoptimized -O0. tuning_flags
+        # ride along with every rung except the last (dropped there in case
+        # LTO/native-tuning is itself what's crashing); target_flags ride
+        # along with EVERY rung including the last, since they're not an
+        # optimization to give up on.
+        def _is_llvm_ice(stderr):
+            markers = ("PLEASE submit a bug report", "Stack dump:",
+                       "clang frontend command failed due to signal")
+            return any(m in stderr for m in markers)
+
+        OPT_LADDER = [
+            ("-O2", ["-O2"] + tuning_flags + target_flags),
+            ("-O2 (no vectorizer)", ["-O2", "-fno-vectorize", "-fno-slp-vectorize"] + tuning_flags + target_flags),
+            ("-O1", ["-O1"] + tuning_flags + target_flags),
+            ("-O0 (safe fallback)", ["-O0"] + target_flags),
+        ]
+
         try:
-            if shared_lib:
-                clang_cmd = ["clang", "-shared", "-fPIC", ir_path, c_path,
-                             "-o", output_bin, "-O2", "-pthread", "-ldl", "-lm"]
-            else:
-                clang_cmd = ["clang", ir_path, c_path, "-o", output_bin,
-                             "-O2", "-pthread", "-ldl", "-lm"]
-            result = subprocess.run(clang_cmd, capture_output=True, text=True)
+            result = None
+            for idx, (label, flags) in enumerate(OPT_LADDER):
+                result = subprocess.run(_clang_cmd(flags), capture_output=True, text=True)
+                if result.returncode == 0:
+                    if idx > 0:
+                        print(f"⚠ clang/LLVM crashed internally at earlier optimization levels "
+                              f"(not a Rubidium error) — built successfully at {label}.")
+                    break
+                if _is_llvm_ice(result.stderr):
+                    print(f"⚠ {label} crashed inside clang/LLVM itself — falling back...")
+                    continue
+                # A real (non-crash) compile error — no point trying weaker
+                # optimization levels, they'll fail the same way.
+                break
         finally:
             pass
             # os.unlink(ir_path)
@@ -2557,16 +2636,29 @@ def compile_files(source_files, output=None, shared_lib=False):
         sys.exit(1)
 
 if __name__ == "__main__":
+    USAGE = (f"Usage: python compiler.py [-s] [--native {{{'|'.join(NATIVE_CHOICES)}}}] "
+             f"<file1.rub> [file2.rub ...] [output]")
     if len(sys.argv) < 2:
-        print("Usage: python compiler.py [-s] <file1.rub> [file2.rub ...] [output]")
+        print(USAGE)
         sys.exit(1)
 
     argv = sys.argv[1:]
     shared_lib = "-s" in argv
+
+    native = None
+    if "--native" in argv:
+        idx = argv.index("--native")
+        if idx + 1 >= len(argv) or argv[idx + 1] not in NATIVE_CHOICES:
+            print(USAGE)
+            print(f"  --native requires one of: {', '.join(NATIVE_CHOICES)}")
+            sys.exit(1)
+        native = argv[idx + 1]
+        del argv[idx:idx + 2]
+
     argv = [a for a in argv if a != "-s"]
 
     if not argv:
-        print("Usage: python compiler.py [-s] <file1.rub> [file2.rub ...] [output]")
+        print(USAGE)
         sys.exit(1)
 
     if not argv[-1].endswith('.rub'):
@@ -2575,12 +2667,12 @@ if __name__ == "__main__":
     else:
         output = None
         source_files = argv[:]
-    
+
     expanded_files = []
     for pattern in source_files:
         if '*' in pattern or '?' in pattern or '[' in pattern:
             expanded_files.extend(glob.glob(pattern))
         else:
             expanded_files.append(pattern)
-    
-    compile_files(expanded_files, output, shared_lib=shared_lib)
+
+    compile_files(expanded_files, output, shared_lib=shared_lib, native=native)
