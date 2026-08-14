@@ -179,7 +179,7 @@ class Parser:
                     self.match("LPAREN")
                     args = []
                     while self.peek() and self.peek()[0] != "RPAREN":
-                        args.append(self.expr())
+                        args.append(self._call_arg())
                         if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                     self.match("RPAREN")
                     res = MethodCall(res, attr, args)
@@ -191,7 +191,7 @@ class Parser:
                 self.match("LPAREN")
                 args = []
                 while self.peek() and self.peek()[0] != "RPAREN":
-                    args.append(self.expr())
+                    args.append(self._call_arg())
                     if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                 self.match("RPAREN")
                 # Intercept specialized built-ins for direct calls
@@ -415,6 +415,7 @@ class Parser:
         # infinite loop/hang. Only require the parens when they're actually
         # there.
         params = []
+        defaults = {}
         if self.peek() and self.peek()[0] == "LPAREN":
             self.match("LPAREN")
             while self.peek() and self.peek()[0] != "RPAREN":
@@ -435,9 +436,27 @@ class Parser:
                 ptype = self.match("TYPE") or self.match("IDENT")
                 if ptype: self._reject_void(ptype, "a function parameter type")
                 params.append((pname, ptype))
+                # DEFAULT PARAMETER VALUES: `fn test(x: i32 = 10)` — a bare
+                # '=' right after the type. Must come after ALL params
+                # without one, same rule as most languages (checked below,
+                # once the whole list is known), so a call can still bind
+                # the trailing arguments positionally without naming them.
+                if self.peek() and self.peek()[0] == "OP" and self.peek()[1] == "=":
+                    self.match("OP")
+                    defaults[pname] = self.expr()
                 if self.peek() and self.peek()[0] == "COMMA":
                     self.match("COMMA")
             self.match("RPAREN")
+        if defaults:
+            seen_default = False
+            for pname, _ in params:
+                if pname in defaults:
+                    seen_default = True
+                elif seen_default:
+                    raise SyntaxError(
+                        f"Line {self.line_no}: parameter '{pname}' has no default value but "
+                        f"follows one that does — parameters with defaults must come last"
+                    )
         ret_type = None
         if self.peek() and self.peek()[1] == "->":
             self.match("OP")
@@ -446,7 +465,7 @@ class Parser:
         self.match("LBRACE")
         body = self.block()
         self.match("RBRACE")
-        return FnDef(name, params, ret_type, body)
+        return FnDef(name, params, ret_type, body, defaults=defaults)
 
     def block(self):
         stmts = []
@@ -732,7 +751,7 @@ class Parser:
             self.match("LPAREN")
             args = []
             while self.peek() and self.peek()[0] != "RPAREN":
-                args.append(self.expr())
+                args.append(self._call_arg())
                 if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
             self.match("RPAREN")
             return FileHandleStmt(file_var, method, args)
@@ -896,6 +915,21 @@ class Parser:
         self.match("RBRACE")
         return fields
 
+    def _call_arg(self):
+        """One argument inside a call's parentheses: either a plain
+        expression, or a named argument `name = expr` (e.g. `test(x = 100,
+        y = 4)`). Pure lookahead — only consumes the name/'=' when the
+        pattern is actually there, so an ordinary expression starting with
+        an identifier (`f(x + 1)`, `f(x)`) is completely unaffected."""
+        tok = self.peek()
+        nxt = self.tokens[self.pos + 1] if self.pos + 1 < len(self.tokens) else None
+        if (tok and tok[0] in ("IDENT", "TYPE")
+                and nxt and nxt[0] == "OP" and nxt[1] == "="):
+            name = self.match(tok[0])
+            self.match("OP")
+            return KwArg(name, self.expr())
+        return self.expr()
+
     def expr(self):       return self.logical_or()
     def logical_or(self):
         left = self.logical_and()
@@ -1025,7 +1059,7 @@ class Parser:
                     self.match("LPAREN")
                     args = []
                     while self.peek() and self.peek()[0] != "RPAREN":
-                        args.append(self.expr())
+                        args.append(self._call_arg())
                         if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                     self.match("RPAREN")
                     res = MethodCall(res, attr, args)
@@ -1051,7 +1085,7 @@ class Parser:
                     self.match("LPAREN")
                     args = []
                     while self.peek() and self.peek()[0] != "RPAREN":
-                        args.append(self.expr())
+                        args.append(self._call_arg())
                         if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                     self.match("RPAREN")
                     res = MethodCall(res, attr, args)
@@ -1079,7 +1113,7 @@ class Parser:
                     self.match("LPAREN")
                     args = []
                     while self.peek() and self.peek()[0] != "RPAREN":
-                        args.append(self.expr())
+                        args.append(self._call_arg())
                         if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                     self.match("RPAREN")
                     return FnCall(DynResolve(dyn_holder), args)
@@ -1095,7 +1129,7 @@ class Parser:
                     self.match("LPAREN")
                     args = []
                     while self.peek() and self.peek()[0] != "RPAREN":
-                        args.append(self.expr())
+                        args.append(self._call_arg())
                         if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                     self.match("RPAREN")
                     return FnCall(sy_name, args)
@@ -1129,7 +1163,7 @@ class Parser:
                         self.match("LPAREN")
                         args = []
                         while self.peek() and self.peek()[0] != "RPAREN":
-                            args.append(self.expr())
+                            args.append(self._call_arg())
                             if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                         self.match("RPAREN")
                         e = MethodCall(e, attr, args)
@@ -1139,7 +1173,7 @@ class Parser:
                     self.match("LPAREN")
                     args = []
                     while self.peek() and self.peek()[0] != "RPAREN":
-                        args.append(self.expr())
+                        args.append(self._call_arg())
                         if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                     self.match("RPAREN")
                     e = FnCall(e, args)
@@ -1159,7 +1193,7 @@ class Parser:
                     self.match("LPAREN")
                     args = []
                     while self.peek() and self.peek()[0] != "RPAREN":
-                        args.append(self.expr())
+                        args.append(self._call_arg())
                         if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                     self.match("RPAREN")
                     res = MethodCall(res, attr, args)
@@ -1184,7 +1218,7 @@ class Parser:
                         self.match("LPAREN")
                         args = []
                         while self.peek() and self.peek()[0] != "RPAREN":
-                            args.append(self.expr())
+                            args.append(self._call_arg())
                             if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                         self.match("RPAREN")
                         res = MethodCall(res, attr, args)
@@ -1194,7 +1228,7 @@ class Parser:
                     self.match("LPAREN")
                     args = []
                     while self.peek() and self.peek()[0] != "RPAREN":
-                        args.append(self.expr())
+                        args.append(self._call_arg())
                         if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                     self.match("RPAREN")
                     res = FnCall(name, args)
@@ -1219,7 +1253,7 @@ class Parser:
                         self.match("LPAREN")
                         args = []
                         while self.peek() and self.peek()[0] != "RPAREN":
-                            args.append(self.expr())
+                            args.append(self._call_arg())
                             if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                         self.match("RPAREN")
                         res = MethodCall(res, attr, args)
@@ -1230,7 +1264,7 @@ class Parser:
                     self.match("LPAREN")
                     args = []
                     while self.peek() and self.peek()[0] != "RPAREN":
-                        args.append(self.expr())
+                        args.append(self._call_arg())
                         if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                     self.match("RPAREN")
                     res = FnCall(name, args)
@@ -1300,7 +1334,7 @@ class Parser:
                         self.match("LPAREN")
                         args = []
                         while self.peek() and self.peek()[0] != "RPAREN":
-                            args.append(self.expr())
+                            args.append(self._call_arg())
                             if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                         self.match("RPAREN")
                         res = MethodCall(res, attr, args)
@@ -1310,7 +1344,7 @@ class Parser:
                     self.match("LPAREN")
                     args = []
                     while self.peek() and self.peek()[0] != "RPAREN":
-                        args.append(self.expr())
+                        args.append(self._call_arg())
                         if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                     self.match("RPAREN")
                     

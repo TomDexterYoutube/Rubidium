@@ -870,7 +870,8 @@ class CodeGen:
                 self.class_ids[s.name] = len(self.class_ids)
                 for m in s.methods:
                     mangled_name = self.method_ir_name(s.name, m.name)
-                    mfn = FnDef(mangled_name, [("__self", s.name)] + m.params, m.ret_type, m.body)
+                    mfn = FnDef(mangled_name, [("__self", s.name)] + m.params, m.ret_type, m.body,
+                                defaults=getattr(m, "defaults", {}))
                     mfn.class_name = s.name
                     self.functions[mangled_name] = mfn
             elif isinstance(s, FnDef):
@@ -4035,6 +4036,19 @@ class CodeGen:
         self._pending_trampolines += pending
 
     def emit_expr(self, node):
+        if isinstance(node, KwArg):
+            # A named argument (`x = value`) only has meaning inside a call's
+            # parentheses, where _resolve_call_args() matches it to a
+            # parameter and strips the wrapper before codegen ever sees the
+            # inner value. Reaching here means one survived into a context
+            # that doesn't resolve named arguments at all (a method call, a
+            # collection index, ...) — a clear compile error instead of
+            # emit_expr silently trying to evaluate a KwArg as if it were an
+            # ordinary value.
+            raise RubidiumTypeError(
+                f"Named argument '{node.name} = ...' is not valid here — "
+                f"named/default arguments are only supported for plain function calls"
+            )
         if isinstance(node, LinkArg):
             # Link Rule: pass-by-reference. Collections/Any are already
             # %Box* (pointer/reference) and function calls currently never
@@ -4340,6 +4354,59 @@ class CodeGen:
         self.emit(f"  {val} = load {ir_t}, {ir_t}* {fptr}")
         return val, ir_t
 
+    def _resolve_call_args(self, fn_name, params, defaults, args):
+        """DEFAULT / NAMED ARGUMENTS: `fn test(x: i32 = 10)` declares a
+        default, and a call site can bind by name instead of position —
+        `test(x = 100, y = 4, b = 9)`. Matches `args` (a mix of plain expr
+        nodes and KwArg('name', expr) nodes, straight from the parser)
+        against `params` ([(name, type), ...], in declaration order),
+        filling any parameter the call didn't supply from `defaults`
+        ({name: expr}). Returns a plain positional list the same length as
+        `params`, so every existing call-emission site downstream (which
+        zips args 1:1 against params) needs no changes at all — it never
+        sees a KwArg or a missing argument, only the resolved result.
+        """
+        has_kwargs = any(isinstance(a, KwArg) for a in args)
+        if not has_kwargs and len(args) == len(params):
+            return args  # fast path: the overwhelming common case, untouched
+
+        param_names = [pn for pn, _ in params]
+        resolved = [None] * len(params)
+        filled = [False] * len(params)
+
+        pos_i = 0
+        seen_named = False
+        for a in args:
+            if isinstance(a, KwArg):
+                seen_named = True
+                if a.name not in param_names:
+                    raise RubidiumTypeError(f"Function '{fn_name}' has no parameter named '{a.name}'")
+                idx = param_names.index(a.name)
+                if filled[idx]:
+                    raise RubidiumTypeError(f"Function '{fn_name}' got multiple values for parameter '{a.name}'")
+                resolved[idx] = a.value
+                filled[idx] = True
+            else:
+                if seen_named:
+                    raise RubidiumTypeError(f"Function '{fn_name}': positional argument follows a named one")
+                if pos_i >= len(params):
+                    raise RubidiumTypeError(
+                        f"Function '{fn_name}' expects {len(params)} argument(s), got more"
+                    )
+                resolved[pos_i] = a
+                filled[pos_i] = True
+                pos_i += 1
+
+        for idx, pn in enumerate(param_names):
+            if not filled[idx]:
+                if pn in defaults:
+                    resolved[idx] = defaults[pn]
+                    filled[idx] = True
+                else:
+                    raise RubidiumTypeError(f"Function '{fn_name}' missing required argument '{pn}'")
+
+        return resolved
+
     def _check_arg_count(self, fn_name, params, args):
         """BUG (found via syntax sweep): calling a function with the wrong
         number of arguments silently succeeded, on the REAL compiler — extra
@@ -4398,6 +4465,8 @@ class CodeGen:
                 fn_def = self.functions[ir_method]
                 # fn_def.params has the implicit __self prepended — the
                 # user-visible call (e.g. heal(40)) never includes it.
+                node.args = self._resolve_call_args(
+                    node.name, fn_def.params[1:], getattr(fn_def, "defaults", {}), node.args)
                 self._check_arg_count(node.name, fn_def.params[1:], node.args)
                 param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_def.params]
                 ret_ir = self.rubi_type_to_ir(fn_def.ret_type) if fn_def.ret_type else "i64"
@@ -4623,6 +4692,8 @@ class CodeGen:
                     f"(pass it in as a parameter instead)"
                 )
             fn_obj = self.functions[target_name]
+            node.args = self._resolve_call_args(
+                node.name, fn_obj.params or [], getattr(fn_obj, "defaults", {}), node.args)
             self._check_arg_count(node.name, fn_obj.params or [], node.args)
             # BUG (GLFW FFI report): FFI-bound functions (`fn lib symbol(...) as
             # name`) are DEFINED by emit_ffi_bind using _ffi_type_to_ir, which
@@ -5209,6 +5280,8 @@ class CodeGen:
                 fn = self.functions[mangled]
                 # fn.params has the implicit __self prepended — the
                 # user-visible call (p.method(args)) never includes it.
+                node.args = self._resolve_call_args(
+                    f"{obj_name}.{node.method}", fn.params[1:], getattr(fn, "defaults", {}), node.args)
                 self._check_arg_count(f"{obj_name}.{node.method}", fn.params[1:], node.args)
                 struct_t = self.class_ir_type(class_name)
                 ptr_str, _ = self.get_var_ptr(obj_name)
@@ -5253,6 +5326,8 @@ class CodeGen:
                     return self.emit_call_expr(FnCall(merged, node.args))
             if target_name in self.functions:
                 fn_obj = self.functions[target_name]
+                node.args = self._resolve_call_args(
+                    f"{obj_name}.{node.method}", fn_obj.params or [], getattr(fn_obj, "defaults", {}), node.args)
                 self._check_arg_count(f"{obj_name}.{node.method}", fn_obj.params or [], node.args)
                 # OPEN-12: coerce each arg to the callee's declared param type
                 # (same class of bug as OPEN-11, here on the module-namespaced
@@ -5309,6 +5384,9 @@ class CodeGen:
             for target in (f"{ns_name}_{attr_name}_{node.method}", f"{ns_name}_{node.method}", node.method):
                 if target in self.functions:
                     fn_obj = self.functions[target]
+                    node.args = self._resolve_call_args(
+                        f"{ns_name}.{attr_name}.{node.method}", fn_obj.params or [],
+                        getattr(fn_obj, "defaults", {}), node.args)
                     self._check_arg_count(f"{ns_name}.{attr_name}.{node.method}", fn_obj.params or [], node.args)
                     # OPEN-12: coerce args to declared param types (see the
                     # module-function path above — same fix).
@@ -5512,7 +5590,10 @@ class CodeGen:
         # Not a string — treat as a module-namespaced function call (e.g. math.add -> math_add)
         target_name = f"{obj_name}_{node.method}"
         if target_name in self.functions:
-            self._check_arg_count(f"{obj_name}.{node.method}", self.functions[target_name].params or [], node.args)
+            fn_obj = self.functions[target_name]
+            node.args = self._resolve_call_args(
+                f"{obj_name}.{node.method}", fn_obj.params or [], getattr(fn_obj, "defaults", {}), node.args)
+            self._check_arg_count(f"{obj_name}.{node.method}", fn_obj.params or [], node.args)
             args_ir = []
             for a in node.args:
                 v, t = self.emit_expr(a); args_ir.append(f"{t} {v}")

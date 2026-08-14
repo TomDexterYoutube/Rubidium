@@ -898,6 +898,66 @@ fn log(msg: str) {
     print(i"[LOG] {msg}")
 }
 
+# -----------------------------------------
+# DEFAULT PARAMETER VALUES
+# -----------------------------------------
+
+# A parameter can declare a default with `= value` right after its type.
+# A call that omits it uses the default instead.
+
+fn test(x: i32 = 10, y: i32 = 20, b: i32 = 1) {
+    print(x)
+    print(y)
+    print(b)
+}
+
+test()   # 10, 20, 1 — every default used
+
+# Parameters WITHOUT a default must all come before the ones that have one
+# — same rule as most languages, so trailing arguments can still be left
+# out and filled positionally without naming them:
+
+fn add(a: i32, b: i32 = 5) -> i32 {
+    return a + b
+}
+
+add(7)      # 12 — b uses its default
+add(7, 3)   # 10 — b explicit
+
+# fn add(a: i32 = 1, b: i32) { ... }   # ERROR: 'b' has no default but
+#                                      # follows one that does
+
+# -----------------------------------------
+# NAMED ARGUMENTS
+# -----------------------------------------
+
+# A call can bind arguments by parameter name instead of position, in any
+# order — not just for skipping defaults, works for required parameters too:
+
+test(x = 100, y = 4, b = 9)
+test(b = 9, x = 100, y = 4)   # same call, any order
+
+# Positional and named arguments can mix, but every positional argument
+# must come BEFORE any named one (it fills the next unbound parameter in
+# declaration order; a named one after that could bind the same slot twice
+# with no clear rule for which wins):
+
+add(7, b = 3)      # OK — 7 positional for 'a', 3 named for 'b'
+# add(a = 7, 3)    # ERROR: positional argument follows a named one
+
+# Naming a parameter that doesn't exist, naming the same parameter twice
+# (once positionally and once by name, or twice by name), or leaving a
+# parameter with no default unfilled are all compile errors:
+
+# add(c = 1)         # ERROR: no parameter named 'c'
+# add(1, a = 2)      # ERROR: multiple values for parameter 'a'
+# fn needs_two(a: i32, b: i32) {}
+# needs_two(a = 1)   # ERROR: missing required argument 'b'
+
+# Default values and named arguments work the same way for class methods
+# (see CLASSES below) — declared on the method's own parameter list, bound
+# the same way at the call site (p.method(x = 1)).
+
 # =========================================
 # The Link Rule
 # =========================================

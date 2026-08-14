@@ -104,7 +104,7 @@ class While:
         self.body = body
 
 class FnDef:
-    def __init__(self, name, params, ret_type, body, is_callback=False):
+    def __init__(self, name, params, ret_type, body, is_callback=False, defaults=None):
         self.name = name
         self.params = params
         self.ret_type = ret_type
@@ -116,11 +116,29 @@ class FnDef:
         # codegen's function-emission and bare-name-as-value resolution
         # need to actually branch on it.
         self.is_callback = is_callback
+        # DEFAULT PARAMETER VALUES: `fn test(x: i32 = 10)` — kept as a
+        # separate {param_name: default_expr} side table rather than
+        # widening each params tuple to 3 elements, since ~35 call sites
+        # across codegen.py destructure params as plain `(name, type)`
+        # pairs; only the (small) argument-resolution step that matches a
+        # call's args against a fn_def's params needs to know about this.
+        self.defaults = defaults or {}
 
 class FnCall:
     def __init__(self, name, args):
         self.name = name
         self.args = args
+
+class KwArg:
+    """A named call argument: `x = value` inside a call's parentheses, e.g.
+    `test(x = 100, y = 4)`. Only meaningful directly inside a call's
+    argument list — resolved away (matched to a parameter name and
+    reordered/defaulted into a plain positional list) before codegen
+    touches the callee's body. Encountering one anywhere else (a method
+    call, a collection index, ...) is a compile error, not a value."""
+    def __init__(self, name, value):
+        self.name = name
+        self.value = value
 
 class Return:
     def __init__(self, value):
