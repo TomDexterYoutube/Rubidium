@@ -5046,12 +5046,31 @@ class CodeGen:
                 self.emit(f"  call i32 @sleep(i32 {sec_i32})")
                 return "0", "i64"
             if node.method == "wait":
-                # Syntax says time.wait(n) waits for n seconds - use sleep, not usleep
+                # BUGFIX: time.wait(n) coerced n straight to i64 and called
+                # sleep() (whole seconds only) — any fractional argument
+                # (0.1, 0.5, ...) got truncated to 0 before sleep() ever saw
+                # it, so a sub-second wait silently did nothing at all.
+                # Confirmed: the typewriter-effect examples in the syntax
+                # file itself use time.wait(0.1) between characters — this
+                # broke that exact documented pattern. Split into a whole-
+                # second sleep() plus a fractional usleep() computed at
+                # double precision, so both `time.wait(2)` and
+                # `time.wait(0.1)` (and `time.wait(2.5)`) actually wait the
+                # real requested duration instead of only the integer part.
                 secs_v, secs_t = self.emit_expr(node.args[0])
-                secs_v = self.coerce(secs_v, secs_t, "i64")
-                sec_i32 = self.new_tmp()
-                self.emit(f"  {sec_i32} = trunc i64 {secs_v} to i32")
-                self.emit(f"  call i32 @sleep(i32 {sec_i32})")
+                secs_d = self.coerce(secs_v, secs_t, "double")
+                whole_d = self.new_tmp()
+                self.emit(f"  {whole_d} = call double @floor(double {secs_d})")
+                whole_i32 = self.new_tmp()
+                self.emit(f"  {whole_i32} = fptosi double {whole_d} to i32")
+                self.emit(f"  call i32 @sleep(i32 {whole_i32})")
+                frac_d = self.new_tmp()
+                self.emit(f"  {frac_d} = fsub double {secs_d}, {whole_d}")
+                usec_d = self.new_tmp()
+                self.emit(f"  {usec_d} = fmul double {frac_d}, 1.000000e+06")
+                usec_i32 = self.new_tmp()
+                self.emit(f"  {usec_i32} = fptosi double {usec_d} to i32")
+                self.emit(f"  call i32 @usleep(i32 {usec_i32})")
                 return "0", "i64"
             if node.method == "timer_start":
                 tid_v, tid_t = self.emit_expr(node.args[0])
