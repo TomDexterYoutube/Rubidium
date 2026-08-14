@@ -33,6 +33,7 @@ def _closest_name(word: str, candidates, max_dist: int = 1) -> str | None:
 
 KNOWN_MODULES = {
     'random', 'math', 'time', 'json', 'os', 'FFI', 'net', 'crypto', 'io',
+    'keyboard',
 }
 
 BUILTIN_FNS = {
@@ -515,6 +516,9 @@ class Analyzer:
                     }
             elif isinstance(node, ast.Use):
                 self.namespaces.add(node.module_name)
+                alias = getattr(node, 'alias', None)
+                if alias:
+                    self.namespaces.add(alias)
             elif isinstance(node, ast.Import):
                 self.imports.add(node.module_name)
                 self.namespaces.add(node.module_name)   # treat imported files as namespaces
@@ -939,6 +943,9 @@ class Analyzer:
             self._collection_method(node, scope)
         elif t is ast.Use:
             self.namespaces.add(node.module_name)
+            alias = getattr(node, 'alias', None)
+            if alias:
+                self.namespaces.add(alias)
         elif t is ast.Import:
             self.imports.add(node.module_name)
             self.namespaces.add(node.module_name)
@@ -1218,7 +1225,7 @@ class Analyzer:
         if name:
             info = scope.lookup(name)
             if info is None:
-                self._emit('ERROR', None, 'Unknown Variable',
+                self._emit('ERROR', getattr(node, 'line', None), 'Unknown Variable',
                            f"Unknown variable: {name}")
             else:
                 scope.mark_used(name)
@@ -1539,7 +1546,7 @@ class Analyzer:
     def _drop(self, node: ast.Drop, scope: Scope):
         info = scope.lookup(node.name)
         if info is None:
-            self._emit('ERROR', None, 'Unknown Variable',
+            self._emit('ERROR', getattr(node, 'line', None), 'Unknown Variable',
                        f"Unknown variable: {node.name}")
             return
         if info.get('dropped'):
@@ -1810,7 +1817,7 @@ class Analyzer:
             msg = f"Unknown variable: {name}"
             if suggestion:
                 msg += f"\n\nDid you mean: {suggestion}?"
-            self._emit('ERROR', None, 'Unknown Variable', msg)
+            self._emit('ERROR', getattr(node, 'line', None), 'Unknown Variable', msg)
 
     def _method_call(self, node: ast.MethodCall, scope: Scope):
         # BUG-16: `p.scores(0).set(99)` / `p.scores().add(50)` reach a class's

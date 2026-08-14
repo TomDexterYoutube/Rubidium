@@ -129,6 +129,22 @@ declare i32 @file_delete(i8*)
 declare i32 @file_rename_file(i8*, i8*)
 declare i32 @file_copy_file(i8*, i8*)
 declare %Box* @file_list_dir(i8*)
+declare i8* @strdup(i8*)
+declare void @rub_net_process(double, i8*)
+declare void @rub_net_listen(%Box*)
+declare %Box* @rub_net_find()
+declare %Box* @rub_net_list()
+declare %Box* @rub_net_requests()
+declare void @rub_net_connect(%Box*)
+declare void @rub_net_accept(%Box*)
+declare void @rub_net_close(%Box*)
+declare void @rub_net_send(%Box*, %Box*)
+declare %Box* @rub_net_data(%Box*)
+declare void @_thread_kill(i64)
+declare void @_thread_enable_async_cancel()
+declare i8* @rub_keyboard_wait()
+declare i8* @rub_keyboard_last()
+declare void @rub_keyboard_thread(double)
 '''
 
 
@@ -189,6 +205,7 @@ class CodeGen:
         self.tmp_count   = 0
         self.label_count = 0
         self.global_vars  = {}
+        self.use_aliases = {}  # `use net as n` — alias -> real builtin-module name
         self.local_vars_stack = [[]]  # Stack of scopes, each scope is a dict of variable names to types
         self.mutable_vars = set()
         self.dropped_vars = set()
@@ -747,8 +764,32 @@ class CodeGen:
         automatically un-shadowed by _pop_scope_frame when this frame
         closes, restoring whatever it was hiding.
         """
-        is_shadow = (name in self.global_vars
-                     or any(name in scope for scope in self.local_vars_stack))
+        # BUGFIX: this checked ALL frames including the CURRENT one, so a
+        # plain same-scope re-declaration (`let tmp = ...` twice in a row
+        # in the same block — e.g. two sequential `let local tmp =
+        # input(...)` calls, or a 'tmp' reused a third time later in that
+        # same block) ALSO matched "already visible somewhere" and got
+        # incorrectly treated as a shadow every time, contradicting this
+        # method's own documented intent right above. Each of those
+        # redeclarations pushed its own shadow entry, but _pop_scope_frame
+        # only pops ONE shadow layer per frame close — so with 2+ same-
+        # scope redeclarations of one name, closing that block left
+        # _shadow_active[name] stuck pointing at a STALE, no-longer-
+        # current shadow pointer instead of being fully cleared. Confirmed
+        # in a real program: a `while` loop body declaring `tmp` from
+        # input() multiple times per iteration (once per player's prompt,
+        # again for a later `check()` result) caused later reads of `tmp`
+        # to intermittently resolve to an EARLIER declaration's stale
+        # value instead of the one just assigned — read as "phantom" hits
+        # firing from old input that should no longer have been in scope.
+        # Only an OUTER (already-open, enclosing) frame or a global should
+        # count as "shadowed"; the current frame's own prior declaration
+        # of this exact name is the ordinary VARIABLE OVERWRITE RULE, not
+        # a shadow, and must keep reusing the same plain storage.
+        is_shadow = (name not in self.local_vars_stack[-1]) and (
+            name in self.global_vars
+            or any(name in scope for scope in self.local_vars_stack[:-1])
+        )
         self.local_vars_stack[-1][name] = ir_t
         if is_shadow:
             ptr_str = f"%ptr_{name}__shadow{self.new_tmp()[1:]}"
@@ -930,6 +971,14 @@ class CodeGen:
             s2.name for s2 in stmts
             if isinstance(s2, VarDecl) and not getattr(s2, 'is_local', False)
         }
+
+        # `use X as Y` — resolved up front so every builtin-module dispatch
+        # site (emit_method_call_expr, _infer_type, the thread(...) builtin)
+        # can treat the alias exactly like the real module name regardless
+        # of where the `use` statement sits relative to first use.
+        for s in stmts:
+            if isinstance(s, Use) and getattr(s, 'alias', None):
+                self.use_aliases[s.alias] = s.module_name
 
         # BUGFIX (bugs.log #2): top-level functions and classes were being
         # registered by blindly overwriting self.functions[name] /
@@ -1403,7 +1452,8 @@ class CodeGen:
         
         if isinstance(node, MethodCall):
             obj_name = node.obj.name if hasattr(node.obj, 'name') else str(node.obj)
-            
+            obj_name = self.use_aliases.get(obj_name, obj_name)
+
             # Check for module function call (e.g., math_tools.sin -> math_tools_sin)
             # Also resolves import aliases (e.g. 'mt' -> 'math_tools' -> math_tools_sin)
             resolved_obj = self.import_aliases.get(obj_name, obj_name)
@@ -1471,6 +1521,11 @@ class CodeGen:
                         return self.rubi_type_to_ir(arg.value)
                 return "i64"
 # Built-in module methods
+            if obj_name == "net":
+                if node.method in ("find", "list", "requests", "data"): return "%Box*"
+                return "i64"  # connect/accept/close/send all return an unused i64
+            if obj_name == "keyboard":
+                return "i8*"  # wait()/last() both return a key name string
             if obj_name == "time":
                 if node.method == "timer_read":
                     return "double"
@@ -2539,6 +2594,22 @@ class CodeGen:
             self.emit_ffi_bind(node)
         elif isinstance(node, Use):
             pass  # module activation — tracked at parse time, no IR needed
+        elif isinstance(node, Input):
+            # BUGFIX: this dispatch chain had no case at all for a bare
+            # input(...) statement (the return value discarded — used
+            # purely to pause and read a line, e.g. input("Press Enter to
+            # continue")). Every branch above fell through and hit the
+            # unconditional `return False` below, so the statement was
+            # SILENTLY DROPPED — not "read and discard the result", the
+            # actual @_rubidium_input_line() call never happened AT ALL.
+            # Confirmed: a real game's `input("Enter to finish Turn")` /
+            # input("Enter to start turn") calls between turns never
+            # printed their prompt and never blocked — the program just
+            # silently sailed straight through to the next turn's logic
+            # with no pause and no keypress required, which looked exactly
+            # like "extra things happening from a single keypress" even
+            # though nothing was actually reading input there at all.
+            self.emit_expr(node)
         return False
 
     def emit_element_drop(self, node):
@@ -3330,11 +3401,20 @@ class CodeGen:
             self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, i8* {val})')
             self.emit(f'  call i32 @fflush(i8* null)')
         elif val_t == "%Box*":
-            # Box printing for println — use printf with \r instead of puts
-            fmt, flen = self.intern_str("\r<value>\x1b[K")
+            # BUGFIX: this unconditionally printed the literal text "<value>"
+            # instead of the box's actual contents — println() on ANY
+            # dynamically-typed value (a `list`, an `Any`, a net.data()
+            # result, ...) showed that placeholder instead of real data.
+            # print() already does this correctly via box_to_cstr (see
+            # _emit_print_value below); reuse it here with println's
+            # \r...\x1b[K wrapper instead of print()'s trailing \n.
+            cstr = self.new_tmp()
+            self.emit(f'  {cstr} = call i8* @box_to_cstr(%Box* {val})')
+            fmt, flen = self.intern_str("\r%s\x1b[K")
             ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
-            self.emit(f'  call i32 @printf(i8* {ptr})')
+            self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, i8* {cstr})')
+            self.emit(f'  call void @free(i8* {cstr})')
             self.emit(f'  call i32 @fflush(i8* null)')
 
     def to_bool(self, val, t):
@@ -4790,6 +4870,18 @@ class CodeGen:
             h_ptr = self.new_tmp()
             self.emit(f"  {h_ptr} = getelementptr [1024 x i64], [1024 x i64]* @_thread_handles, i64 0, i64 {tid_v}")
 
+            # `thread(net.process(...), id)` / `thread(net.listen(...), id)` —
+            # the callee isn't a Rubidium FnDef at all (it's a runtime C
+            # function), so it can't go through the fn_def-lookup trampoline
+            # logic below. Handled separately with its own fixed signature.
+            if isinstance(func_call_node, MethodCall):
+                _mc_obj_name = func_call_node.obj.name if hasattr(func_call_node.obj, 'name') else str(func_call_node.obj)
+                _mc_obj_name = self.use_aliases.get(_mc_obj_name, _mc_obj_name)
+                if _mc_obj_name == "net" and func_call_node.method in ("process", "listen"):
+                    return self._emit_net_thread_call(func_call_node, h_ptr)
+                if _mc_obj_name == "keyboard" and func_call_node.method == "thread":
+                    return self._emit_keyboard_thread_call(func_call_node, h_ptr)
+
             fn_name = func_call_node.name if isinstance(func_call_node, FnCall) else str(func_call_node)
             call_args = func_call_node.args if isinstance(func_call_node, FnCall) else []
             fn_def = self.functions.get(fn_name)
@@ -4817,6 +4909,9 @@ class CodeGen:
 
             if tramp not in self.functions:
                 tramp_lines = [f"define i8* @{tramp}(i8* %_arg) {{", "entry:"]
+                # thread.kill(id) needs this thread cancellable immediately,
+                # even mid-loop with no I/O — see _thread_kill's comment.
+                tramp_lines.append(f"  call void @_thread_enable_async_cancel()")
                 if call_args and param_types:
                     struct_t = "{" + ", ".join(param_types) + "}"
                     tramp_lines.append(f"  %s = bitcast i8* %_arg to {struct_t}*")
@@ -5027,6 +5122,91 @@ class CodeGen:
 
         raise RubidiumNameError(f"Undefined function or variable: {node.name}")
 
+    def _emit_raw_thread_trampoline(self, h_ptr, tramp, call_target, param_types, vals):
+        """Shared marshal + trampoline + pthread_create for a thread(...) target
+        that calls straight into a runtime C function (not a Rubidium FnDef) —
+        used by net.process/net.listen/keyboard.thread. Every trampoline body
+        starts by switching that OS thread to async cancellation, so
+        thread.kill(id) can actually stop it immediately even if it's a pure
+        compute loop with no I/O (see _thread_kill's comment for the tradeoff)."""
+        if param_types:
+            struct_t = "{" + ", ".join(param_types) + "}"
+            size_ptr, size_int, raw_ptr, struct_ptr = self.new_tmp(), self.new_tmp(), self.new_tmp(), self.new_tmp()
+            self.emit(f"  {size_ptr} = getelementptr {struct_t}, {struct_t}* null, i64 1")
+            self.emit(f"  {size_int} = ptrtoint {struct_t}* {size_ptr} to i64")
+            self.emit(f"  {raw_ptr} = call i8* @malloc(i64 {size_int})")
+            self.emit(f"  {struct_ptr} = bitcast i8* {raw_ptr} to {struct_t}*")
+            for i, (val, pt) in enumerate(zip(vals, param_types)):
+                fptr = self.new_tmp()
+                self.emit(f"  {fptr} = getelementptr {struct_t}, {struct_t}* {struct_ptr}, i32 0, i32 {i}")
+                self.emit(f"  store {pt} {val}, {pt}* {fptr}")
+            arg_ptr = raw_ptr
+        else:
+            arg_ptr = "null"
+
+        if tramp not in self.functions:
+            tramp_lines = [f"define i8* @{tramp}(i8* %_arg) {{", "entry:"]
+            tramp_lines.append(f"  call void @_thread_enable_async_cancel()")
+            if param_types:
+                tramp_lines.append(f"  %s = bitcast i8* %_arg to {struct_t}*")
+                call_arg_strs = []
+                for i, pt in enumerate(param_types):
+                    tramp_lines.append(f"  %fp{i} = getelementptr {struct_t}, {struct_t}* %s, i32 0, i32 {i}")
+                    tramp_lines.append(f"  %v{i} = load {pt}, {pt}* %fp{i}")
+                    call_arg_strs.append(f"{pt} %v{i}")
+                tramp_lines.append(f"  call void @{call_target}({', '.join(call_arg_strs)})")
+                tramp_lines.append(f"  call void @free(i8* %_arg)")
+            else:
+                tramp_lines.append(f"  call void @{call_target}()")
+            tramp_lines += ["  ret i8* null", "}", ""]
+            self._pending_trampolines += tramp_lines
+            self.functions[tramp] = FnDef(tramp, [], None, [])
+
+        tramp_ptr = self.new_tmp()
+        self.emit(f"  {tramp_ptr} = bitcast i8* (i8*)* @{tramp} to i8* (i8*)*")
+        self.emit(f"  call i32 @pthread_create(i64* {h_ptr}, i64* null, i8* (i8*)* {tramp_ptr}, i8* {arg_ptr})")
+        return "0", "i64"
+
+    def _emit_net_thread_call(self, func_call_node, h_ptr):
+        """Marshal + trampoline for thread(net.process(...), id) / thread(net.listen(...), id).
+        These call straight into runtime C functions (rub_net_process/rub_net_listen),
+        not a Rubidium FnDef, so they need their own fixed-signature marshaling
+        instead of the generic fn_def-driven path in the caller."""
+        method = func_call_node.method
+        args = func_call_node.args
+        if method == "process":
+            rate_expr = args[0] if len(args) >= 1 else Number(2)
+            name_expr = args[1] if len(args) >= 2 else Str("")
+            rate_v, rate_t = self.emit_expr(rate_expr)
+            rate_d = self.coerce(rate_v, rate_t, "double")
+            name_v, name_t = self.emit_expr(name_expr)
+            name_s = name_v if name_t == "i8*" else self.coerce_to_string(name_v, name_t)
+            # rub_net_process() takes ownership of `name` (frees it) — the
+            # incoming pointer may be an unowned interned string literal, so
+            # give the thread its own independent heap copy.
+            name_dup = self.new_tmp()
+            self.emit(f"  {name_dup} = call i8* @strdup(i8* {name_s})")
+            return self._emit_raw_thread_trampoline(
+                h_ptr, "_tramp_net_process", "rub_net_process", ["double", "i8*"], [rate_d, name_dup])
+        elif method == "listen":
+            id_v, id_t = self.emit_expr(args[0])
+            id_b = self.coerce_to_box(id_v, id_t)
+            return self._emit_raw_thread_trampoline(
+                h_ptr, "_tramp_net_listen", "rub_net_listen", ["%Box*"], [id_b])
+        else:
+            raise RubidiumNameError(f"net.{method}(...) cannot be used with thread(...)")
+
+    def _emit_keyboard_thread_call(self, func_call_node, h_ptr):
+        """Marshal + trampoline for thread(keyboard.thread(rate), id) — polls
+        stdin at `rate` reads/sec in the background, storing the latest
+        keypress for keyboard.last() to consume."""
+        args = func_call_node.args
+        rate_expr = args[0] if len(args) >= 1 else Number(100)
+        rate_v, rate_t = self.emit_expr(rate_expr)
+        rate_d = self.coerce(rate_v, rate_t, "double")
+        return self._emit_raw_thread_trampoline(
+            h_ptr, "_tramp_keyboard_thread", "rub_keyboard_thread", ["double"], [rate_d])
+
     def emit_method_call_expr(self, node):
         # 1. Resolve the object name
         obj_name = node.obj.name if hasattr(node.obj, 'name') else str(node.obj)
@@ -5034,6 +5214,11 @@ class CodeGen:
         # 0. File handle method calls — intercept before any other logic
         if obj_name in self._file_handle_vars:
             return self.emit_file_handle_method(obj_name, node.method, node.args)
+
+        # `use net as n` — only affects builtin-module dispatch below (never
+        # file handles/class instances/plain vars, so a real variable that
+        # happens to share a name with someone's alias is unaffected).
+        obj_name = self.use_aliases.get(obj_name, obj_name)
 
         # 0a. Handle thread.wait and thread.running on the 'thread' module
         if obj_name == "thread" and node.method == "wait":
@@ -5048,6 +5233,98 @@ class CodeGen:
             result = self.new_tmp()
             self.emit(f"  {result} = call i1 @_thread_is_running(i64 {tid_v})")
             return result, "i1"
+        if obj_name == "thread" and node.method == "kill":
+            # thread.kill(id) — stops that thread immediately, even mid-loop
+            # with no I/O in it (see the THREADING section: "meant for loops
+            # but can be used anywhere"). Backed by pthread_cancel() with
+            # PTHREAD_CANCEL_ASYNCHRONOUS (set as the very first instruction
+            # of every thread trampoline, see _thread_enable_async_cancel) —
+            # deferred (the pthread default) only cancels at I/O calls, which
+            # would never fire for a pure compute loop. The real tradeoff:
+            # async cancellation can in principle land mid-malloc/free and
+            # corrupt the heap; deferred cancellation is heap-safe but can't
+            # honor "immediately... anywhere". The spec explicitly wants the
+            # latter, so that's what this implements.
+            tid_v, tid_t = self.emit_expr(node.args[0])
+            tid_v = self.coerce(tid_v, tid_t, "i64")
+            self.emit(f"  call void @_thread_kill(i64 {tid_v})")
+            return "0", "i64"
+
+        # 0b. `net` module — LAN discovery/messaging (see syntax's NET section).
+        # process()/listen() only make sense as the body of a background
+        # thread(...) call (they run forever) — see _emit_net_thread_call,
+        # hooked into the "thread" builtin below. Calling them directly here
+        # is a clear compile error rather than a confusing runtime one.
+        if obj_name == "net":
+            if node.method in ("process", "listen"):
+                raise RubidiumNameError(
+                    f"net.{node.method}(...) must be called inside thread(...) — "
+                    f"e.g. thread(net.{node.method}(...), 0). See the NET section of the syntax reference."
+                )
+            if node.method == "find":
+                tmp = self.new_tmp()
+                self.emit(f"  {tmp} = call %Box* @rub_net_find()")
+                return tmp, "%Box*"
+            if node.method == "list":
+                tmp = self.new_tmp()
+                self.emit(f"  {tmp} = call %Box* @rub_net_list()")
+                return tmp, "%Box*"
+            if node.method == "requests":
+                tmp = self.new_tmp()
+                self.emit(f"  {tmp} = call %Box* @rub_net_requests()")
+                return tmp, "%Box*"
+            if node.method == "connect":
+                arg_v, arg_t = self.emit_expr(node.args[0])
+                arg_b = self.coerce_to_box(arg_v, arg_t)
+                self.emit(f"  call void @rub_net_connect(%Box* {arg_b})")
+                return "0", "i64"
+            if node.method == "accept":
+                arg_v, arg_t = self.emit_expr(node.args[0])
+                arg_b = self.coerce_to_box(arg_v, arg_t)
+                self.emit(f"  call void @rub_net_accept(%Box* {arg_b})")
+                return "0", "i64"
+            if node.method == "close":
+                arg_v, arg_t = self.emit_expr(node.args[0])
+                arg_b = self.coerce_to_box(arg_v, arg_t)
+                self.emit(f"  call void @rub_net_close(%Box* {arg_b})")
+                return "0", "i64"
+            if node.method == "data":
+                arg_v, arg_t = self.emit_expr(node.args[0])
+                arg_b = self.coerce_to_box(arg_v, arg_t)
+                tmp = self.new_tmp()
+                self.emit(f"  {tmp} = call %Box* @rub_net_data(%Box* {arg_b})")
+                return tmp, "%Box*"
+            if node.method == "send":
+                id_v, id_t = self.emit_expr(node.args[0])
+                id_b = self.coerce_to_box(id_v, id_t)
+                val_v, val_t = self.emit_expr(node.args[1])
+                val_b = self.coerce_to_box(val_v, val_t)
+                self.emit(f"  call void @rub_net_send(%Box* {id_b}, %Box* {val_b})")
+                return "0", "i64"
+            raise RubidiumNameError(f"Unknown net method: net.{node.method}")
+
+        # 0c. `keyboard` module — real-time key reads (see syntax's KEYBOARD
+        # section). keyboard.thread(...) only makes sense as the body of a
+        # background thread(...) call (it polls forever) — see
+        # _emit_keyboard_thread_call, hooked into the "thread" builtin below.
+        if obj_name == "keyboard":
+            if node.method == "thread":
+                raise RubidiumNameError(
+                    "keyboard.thread(...) must be called inside thread(...) — "
+                    "e.g. thread(keyboard.thread(100), 0). See the KEYBOARD section of the syntax reference."
+                )
+            if node.method == "wait":
+                tmp = self.new_tmp()
+                self.emit(f"  {tmp} = call i8* @rub_keyboard_wait()")
+                return tmp, "i8*"
+            if node.method == "last":
+                # Non-blocking companion to keyboard.thread(rate) — the
+                # latest key that background poller has seen, or "" if none
+                # yet / already read (consuming, like net.data()).
+                tmp = self.new_tmp()
+                self.emit(f"  {tmp} = call i8* @rub_keyboard_last()")
+                return tmp, "i8*"
+            raise RubidiumNameError(f"Unknown keyboard method: keyboard.{node.method}")
 
         # 2. Handle .to() type conversion for any type (numeric, string, float)
         if node.method == "to" and isinstance(node.obj, Var) and node.args:

@@ -27,8 +27,16 @@ class InterpolatedStr:
         self.parts = parts
 
 class Var:
-    def __init__(self, name):
+    def __init__(self, name, line=None):
         self.name = name
+        # Source line this reference appeared on — optional (defaults to
+        # None so every existing call site that builds a Var internally,
+        # not from real source text, e.g. Var("__self")/Var(coll_name)
+        # inside codegen/debug.py, keeps working unchanged). Only the
+        # parser's own real-identifier-reference sites pass a real line,
+        # so checks like debug.py's "Unknown Variable" can report WHERE
+        # the bad reference is instead of just that one exists somewhere.
+        self.line = line
 
 class ListExpr:
     def __init__(self, elements):
@@ -74,9 +82,10 @@ class VarDecl:
         self.element_type = element_type
 
 class Assign:
-    def __init__(self, name, value):
+    def __init__(self, name, value, line=None):
         self.name = name
         self.value = value
+        self.line = line
 
 class FieldAssign:
     def __init__(self, obj, field, value):
@@ -150,8 +159,9 @@ class Try:
         self.error_body = error_body
 
 class Drop:
-    def __init__(self, name):
+    def __init__(self, name, line=None):
         self.name = name
+        self.line = line
 
 class ElementDrop:
     """items(1).drop() — remove an element/key from a collection and shift,
@@ -241,8 +251,12 @@ class Import:
                                          # resolved from ~/.xeon/packages/ instead of a relative path)
 
 class Use:
-    def __init__(self, module_name):
+    def __init__(self, module_name, alias=None):
         self.module_name = module_name
+        # `use net as n` — resolved at codegen time (self.use_aliases) so
+        # every builtin-module dispatch site can treat the alias exactly
+        # like the real module name; mirrors Import's alias.
+        self.alias = alias
 
 class TypeCast:
     def __init__(self, expr, target_type):

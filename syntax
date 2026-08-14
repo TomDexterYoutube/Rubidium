@@ -1233,6 +1233,16 @@ fn main() {
 # y is local, so each thread shares z but
 # has its own x and y.
 
+# when you need to stop something
+
+thread.kill(1)
+
+# thread.kill(id) stops that thread immediately — even mid-loop with no
+# other work in it (meant for loops, but can be used anywhere). Killing an
+# id with no thread running on it is a harmless no-op. Once killed, the id
+# is free to reuse with a new thread(...) call, same as a thread that
+# finished on its own.
+
 # -----------------------------------------
 # THREAD SCOPE RULES
 # -----------------------------------------
@@ -1634,6 +1644,152 @@ glfw.set_key_callback(win, my_key_handler)
 # - Not yet supported: calling/passing a `fn callback` in debug mode
 #   (`xeon run --debug` / the debugger) — compile and run the real binary
 #   to test callback behavior.
+
+# =========================================
+# KEYBOARD
+# =========================================
+
+# the keyboard module is a cleaner, instant version of input() — a key is
+# read the moment it's pressed, no Enter needed.
+
+# `use X as Y` works on any module (not just imports) — Y is just a local
+# rename, X is still the real module.
+
+use keyboard as key
+
+# key.wait() blocks until a key is pressed, then returns it as a str.
+
+print(key.wait())
+
+# As soon as a key is pressed it stops and returns it.
+
+# Letters always come back lowercase, e.g. "a" — never "A". Shift+letter
+# and Ctrl+letter are reported as "shift+a" / "ctrl+a" (the letter tells you
+# which key, the prefix tells you which modifier was held). Other keys come
+# back as their own name: "space", "enter", "tab", "backspace", "esc",
+# "up", "down", "left", "right". Anything else prints as the character
+# itself (e.g. "!", "9").
+#
+# A bare Shift/Ctrl/Alt/CapsLock press with nothing else can't be reported
+# at all — no terminal program can see that, only its effect on a key
+# pressed alongside it. This module only ever tells you about a real key.
+
+# key.thread(rate) polls the keyboard in the background — pair it with
+# thread(...) so it doesn't block your main loop, and read key.last() from
+# there to pick up what it's seen.
+
+thread(key.thread(100), 1)
+
+# this must be used with the thread module — checks for a key press this
+# many times a second (default 100, can be changed).
+
+let mut pressed: str = key.last()
+
+# key.last() is non-blocking and consuming: it returns the most recent key
+# key.thread() has seen, or "" if nothing new has come in since the last
+# call — so polling it in a loop never sees the same keypress twice.
+
+# =========================================
+# NET
+# =========================================
+
+# net connects Rubidium programs to each other on a LAN — not a general
+# sockets API. Two programs speak the same built-in protocol automatically;
+# you never touch ports, addresses, or handshakes yourself.
+
+use net
+
+# net.process(rate, name) must be running (via thread) before find() /
+# requests() / accept() do anything — it's what makes YOUR program
+# discoverable to other Rubidium programs' net.find() calls, and handles
+# the protocol plumbing in the background. Runs forever, like a while loop.
+#
+#   rate — how many visibility pings per second it broadcasts so already-
+#          running programs are ambiently discoverable. Optional, defaults
+#          to 2. While it's alive it also listens for and answers incoming
+#          net.find() requests and connection requests the whole time.
+#   name — an optional display name (defaults to "" — no name set). A
+#          named peer shows up AS that name in find()/list()/requests()
+#          instead of a bare number (see DISCOVERY below).
+
+thread(net.process(2), 0)                    # no name — shows up as a number
+thread(net.process(2, "Max's Game"), 0)      # named
+
+# -----------------------------------------
+# DISCOVERY
+# -----------------------------------------
+
+# find() actively sends out a discovery request and collects replies from
+# every net.process() currently running on the LAN. Returns a list ordered
+# by ping, fastest first — each entry is that peer's NAME if they set one,
+# or their id (a plain number) if they didn't.
+
+let found: list = net.find()
+# e.g. ["Max's Game", 7, "Bob's Server"]
+
+# Currently-connected peers (already accepted/connected, not just found) —
+# same convention: name if set, id otherwise.
+
+let connected: list = net.list()
+
+# -----------------------------------------
+# CONNECTING
+# -----------------------------------------
+
+# connect/accept/listen/data/send/close all take whatever value came out
+# of find()/list()/requests() — a name OR a plain id, either works:
+
+net.connect("Max's Game")   # or: net.connect(7)
+
+# Two peers CAN pick the same name — there's no uniqueness check. Connecting
+# by a duplicate name always resolves to whichever match is FIRST in ping
+# order (the closest/fastest one) — the same ordering find()/list() already
+# use, so it's a deterministic tiebreak, not a random pick.
+
+let pending: list = net.requests()   # ids/names currently asking to connect
+net.accept("Max's Game")
+
+# -----------------------------------------
+# RECEIVING
+# -----------------------------------------
+
+thread(net.listen("Max's Game"), 5)   # runs forever, receiving for that connection
+
+# Poll from your own loop. Consuming read: once read, it's cleared for
+# that connection — the next net.data(...) call returns Null until a NEW
+# message arrives, so you never process the same message twice.
+
+let msg = net.data("Max's Game")
+
+# -----------------------------------------
+# SENDING
+# -----------------------------------------
+
+# Send any Rubidium value. It goes out as a string with a small type-tag
+# header, and the receiving side's net.data() converts it back to the
+# right type automatically — you get back an i32, a str, a list, etc., not
+# raw text.
+#
+# Wire format: "TAG:value", tag is one of i/f/s/b/n/l —
+#   i:42            -> i32/i64  42
+#   f:3.14          -> float    3.14
+#   s:hello         -> str      "hello"
+#   b:True          -> bool     True
+#   n:              -> Null
+#   l:i:7,s:K,i:2   -> list     [7, "K", 2]  (elements recursively tagged)
+#
+# v1 covers scalars and FLAT lists of scalars only — nested list/index/
+# dict/dict+ aren't supported over the wire yet.
+
+net.send("Max's Game", "hit:0")
+net.send("Max's Game", 42)
+net.send("Max's Game", [7, "K", 2])
+
+# -----------------------------------------
+# CLOSING
+# -----------------------------------------
+
+net.close("Max's Game")
 
 # =========================================
 # MODULES & IMPORTS

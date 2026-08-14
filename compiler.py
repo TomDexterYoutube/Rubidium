@@ -126,6 +126,32 @@ int _thread_is_running(long long tid) {
     return 0;
 }
 
+// Called as the FIRST instruction of every thread trampoline (see codegen's
+// _emit_raw_thread_trampoline and the generic thread() trampoline) so
+// thread.kill() below can use PTHREAD_CANCEL_ASYNCHRONOUS instead of the
+// pthread default (PTHREAD_CANCEL_DEFERRED, which only cancels at I/O calls
+// — useless against a pure compute loop with no syscalls in it, which is
+// exactly what `syntax`'s THREADING section says thread.kill() must stop:
+// "meant for loops but can be used anywhere"). Trade-off: async cancellation
+// can in principle land mid-malloc/free inside a thread and corrupt the
+// heap, where deferred cancellation never would — accepted here because the
+// documented behavior ("immediately... anywhere") isn't achievable with
+// deferred cancellation at all.
+void _thread_enable_async_cancel(void) {
+    int old_type;
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &old_type);
+}
+
+// thread.kill(id) — forcibly stops that thread right away.
+void _thread_kill(long long tid) {
+    if(tid < 0 || tid >= 1024) return;
+    pthread_t handle = (pthread_t)_thread_handles[tid];
+    if(!handle) return;
+    pthread_cancel(handle);
+    pthread_join(handle, NULL);
+    _thread_handles[tid] = 0;
+}
+
 void box_drop(Box* b) {
     if (!b) return;
     if (b->type == 2 && b->s) free(b->s);
@@ -1603,6 +1629,618 @@ void os_terminal_drop(long long id) {
     close(t->stdout_fd);
     waitpid(t->pid, NULL, WNOHANG);
     t->active=0;
+}
+
+// -------------------------------------------------------
+// NET MODULE — LAN discovery + peer messaging (see `syntax`'s NET section)
+//
+// One UDP socket per process, bound to a fixed port. Discovery/handshake
+// packets are broadcast/unicast text frames of the form
+// "<TYPE>\x01<sender_id>\x01<field>..." (TYPE is a single char: P=ping,
+// F=find request, R=find reply, C=connect request, A=connect ack,
+// D=data, X=close). net.process()'s background loop owns the socket's
+// only recvfrom() call and demuxes every packet type from there — nothing
+// else ever reads the socket, so net.listen() (which the spec says must
+// be running to receive) is a thin peer-liveness check that otherwise
+// just idles: the actual receiving already happens centrally.
+// -------------------------------------------------------
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <stdint.h>
+
+#define RUB_NET_PORT 47990
+#define RUB_NET_MAX_PEERS 128
+#define RUB_NET_NAME_LEN 128
+#define RUB_NET_BUF_LEN 4096
+
+typedef struct {
+    int in_use;
+    int id;
+    char name[RUB_NET_NAME_LEN];
+    struct sockaddr_in addr;
+    double last_seen;
+    double rtt;            // seconds; sentinel 1e9 means "never measured via find()"
+    int connected;
+    int pending_in;        // they sent CONNECT, awaiting our accept()
+    int pending_out;       // we sent CONNECT, awaiting their ack
+    char* mailbox;         // last unread DATA payload (consuming read), NULL if empty
+} RubNetPeer;
+
+typedef struct { int id; char name[RUB_NET_NAME_LEN]; double rtt; } RubNetFindHit;
+
+static RubNetPeer g_net_peers[RUB_NET_MAX_PEERS];
+static pthread_mutex_t g_net_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_net_sock = -1;
+static int g_net_self_id = 0;
+static char g_net_self_name[RUB_NET_NAME_LEN];
+static volatile int g_net_started = 0;
+static struct sockaddr_in g_net_bcast_addr;
+
+static RubNetFindHit g_find_hits[RUB_NET_MAX_PEERS];
+static int g_find_count = 0;
+static volatile int g_finding = 0;
+static double g_find_sent_at = 0;
+static pthread_mutex_t g_find_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static double rub_net_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+// Resolve a name-or-id Box* to a known peer. CALLER MUST HOLD g_net_lock.
+// Duplicate names resolve to the lowest-rtt (closest/fastest, i.e. first
+// in find()/list() order) match — see the NET section's DISCOVERY notes.
+static RubNetPeer* _net_resolve_locked(Box* target) {
+    if (!target) return NULL;
+    if (target->type == 2 && target->s) {
+        RubNetPeer* best = NULL;
+        for (int i = 0; i < RUB_NET_MAX_PEERS; i++) {
+            RubNetPeer* p = &g_net_peers[i];
+            if (p->in_use && p->name[0] && strcmp(p->name, target->s) == 0) {
+                if (!best || p->rtt < best->rtt) best = p;
+            }
+        }
+        return best;
+    }
+    long long id = target->i;
+    for (int i = 0; i < RUB_NET_MAX_PEERS; i++) {
+        if (g_net_peers[i].in_use && g_net_peers[i].id == id) return &g_net_peers[i];
+    }
+    return NULL;
+}
+
+// CALLER MUST HOLD g_net_lock.
+static RubNetPeer* _net_find_or_create_locked(int id, const char* name, struct sockaddr_in* addr, double now) {
+    for (int i = 0; i < RUB_NET_MAX_PEERS; i++) {
+        if (g_net_peers[i].in_use && g_net_peers[i].id == id) {
+            RubNetPeer* p = &g_net_peers[i];
+            if (name && name[0]) { strncpy(p->name, name, RUB_NET_NAME_LEN - 1); p->name[RUB_NET_NAME_LEN-1] = 0; }
+            if (addr) p->addr = *addr;
+            p->last_seen = now;
+            return p;
+        }
+    }
+    for (int i = 0; i < RUB_NET_MAX_PEERS; i++) {
+        if (!g_net_peers[i].in_use) {
+            RubNetPeer* p = &g_net_peers[i];
+            memset(p, 0, sizeof(RubNetPeer));
+            p->in_use = 1;
+            p->id = id;
+            if (name) { strncpy(p->name, name, RUB_NET_NAME_LEN - 1); }
+            if (addr) p->addr = *addr;
+            p->last_seen = now;
+            p->rtt = 1e9;
+            return p;
+        }
+    }
+    return NULL; // peer table full — drop silently
+}
+
+static void _rub_net_send_raw(struct sockaddr_in* dst, const char* msg) {
+    if (g_net_sock < 0) return;
+    sendto(g_net_sock, msg, strlen(msg), 0, (struct sockaddr*)dst, sizeof(*dst));
+}
+
+static void _rub_net_send_ping(void) {
+    char msg[RUB_NET_NAME_LEN + 32];
+    snprintf(msg, sizeof(msg), "P\x01%d\x01%s", g_net_self_id, g_net_self_name);
+    _rub_net_send_raw(&g_net_bcast_addr, msg);
+}
+
+static void _rub_net_send_find(void) {
+    char msg[RUB_NET_NAME_LEN + 32];
+    snprintf(msg, sizeof(msg), "F\x01%d\x01%s", g_net_self_id, g_net_self_name);
+    _rub_net_send_raw(&g_net_bcast_addr, msg);
+}
+
+static void _rub_net_handle_packet(char* buf, int n, struct sockaddr_in* src) {
+    char* fields[8];
+    int nf = 0;
+    fields[nf++] = buf;
+    for (int i = 0; i < n && nf < 8; i++) {
+        if (buf[i] == '\x01') { buf[i] = 0; fields[nf++] = buf + i + 1; }
+    }
+    if (nf < 2) return;
+    char type = fields[0][0];
+    int sender_id = atoi(fields[1]);
+    if (sender_id == 0 || sender_id == g_net_self_id) return;
+    const char* name = (nf > 2) ? fields[2] : "";
+    double now = rub_net_now();
+
+    if (type == 'P') {
+        pthread_mutex_lock(&g_net_lock);
+        _net_find_or_create_locked(sender_id, name, src, now);
+        pthread_mutex_unlock(&g_net_lock);
+    } else if (type == 'F') {
+        pthread_mutex_lock(&g_net_lock);
+        _net_find_or_create_locked(sender_id, name, src, now);
+        pthread_mutex_unlock(&g_net_lock);
+        char msg[RUB_NET_NAME_LEN + 32];
+        snprintf(msg, sizeof(msg), "R\x01%d\x01%s", g_net_self_id, g_net_self_name);
+        _rub_net_send_raw(src, msg);
+    } else if (type == 'R') {
+        int finding = g_finding;
+        double rtt = finding ? (now - g_find_sent_at) : 0.0;
+        pthread_mutex_lock(&g_net_lock);
+        RubNetPeer* p = _net_find_or_create_locked(sender_id, name, src, now);
+        if (p && finding) p->rtt = rtt;
+        pthread_mutex_unlock(&g_net_lock);
+        if (finding) {
+            pthread_mutex_lock(&g_find_lock);
+            int found = 0;
+            for (int i = 0; i < g_find_count; i++) {
+                if (g_find_hits[i].id == sender_id) { g_find_hits[i].rtt = rtt; found = 1; break; }
+            }
+            if (!found && g_find_count < RUB_NET_MAX_PEERS) {
+                g_find_hits[g_find_count].id = sender_id;
+                strncpy(g_find_hits[g_find_count].name, name, RUB_NET_NAME_LEN - 1);
+                g_find_hits[g_find_count].name[RUB_NET_NAME_LEN - 1] = 0;
+                g_find_hits[g_find_count].rtt = rtt;
+                g_find_count++;
+            }
+            pthread_mutex_unlock(&g_find_lock);
+        }
+    } else if (type == 'C') {
+        pthread_mutex_lock(&g_net_lock);
+        RubNetPeer* p = _net_find_or_create_locked(sender_id, name, src, now);
+        if (p) p->pending_in = 1;
+        pthread_mutex_unlock(&g_net_lock);
+    } else if (type == 'A') {
+        pthread_mutex_lock(&g_net_lock);
+        for (int i = 0; i < RUB_NET_MAX_PEERS; i++) {
+            if (g_net_peers[i].in_use && g_net_peers[i].id == sender_id) {
+                if (g_net_peers[i].pending_out) { g_net_peers[i].connected = 1; g_net_peers[i].pending_out = 0; }
+                if (name[0]) { strncpy(g_net_peers[i].name, name, RUB_NET_NAME_LEN - 1); g_net_peers[i].name[RUB_NET_NAME_LEN-1]=0; }
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_net_lock);
+    } else if (type == 'D') {
+        const char* payload = (nf > 2) ? fields[2] : "";
+        pthread_mutex_lock(&g_net_lock);
+        for (int i = 0; i < RUB_NET_MAX_PEERS; i++) {
+            if (g_net_peers[i].in_use && g_net_peers[i].id == sender_id && g_net_peers[i].connected) {
+                if (g_net_peers[i].mailbox) free(g_net_peers[i].mailbox);
+                g_net_peers[i].mailbox = strdup(payload);
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_net_lock);
+    } else if (type == 'X') {
+        pthread_mutex_lock(&g_net_lock);
+        for (int i = 0; i < RUB_NET_MAX_PEERS; i++) {
+            if (g_net_peers[i].in_use && g_net_peers[i].id == sender_id) {
+                g_net_peers[i].connected = 0;
+                g_net_peers[i].pending_in = 0;
+                g_net_peers[i].pending_out = 0;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_net_lock);
+    }
+}
+
+// Thread body for `thread(net.process(rate, name), id)` — never returns.
+void rub_net_process(double rate, char* name) {
+    if (g_net_started) return; // already running (idempotent re-entry guard)
+    if (rate <= 0) rate = 2.0;
+
+    // NOTE: deliberately no SO_REUSEPORT — two net.process() instances on
+    // the SAME machine would silently split incoming discovery/connect/data
+    // packets between them (the kernel hashes each packet to exactly one of
+    // the reusing sockets), which looks like random, hard-to-debug packet
+    // loss rather than a clean error. One net.process() per machine is the
+    // whole model (see the NET section), so a second instance on the same
+    // host should fail loudly at bind() below, not silently steal traffic.
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int one = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(RUB_NET_PORT);
+    if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        rub_throw("net.process: failed to bind the LAN discovery port — another program on this machine may already be using it");
+        return;
+    }
+
+    memset(&g_net_bcast_addr, 0, sizeof(g_net_bcast_addr));
+    g_net_bcast_addr.sin_family = AF_INET;
+    g_net_bcast_addr.sin_port = htons(RUB_NET_PORT);
+    g_net_bcast_addr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+
+    unsigned int seed = (unsigned int)(time(NULL) ^ getpid() ^ (uintptr_t)&addr);
+    g_net_self_id = (int)((rand_r(&seed) & 0x7FFFFFFF) | 1);
+    g_net_self_name[0] = 0;
+    if (name && name[0]) { strncpy(g_net_self_name, name, RUB_NET_NAME_LEN - 1); }
+    free(name);
+
+    g_net_sock = sock;
+    g_net_started = 1;
+
+    double period = 1.0 / rate;
+    double next_ping = rub_net_now();
+    struct pollfd pfd; pfd.fd = sock; pfd.events = POLLIN;
+    char buf[RUB_NET_BUF_LEN];
+
+    for (;;) {
+        double now = rub_net_now();
+        double wait_s = next_ping - now;
+        int timeout_ms = (wait_s > 0) ? (int)(wait_s * 1000) : 0;
+        if (timeout_ms > 200) timeout_ms = 200;
+        int pr = poll(&pfd, 1, timeout_ms);
+        if (pr > 0 && (pfd.revents & POLLIN)) {
+            struct sockaddr_in src; socklen_t slen = sizeof(src);
+            ssize_t n = recvfrom(sock, buf, sizeof(buf) - 1, 0, (struct sockaddr*)&src, &slen);
+            if (n > 0) { buf[n] = 0; _rub_net_handle_packet(buf, (int)n, &src); }
+        }
+        now = rub_net_now();
+        if (now >= next_ping) {
+            _rub_net_send_ping();
+            next_ping = now + period;
+        }
+    }
+}
+
+// Thread body for `thread(net.listen(id_or_name), id)`. The actual receive
+// loop lives in net.process() (single reader on the shared socket) — this
+// just validates the peer and idles, matching the documented "must be
+// running to receive" contract without a second thread fighting for the
+// same recvfrom().
+void rub_net_listen(Box* target) {
+    if (!g_net_started) { rub_throw("net.listen: net.process must be running first"); return; }
+    pthread_mutex_lock(&g_net_lock);
+    RubNetPeer* p = _net_resolve_locked(target);
+    pthread_mutex_unlock(&g_net_lock);
+    if (!p) { rub_throw("net.listen: unknown peer — connect()/accept() it first"); return; }
+    for (;;) { usleep(50000); }
+}
+
+Box* rub_net_find(void) {
+    if (!g_net_started) { rub_throw("net.find: net.process must be running first"); return make_list(); }
+
+    pthread_mutex_lock(&g_find_lock);
+    g_find_count = 0;
+    g_finding = 1;
+    g_find_sent_at = rub_net_now();
+    pthread_mutex_unlock(&g_find_lock);
+
+    _rub_net_send_find();
+    usleep(400000); // discovery window
+
+    pthread_mutex_lock(&g_find_lock);
+    g_finding = 0;
+    int count = g_find_count;
+    RubNetFindHit local[RUB_NET_MAX_PEERS];
+    memcpy(local, g_find_hits, sizeof(RubNetFindHit) * count);
+    pthread_mutex_unlock(&g_find_lock);
+
+    for (int i = 1; i < count; i++) {
+        RubNetFindHit key = local[i];
+        int j = i - 1;
+        while (j >= 0 && local[j].rtt > key.rtt) { local[j+1] = local[j]; j--; }
+        local[j+1] = key;
+    }
+
+    Box* result = make_list();
+    for (int i = 0; i < count; i++) {
+        if (local[i].name[0]) list_append(result, box_s(local[i].name));
+        else list_append(result, box_i(local[i].id));
+    }
+    return result;
+}
+
+Box* rub_net_list(void) {
+    Box* result = make_list();
+    if (!g_net_started) return result;
+    pthread_mutex_lock(&g_net_lock);
+    RubNetPeer* items[RUB_NET_MAX_PEERS]; int n = 0;
+    for (int i = 0; i < RUB_NET_MAX_PEERS; i++) {
+        if (g_net_peers[i].in_use && g_net_peers[i].connected) items[n++] = &g_net_peers[i];
+    }
+    for (int i = 1; i < n; i++) {
+        RubNetPeer* key = items[i];
+        int j = i - 1;
+        while (j >= 0 && items[j]->rtt > key->rtt) { items[j+1] = items[j]; j--; }
+        items[j+1] = key;
+    }
+    for (int i = 0; i < n; i++) {
+        if (items[i]->name[0]) list_append(result, box_s(items[i]->name));
+        else list_append(result, box_i(items[i]->id));
+    }
+    pthread_mutex_unlock(&g_net_lock);
+    return result;
+}
+
+Box* rub_net_requests(void) {
+    Box* result = make_list();
+    if (!g_net_started) return result;
+    pthread_mutex_lock(&g_net_lock);
+    RubNetPeer* items[RUB_NET_MAX_PEERS]; int n = 0;
+    for (int i = 0; i < RUB_NET_MAX_PEERS; i++) {
+        if (g_net_peers[i].in_use && g_net_peers[i].pending_in) items[n++] = &g_net_peers[i];
+    }
+    for (int i = 1; i < n; i++) {
+        RubNetPeer* key = items[i];
+        int j = i - 1;
+        while (j >= 0 && items[j]->rtt > key->rtt) { items[j+1] = items[j]; j--; }
+        items[j+1] = key;
+    }
+    for (int i = 0; i < n; i++) {
+        if (items[i]->name[0]) list_append(result, box_s(items[i]->name));
+        else list_append(result, box_i(items[i]->id));
+    }
+    pthread_mutex_unlock(&g_net_lock);
+    return result;
+}
+
+void rub_net_connect(Box* target) {
+    if (!g_net_started) { rub_throw("net.connect: net.process must be running first"); return; }
+    pthread_mutex_lock(&g_net_lock);
+    RubNetPeer* p = _net_resolve_locked(target);
+    if (!p) { pthread_mutex_unlock(&g_net_lock); rub_throw("net.connect: peer not found — call net.find() first"); return; }
+    p->pending_out = 1;
+    struct sockaddr_in addr = p->addr;
+    pthread_mutex_unlock(&g_net_lock);
+    char msg[RUB_NET_NAME_LEN + 32];
+    snprintf(msg, sizeof(msg), "C\x01%d\x01%s", g_net_self_id, g_net_self_name);
+    _rub_net_send_raw(&addr, msg);
+}
+
+void rub_net_accept(Box* target) {
+    if (!g_net_started) { rub_throw("net.accept: net.process must be running first"); return; }
+    pthread_mutex_lock(&g_net_lock);
+    RubNetPeer* p = _net_resolve_locked(target);
+    if (!p || !p->pending_in) { pthread_mutex_unlock(&g_net_lock); rub_throw("net.accept: no pending connection request from that peer"); return; }
+    p->connected = 1;
+    p->pending_in = 0;
+    struct sockaddr_in addr = p->addr;
+    pthread_mutex_unlock(&g_net_lock);
+    char msg[RUB_NET_NAME_LEN + 32];
+    snprintf(msg, sizeof(msg), "A\x01%d\x01%s", g_net_self_id, g_net_self_name);
+    _rub_net_send_raw(&addr, msg);
+}
+
+void rub_net_close(Box* target) {
+    if (!g_net_started) return;
+    pthread_mutex_lock(&g_net_lock);
+    RubNetPeer* p = _net_resolve_locked(target);
+    if (!p) { pthread_mutex_unlock(&g_net_lock); return; }
+    struct sockaddr_in addr = p->addr;
+    p->connected = 0;
+    p->pending_in = 0;
+    p->pending_out = 0;
+    if (p->mailbox) { free(p->mailbox); p->mailbox = NULL; }
+    pthread_mutex_unlock(&g_net_lock);
+    char msg[32];
+    snprintf(msg, sizeof(msg), "X\x01%d", g_net_self_id);
+    _rub_net_send_raw(&addr, msg);
+}
+
+// Recursive: 'l' elements are themselves TAG:value frames (see the NET
+// section's wire-format table). Only flat lists of scalars are valid input.
+static char* rub_net_serialize(Box* v) {
+    char buf[64];
+    if (!v || v->type == 6) return strdup("n:");
+    if (v->type == 0) { snprintf(buf, sizeof(buf), "i:%lld", (long long)v->i); return strdup(buf); }
+    if (v->type == 1) { snprintf(buf, sizeof(buf), "f:%.15g", v->f); return strdup(buf); }
+    if (v->type == 4) return strdup(v->i ? "b:True" : "b:False");
+    if (v->type == 2) {
+        const char* s = v->s ? v->s : "";
+        char* out = malloc(strlen(s) + 3);
+        sprintf(out, "s:%s", s);
+        return out;
+    }
+    if (v->type == 3) {
+        int* magic = (int*)v->p;
+        if (!magic || *magic != 1) { rub_throw("net.send: only flat lists of scalars are supported (v1)"); return strdup("n:"); }
+        RList* l = (RList*)v->p;
+        char** parts = malloc(sizeof(char*) * (l->count > 0 ? l->count : 1));
+        size_t total = 3;
+        for (int i = 0; i < l->count; i++) { parts[i] = rub_net_serialize(l->items[i]); total += strlen(parts[i]) + 1; }
+        char* out = malloc(total);
+        strcpy(out, "l:");
+        for (int i = 0; i < l->count; i++) { if (i) strcat(out, ","); strcat(out, parts[i]); free(parts[i]); }
+        free(parts);
+        return out;
+    }
+    rub_throw("net.send: unsupported value type");
+    return strdup("n:");
+}
+
+static Box* rub_net_deserialize(const char* s) {
+    if (!s || !s[0]) return box_null();
+    char tag = s[0];
+    const char* val = (s[1] == ':') ? s + 2 : s + 1;
+    if (tag == 'i') return box_i(atoll(val));
+    if (tag == 'f') return box_f(atof(val));
+    if (tag == 's') return box_s((char*)val);
+    if (tag == 'b') return box_b(strcmp(val, "True") == 0 ? 1 : 0);
+    if (tag == 'l') {
+        Box* lst = make_list();
+        char* dup = strdup(val);
+        char* saveptr = NULL;
+        char* tok = strtok_r(dup, ",", &saveptr);
+        while (tok) { list_append(lst, rub_net_deserialize(tok)); tok = strtok_r(NULL, ",", &saveptr); }
+        free(dup);
+        return lst;
+    }
+    return box_null();
+}
+
+void rub_net_send(Box* target, Box* value) {
+    if (!g_net_started) { rub_throw("net.send: net.process must be running first"); return; }
+    pthread_mutex_lock(&g_net_lock);
+    RubNetPeer* p = _net_resolve_locked(target);
+    if (!p || !p->connected) { pthread_mutex_unlock(&g_net_lock); rub_throw("net.send: not connected to that peer"); return; }
+    struct sockaddr_in addr = p->addr;
+    pthread_mutex_unlock(&g_net_lock);
+    char* payload = rub_net_serialize(value);
+    char msg[RUB_NET_BUF_LEN];
+    snprintf(msg, sizeof(msg), "D\x01%d\x01%s", g_net_self_id, payload);
+    free(payload);
+    _rub_net_send_raw(&addr, msg);
+}
+
+Box* rub_net_data(Box* target) {
+    if (!g_net_started) { rub_throw("net.data: net.process must be running first"); return box_null(); }
+    pthread_mutex_lock(&g_net_lock);
+    RubNetPeer* p = _net_resolve_locked(target);
+    if (!p) { pthread_mutex_unlock(&g_net_lock); rub_throw("net.data: unknown peer"); return box_null(); }
+    char* mb = p->mailbox;
+    p->mailbox = NULL;
+    pthread_mutex_unlock(&g_net_lock);
+    if (!mb) return box_null();
+    Box* result = rub_net_deserialize(mb);
+    free(mb);
+    return result;
+}
+
+// -------------------------------------------------------
+// KEYBOARD MODULE — real-time single-key reads (see `syntax`'s KEYBOARD
+// section). Uses termios raw mode (ICANON+ECHO off) so a key is seen the
+// instant it's pressed, no Enter needed. Letters always come back
+// lowercase; Shift+letter and Ctrl+letter are reported as "shift+<letter>"
+// / "ctrl+<letter>" (the only modifier info a terminal actually exposes —
+// a bare Shift/Ctrl/Alt/CapsLock press with nothing else can't be detected
+// this way; no terminal program can see that, only its effect on a
+// following key).
+// -------------------------------------------------------
+#include <termios.h>
+
+static struct termios g_kb_orig_termios;
+static int g_kb_raw_active = 0;
+
+static void _kb_restore(void) {
+    if (g_kb_raw_active) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &g_kb_orig_termios);
+        g_kb_raw_active = 0;
+    }
+}
+
+static void _kb_enable_raw(void) {
+    if (g_kb_raw_active) return;
+    struct termios raw;
+    tcgetattr(STDIN_FILENO, &g_kb_orig_termios);
+    raw = g_kb_orig_termios;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    g_kb_raw_active = 1;
+    atexit(_kb_restore); // otherwise the user's shell is left echo-less/unbuffered after exit
+}
+
+// Decode one raw input byte into a key name string (caller must free()).
+// ESC gets a short lookahead so arrow-key escape sequences (ESC [ A/B/C/D)
+// resolve to "up"/"down"/"right"/"left" instead of three separate reads.
+static char* _kb_decode(unsigned char c) {
+    if (c == 8 || c == 127) return strdup("backspace");
+    if (c == 9) return strdup("tab");
+    if (c == 10 || c == 13) return strdup("enter");
+    if (c == 32) return strdup("space");
+    if (c == 27) {
+        struct pollfd pfd; pfd.fd = STDIN_FILENO; pfd.events = POLLIN;
+        if (poll(&pfd, 1, 50) > 0) {
+            unsigned char c2 = 0;
+            if (read(STDIN_FILENO, &c2, 1) == 1 && c2 == '[') {
+                unsigned char c3 = 0;
+                if (poll(&pfd, 1, 50) > 0) read(STDIN_FILENO, &c3, 1);
+                if (c3 == 'A') return strdup("up");
+                if (c3 == 'B') return strdup("down");
+                if (c3 == 'C') return strdup("right");
+                if (c3 == 'D') return strdup("left");
+            }
+        }
+        return strdup("esc");
+    }
+    if (c >= 1 && c <= 26) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "ctrl+%c", (char)('a' + (c - 1)));
+        return strdup(buf);
+    }
+    if (c >= 'A' && c <= 'Z') {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "shift+%c", (char)(c - 'A' + 'a'));
+        return strdup(buf);
+    }
+    if (c >= 33 && c <= 126) {
+        char buf[2]; buf[0] = (char)c; buf[1] = 0;
+        return strdup(buf);
+    }
+    char buf[8];
+    snprintf(buf, sizeof(buf), "0x%02x", c);
+    return strdup(buf);
+}
+
+// keyboard.wait() — blocks until a key is pressed, returns it.
+char* rub_keyboard_wait(void) {
+    _kb_enable_raw();
+    unsigned char c;
+    ssize_t n = read(STDIN_FILENO, &c, 1);
+    if (n <= 0) return strdup("");
+    return _kb_decode(c);
+}
+
+static char* g_kb_last_key = NULL;
+static pthread_mutex_t g_kb_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// Thread body for `thread(keyboard.thread(rate), id)` — never returns.
+void rub_keyboard_thread(double rate) {
+    if (rate <= 0) rate = 100.0;
+    _kb_enable_raw();
+    int timeout_ms = (int)(1000.0 / rate);
+    if (timeout_ms < 1) timeout_ms = 1;
+    struct pollfd pfd; pfd.fd = STDIN_FILENO; pfd.events = POLLIN;
+    for (;;) {
+        if (poll(&pfd, 1, timeout_ms) > 0) {
+            unsigned char c;
+            if (read(STDIN_FILENO, &c, 1) == 1) {
+                char* key = _kb_decode(c);
+                pthread_mutex_lock(&g_kb_lock);
+                if (g_kb_last_key) free(g_kb_last_key);
+                g_kb_last_key = key;
+                pthread_mutex_unlock(&g_kb_lock);
+            }
+        }
+    }
+}
+
+// keyboard.last() — non-blocking, consuming read of keyboard.thread()'s
+// latest captured key; "" if nothing new since the last call (mirrors
+// net.data()'s single-slot consuming-read convention).
+char* rub_keyboard_last(void) {
+    pthread_mutex_lock(&g_kb_lock);
+    char* key = g_kb_last_key;
+    g_kb_last_key = NULL;
+    pthread_mutex_unlock(&g_kb_lock);
+    if (!key) return strdup("");
+    return key;
 }
 
 // -------------------------------------------------------

@@ -169,7 +169,7 @@ class Parser:
     # --- Unified Identifier Logic ---
     def parse_identifier_chain(self, name):
         """Unified method for parsing variable access, dots, and calls."""
-        res = Var(name)
+        res = Var(name, line=self.line_no)
         while self.peek():
             if self.peek()[0] == "DOT":
                 self.advance()  # consume DOT
@@ -247,7 +247,12 @@ class Parser:
 
     def use_stmt(self):
         self.match("USE")
-        return Use(self.match("IDENT"))
+        name = self.match("IDENT")
+        alias = None
+        if self.peek() and self.peek()[0] == "AS":
+            self.match("AS")
+            alias = self.match("IDENT")
+        return Use(name, alias=alias)
 
     def class_def(self):
         self.match("CLASS")
@@ -806,11 +811,24 @@ class Parser:
             name = self.match("IDENT")
         # Handle Assignment
         if self.peek() and self.peek()[0] == "OP" and self.peek()[1] == "=":
+            assign_line = self.line_no
             self.match("OP")
-            return Assign(name, self.expr())
+            return Assign(name, self.expr(), line=assign_line)
 
         # Handle thread.wait(1, 2) -> ThreadWait / thread.running(1) -> ThreadRunning
         if name == "thread" and self.peek() and self.peek()[0] == "DOT":
+            # BUGFIX: this used to consume DOT + the attribute name
+            # unconditionally, then fall through to parse_identifier_chain
+            # if the attribute was neither "wait" nor "running" — but by
+            # then those tokens were already gone, so e.g. `thread.kill(1)`
+            # as a bare statement silently mis-parsed into FnCall("thread",
+            # [1]) (the ".kill" just vanished) instead of a real method
+            # call. Save/restore position like the expression-context twin
+            # of this block already does, so any OTHER thread.<method>(...)
+            # — kill, or anything added later — falls through with its
+            # tokens intact and becomes a normal MethodCall via
+            # parse_identifier_chain below.
+            saved = self.pos
             self.match("DOT")
             attr = self.match_attr()
             if attr == "wait":
@@ -826,6 +844,7 @@ class Parser:
                 tid = self.expr()
                 self.match("RPAREN")
                 return ThreadRunning(tid)
+            self.pos = saved
 
         # Handle os.start(n), os.run(...), os(n).drop()
         if name == "os":
@@ -838,7 +857,7 @@ class Parser:
             self.match("OP")
             return FieldAssign(res.obj, res.field, self.expr())
         if isinstance(res, FieldAccess) and res.field == "drop":
-            return Drop(res.obj.name)
+            return Drop(res.obj.name, line=self.line_no)
         if isinstance(res, MethodCall) and res.method == "drop":
             # items(1).drop() — obj is an indexing FnCall/MethodCall chain with
             # args (a collection element/key) — remove-and-shift, NOT a whole-
@@ -847,7 +866,7 @@ class Parser:
             if isinstance(res.obj, (FnCall, MethodCall)) and getattr(res.obj, "args", None):
                 return ElementDrop(res.obj)
             obj_name = res.obj.name if hasattr(res.obj, "name") else str(res.obj)
-            return Drop(obj_name)
+            return Drop(obj_name, line=self.line_no)
         # BUGFIX: a bare variable name with nothing else attached (no call,
         # no assignment, no field/method access) can never do anything as a
         # statement — reading a value and discarding it has no observable
@@ -1143,7 +1162,7 @@ class Parser:
                         if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                     self.match("RPAREN")
                     return FnCall(sy_name, args)
-                return Var(sy_name)
+                return Var(sy_name, line=self.line_no)
             self.advance(); e = self.expr(); self.match("RPAREN")
             # FEATURE (typed math block): `(expr): TYPE` computes the whole
             # bracketed expression at TYPE's precision (see MathBlock / codegen's
@@ -1195,7 +1214,7 @@ class Parser:
         if tok[0] == "FILE" and tok[1] in self._active_file_handles:
             self.advance()
             var_name = tok[1]
-            res = Var(var_name)
+            res = Var(var_name, line=self.line_no)
             while self.peek() and self.peek()[0] == "DOT":
                 self.match("DOT")
                 attr = self.match_attr()
@@ -1218,7 +1237,7 @@ class Parser:
             # Not a file module operation — treat as regular variable name
             self.advance()
             name = tok[1]
-            res = Var(name)
+            res = Var(name, line=self.line_no)
             # Check for method calls on the variable
             while self.peek():
                 if self.peek()[0] == "DOT":
@@ -1253,7 +1272,7 @@ class Parser:
         if tok[0] == "TYPE":
             self.advance()
             name = tok[1]
-            res = Var(name)
+            res = Var(name, line=self.line_no)
             # Check for collection access like list(a + 1) or method calls
             while self.peek():
                 if self.peek()[0] == "DOT":
@@ -1335,7 +1354,7 @@ class Parser:
                     self.match("RPAREN")
                     return ThreadRunning(tid)
                 self.pos = saved_pos
-            res = Var(name)
+            res = Var(name, line=self.line_no)
             while self.peek():
                 if self.peek()[0] == "DOT":
                     self.match("DOT")
