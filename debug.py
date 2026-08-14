@@ -485,6 +485,7 @@ class Analyzer:
                 if node.name not in self.functions:
                     self.functions[node.name] = {
                         'params':   node.params,
+                        'defaults': getattr(node, 'defaults', {}),
                         'ret_type': node.ret_type,
                         'used':     False,
                         'line':     self._ln('fn', node.name),
@@ -526,6 +527,7 @@ class Analyzer:
                 if callable_name and callable_name not in self.functions:
                     self.functions[callable_name] = {
                         'params':   node.params,
+                        'defaults': getattr(node, 'defaults', {}),
                         'ret_type': node.ret_type,
                         'used':     False,
                         'line':     None,
@@ -856,7 +858,12 @@ class Analyzer:
             return
         t = type(node)
 
-        if t is ast.Var:
+        if t is ast.KwArg:
+            # Named call argument (`x = value`) — usage-tracking only cares
+            # about the value expression; the resolved arg/param matching
+            # itself happens in _fn_call/_method_call before we ever get here.
+            self._expr(node.value, scope)
+        elif t is ast.Var:
             self._var_usage(node, scope)
         elif t is ast.FnCall:
             self._fn_call(node, scope)
@@ -1463,6 +1470,66 @@ class Analyzer:
         for stmt in (node.else_body or []):
             self._node(stmt, scope)
 
+    def _resolve_call_args(self, fn_name, params, defaults, args):
+        """Static-analyzer counterpart of codegen.py's _resolve_call_args —
+        kept logically in sync so the debugger doesn't reject (or wrongly
+        allow) something the real compiler decides differently. Matches a
+        call's args (plain expr nodes and KwArg('name', expr) nodes) against
+        the callee's declared params, filling any the call omitted from
+        `defaults`. Returns (True, resolved_args_in_param_order) on success;
+        on failure it has already emitted an ERROR issue itself and returns
+        (False, None) — the caller should skip further per-parameter type
+        checking, since the binding itself is broken.
+        """
+        has_kwargs = any(isinstance(a, ast.KwArg) for a in args)
+        if not has_kwargs and len(args) == len(params):
+            return True, args  # fast path — unaffected by this feature at all
+
+        param_names = [pn for pn, _ in params]
+        resolved = [None] * len(params)
+        filled = [False] * len(params)
+
+        pos_i = 0
+        seen_named = False
+        for a in args:
+            if isinstance(a, ast.KwArg):
+                seen_named = True
+                if a.name not in param_names:
+                    self._emit('ERROR', None, 'Function Argument Error',
+                               f"Function '{fn_name}' has no parameter named '{a.name}'")
+                    return False, None
+                idx = param_names.index(a.name)
+                if filled[idx]:
+                    self._emit('ERROR', None, 'Function Argument Error',
+                               f"Function '{fn_name}' got multiple values for parameter '{a.name}'")
+                    return False, None
+                resolved[idx] = a.value
+                filled[idx] = True
+            else:
+                if seen_named:
+                    self._emit('ERROR', None, 'Function Argument Error',
+                               f"Function '{fn_name}': positional argument follows a named one")
+                    return False, None
+                if pos_i >= len(params):
+                    self._emit('ERROR', None, 'Function Argument Error',
+                               f"Function '{fn_name}' expects {len(params)} argument(s), got more")
+                    return False, None
+                resolved[pos_i] = a
+                filled[pos_i] = True
+                pos_i += 1
+
+        for idx, pn in enumerate(param_names):
+            if not filled[idx]:
+                if pn in defaults:
+                    resolved[idx] = defaults[pn]
+                    filled[idx] = True
+                else:
+                    self._emit('ERROR', None, 'Function Argument Error',
+                               f"Function '{fn_name}' missing required argument '{pn}'")
+                    return False, None
+
+        return True, resolved
+
     def _fn_call(self, node: ast.FnCall, scope: Scope):
         name = node.name if isinstance(node.name, str) else None
         if name is None:
@@ -1509,14 +1576,10 @@ class Analyzer:
         if self.cur_class and name in self.classes.get(self.cur_class, {}).get('methods', {}):
             method = self.classes[self.cur_class]['methods'][name]
             params = method.params or []
-            if len(node.args) != len(params):
-                self._emit(
-                    'ERROR', None, 'Function Argument Error',
-                    f"Function '{name}' expects {len(params)} argument(s), "
-                    f"got {len(node.args)}."
-                )
-            else:
-                for arg, (pname, ptype) in zip(node.args, params):
+            defaults = getattr(method, 'defaults', {})
+            ok, resolved = self._resolve_call_args(name, params, defaults, node.args)
+            if ok:
+                for arg, (pname, ptype) in zip(resolved, params):
                     if ptype and ptype != 'Any':
                         atype = self._infer(arg, scope)
                         if atype and not self._types_compat(ptype, atype):
@@ -1544,14 +1607,10 @@ class Analyzer:
         if name in self.functions:
             self.functions[name]['used'] = True
             params = self.functions[name].get('params') or []
-            if len(node.args) != len(params):
-                self._emit(
-                    'ERROR', None, 'Function Argument Error',
-                    f"Function '{name}' expects {len(params)} argument(s), "
-                    f"got {len(node.args)}."
-                )
-            else:
-                for arg, (pname, ptype) in zip(node.args, params):
+            defaults = self.functions[name].get('defaults') or {}
+            ok, resolved = self._resolve_call_args(name, params, defaults, node.args)
+            if ok:
+                for arg, (pname, ptype) in zip(resolved, params):
                     if ptype and ptype != 'Any':
                         atype = self._infer(arg, scope)
                         if atype and not self._types_compat(ptype, atype):
