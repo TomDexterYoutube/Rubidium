@@ -972,7 +972,17 @@ class Parser:
 
     def factor(self):
         tok = self.peek()
-        if tok is None: return Number(0)
+        # BUGFIX (cut corner found via audit): running out of tokens while
+        # parsing an expression used to silently produce the literal value
+        # 0 instead of a syntax error — so any malformed/truncated
+        # expression with nothing where a value is expected just silently
+        # became "...+ 0" (or similar) with ZERO diagnostic. Confirmed:
+        # i"Value is {x + }" (a typo — trailing '+' with nothing after it)
+        # compiled clean and printed "Value is 5" at runtime, no warning at
+        # all — the malformed inner expression silently evaluated as x + 0.
+        # A real expression never legitimately ends with nothing here.
+        if tok is None:
+            raise SyntaxError(f"Line {self.line_no}: expected an expression, got end of input")
 
         # The Link Rule: `link expr` — pass-by-reference marker, valid
         # anywhere an expression is (in practice, only meaningful as a
@@ -1374,8 +1384,18 @@ class Parser:
         """Parse an i"..." string body into an InterpolatedStr node.
         Each {...} segment is parsed as a full Rubidium expression (supports
         variables, field/method chains, indexing like {items(0)}, arithmetic
-        like {age + 10}, comparisons like {age > 3}, etc.). If the contents of
-        a {...} don't form a single valid expression, it's left as literal text."""
+        like {age + 10}, comparisons like {age > 3}, etc.).
+
+        BUGFIX (cut corner found via audit): a {...} that failed to parse as
+        a complete expression used to be silently accepted as LITERAL TEXT —
+        no error, no warning — so a typo inside the braces (a stray closing
+        paren, a trailing operator, ...) just quietly printed the raw
+        `{broken text}` at runtime instead of failing to compile. There's no
+        documented "literal braces" feature in the syntax file to justify
+        that fallback — it only ever existed to swallow parse failures. Any
+        {...} is now required to be a complete, valid expression; a genuine
+        empty `{}` or anything that doesn't fully parse is a compile error.
+        """
         from lexer import tokenize
         parts = []
         i, last, n = 0, 0, len(raw)
@@ -1396,16 +1416,20 @@ class Parser:
                     j += 1
                 if j < n and raw[j] == '}':
                     inner = raw[i+1:j]
-                    node = None
-                    if inner.strip():
-                        try:
-                            sub_tokens = tokenize(inner)
-                            sub_parser = Parser(sub_tokens)
-                            candidate = sub_parser.expr()
-                            if sub_parser.pos == len(sub_tokens):
-                                node = candidate
-                        except Exception:
-                            node = None
+                    if not inner.strip():
+                        raise SyntaxError(
+                            f"Line {self.line_no}: empty '{{}}' in an interpolated string — "
+                            f"put an expression inside, e.g. i\"...{{name}}...\""
+                        )
+                    sub_tokens = tokenize(inner)
+                    sub_parser = Parser(sub_tokens)
+                    node = sub_parser.expr()
+                    if sub_parser.pos != len(sub_tokens):
+                        bad_tok = sub_parser.peek()
+                        raise SyntaxError(
+                            f"Line {self.line_no}: '{{{inner}}}' in an interpolated string isn't "
+                            f"a valid expression (unexpected {bad_tok[1]!r} after the parsed part)"
+                        )
                     if node is not None:
                         before = raw[last:i]
                         if before:

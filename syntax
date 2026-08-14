@@ -647,6 +647,27 @@ print("Hello!")
 clear()
 print("You won't see 'Hello!' anymore — the screen is blank now.")
 
+# exit([code]) — terminates the running binary immediately and
+# unconditionally, from anywhere in the program (not just main()).
+# No cleanup, no unwinding, no drop()s run — the process just ends,
+# the same as an ordinary process exit with that status code.
+# code is optional and defaults to 0.
+
+fn check(n: i32) {
+    if n < 0 {
+        print("negative — stopping")
+        exit(1)
+    }
+    print("still running")
+}
+
+check(-1)
+print("this line never runs")
+
+# exit() with no arguments exits with status 0:
+
+exit()
+
 # =========================================
 # FILES
 # =========================================

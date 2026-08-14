@@ -4,6 +4,7 @@ from fractions import Fraction
 import re
 
 extern_decls = '''
+declare void @exit(i32) noreturn
 declare i32 @pthread_create(i64*, i64*, i8* (i8*)*, i8*)
 declare i32 @pthread_join(i64, i8**)
 declare i32 @pthread_tryjoin_np(i64, i8**)
@@ -4607,6 +4608,29 @@ class CodeGen:
         # already overwrites just the current line).
         if node.name == "clear":
             self.emit("  call void @rub_clear_screen()")
+            return "0", "i64"
+
+        # syntax: exit([code]) — terminates the running binary immediately,
+        # unconditionally, from anywhere (not just main()). No cleanup, no
+        # unwinding — a direct libc exit(), the same as a normal process
+        # exit with that status code. code defaults to 0 if omitted.
+        if node.name == "exit":
+            if node.args:
+                code_v, code_t = self.emit_expr(node.args[0])
+                code_i32 = self.coerce(code_v, code_t, "i32")
+            else:
+                code_i32 = "0"
+            self.emit(f"  call void @exit(i32 {code_i32})")
+            # exit() is declared `noreturn`, but the CALL instruction itself
+            # still isn't a terminator — the basic block needs one right
+            # after it (same pattern raise/error-propagation already uses:
+            # open a fresh label so anything the caller still emits after
+            # this call lands in its own, separate — if unreachable — block
+            # instead of being appended after a terminator, which LLVM
+            # rejects outright).
+            self.emit("  unreachable")
+            cont_l = self.new_label("after_exit")
+            self.emit(f"{cont_l}:")
             return "0", "i64"
 
         # C library math functions.

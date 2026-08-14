@@ -43,6 +43,10 @@ BUILTIN_FNS = {
     # terminal) is implemented for real in codegen.py but was never added
     # here, so every legitimate call was reported as an unknown function.
     'clear',
+    # exit([code]) — immediately terminates the running binary. Same
+    # reasoning as clear() above: real in codegen.py, must be registered
+    # here too or every legitimate call is reported as unknown.
+    'exit',
 }
 
 NUMERIC_TYPES = {
@@ -627,6 +631,141 @@ class Analyzer:
         self._ast_syntax_check(nodes)
         self._scan_thread_reuse(nodes)
         self._scan_os_sessions(nodes)
+        self._check_uninitialized_global_use(nodes)
+
+    # ── Use-before-initialization (globals only ever set up inside a fn) ──────
+
+    def _check_uninitialized_global_use(self, nodes: list):
+        """FEATURE (requested): a global that is ONLY ever given its first
+        value inside some function's body (never at true top level) is only
+        actually initialized once that function has RUN — reading it any
+        earlier gets its type's zero-default, not a compile error, since the
+        name is real and declared. Confirmed real and dangerous: `wheel_state`
+        is only set up inside setup() (`let mut wheel_state: i32 = 1`); a
+        program that called menu() (which transitively reads wheel_state via
+        wheel()) BEFORE setup() read wheel_state as 0, matched none of
+        wheel()'s branches (no default case), and fell off the end — for a
+        str-returning function that's a null pointer, which segfaulted the
+        instant the caller concatenated it into another string. Zero output,
+        no compile error, no runtime error message — just a crash.
+
+        This checks the straight-line (non-branching) prefix of main()'s own
+        body, in source order: each plain top-level call is checked against
+        every global it (transitively, through whatever it calls) reads, and
+        flagged if that global's owning function hasn't been called yet.
+        Stops at the first if/while/for/try (can't safely reason about what's
+        "definitely" initialized once execution can branch) — deliberately
+        conservative to avoid false positives, so this catches the common,
+        easy-to-hit shape (a flat sequence of setup-ish calls in main() in
+        the wrong order) rather than attempting full control-flow analysis.
+        """
+        fn_defs = {n.name: n for n in nodes if isinstance(n, ast.FnDef)}
+        main_fn = fn_defs.get('main')
+        if main_fn is None:
+            return
+
+        top_level_globals = {n.name for n in nodes
+                              if isinstance(n, ast.VarDecl) and not n.is_local}
+
+        def _collect_decl_names(stmts, out):
+            for s in (stmts or []):
+                if isinstance(s, ast.VarDecl) and not s.is_local:
+                    out.add(s.name)
+                for attr in ('body', 'then_body', 'else_body', 'try_body', 'error_body'):
+                    _collect_decl_names(getattr(s, attr, None), out)
+
+        # Globals whose only 'let' anywhere in the program is inside a
+        # function body — these are the only ones this check cares about; a
+        # top-level 'let' always runs before main() by construction.
+        fn_only_global_owner = {}
+        for fname, fnode in fn_defs.items():
+            assigned = set()
+            _collect_decl_names(fnode.body, assigned)
+            for g in assigned:
+                if g not in top_level_globals:
+                    fn_only_global_owner.setdefault(g, fname)
+        if not fn_only_global_owner:
+            return
+
+        def _walk(node, on_var, on_call):
+            if node is None:
+                return
+            if isinstance(node, list):
+                for item in node:
+                    _walk(item, on_var, on_call)
+                return
+            if isinstance(node, ast.Var):
+                on_var(node.name)
+            if isinstance(node, ast.FnCall) and isinstance(node.name, str):
+                on_call(node.name)
+            if hasattr(node, '__dict__'):
+                for v in vars(node).values():
+                    _walk(v, on_var, on_call)
+
+        direct_reads, direct_calls, direct_assigns = {}, {}, {}
+        for fname, fnode in fn_defs.items():
+            reads, calls, assigns = set(), set(), set()
+            _walk(fnode.body, reads.add, calls.add)
+            _collect_decl_names(fnode.body, assigns)
+            direct_reads[fname] = reads
+            direct_calls[fname] = calls
+            direct_assigns[fname] = assigns
+
+        memo_reads, memo_assigns = {}, {}
+
+        def _trans(fname, visiting, memo, direct_map):
+            if fname in memo:
+                return memo[fname]
+            if fname in visiting or fname not in fn_defs:
+                return set()
+            visiting.add(fname)
+            result = set(direct_map.get(fname, ()))
+            for callee in direct_calls.get(fname, ()):
+                result |= _trans(callee, visiting, memo, direct_map)
+            visiting.discard(fname)
+            memo[fname] = result
+            return result
+
+        initialized = set()
+        for stmt in (main_fn.body or []):
+            if isinstance(stmt, (ast.If, ast.While, ast.For, ast.Try)):
+                break  # execution can branch past here — stop reasoning
+            if isinstance(stmt, ast.VarDecl) and not stmt.is_local:
+                initialized.add(stmt.name)
+                continue
+            if isinstance(stmt, ast.FnCall) and isinstance(stmt.name, str) and stmt.name in fn_defs:
+                target = stmt.name
+                # BUGFIX (self-referential false positive): a function that
+                # both READS and ASSIGNS a global somewhere in its own call
+                # tree (e.g. draw_game() declares line1/line2/line3 via 'let'
+                # and then reads them later in that SAME call) is causally
+                # self-sufficient for it — that ordering is guaranteed by
+                # the function's own control flow, not by call order in
+                # main(). Confirmed: without this exclusion, draw_game()
+                # was flagged as needing 'line3' "before draw_game() has
+                # been called" — nonsensical, since the call in question is
+                # the one that produces it. Only flag globals a function
+                # reads but NEVER assigns anywhere in its own transitive
+                # call tree — i.e. ones it's a pure consumer of, sourced
+                # from some OTHER function entirely.
+                assigned_by_target = _trans(target, set(), memo_assigns, direct_assigns)
+                needed = _trans(target, set(), memo_reads, direct_reads) - assigned_by_target
+                for g in sorted(needed):
+                    if g in fn_only_global_owner and g not in initialized:
+                        owner = fn_only_global_owner[g]
+                        self._emit(
+                            'WARNING', None, 'Possible Use Before Initialization',
+                            f"Calling '{target}()' here may read global '{g}' before it's ever "
+                            f"given a value — '{g}' is only initialized inside '{owner}()', "
+                            f"which hasn't been called yet at this point in main().",
+                            f"Call '{owner}()' before '{target}()', or give '{g}' a value at "
+                            f"the top level instead of inside a function."
+                        )
+                initialized |= assigned_by_target
+                continue
+            # Anything else (print, a plain assignment, a method call
+            # statement, ...) carries no useful global-init information but
+            # doesn't invalidate what's already established either.
 
     # ── AST-level structural syntax checks ────────────────────────────────────
 
