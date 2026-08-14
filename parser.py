@@ -1377,8 +1377,18 @@ class Parser:
                     break
             return res
 
-        self.advance()
-        return Number(0)
+        # BUGFIX (same cut corner as factor()'s `tok is None` case above,
+        # just the "there IS a token, it's just not anything an expression
+        # can start with" variant — missed the first time since it's a
+        # separate fallback at the very end of this function). Any token
+        # that doesn't match one of the patterns above used to be silently
+        # skipped and treated as the literal value 0 — so a stray/misplaced
+        # operator anywhere a value was expected compiled clean with zero
+        # diagnostic. Confirmed: `input(/)` (a typo for `input("/")` — a
+        # dropped pair of quotes) compiled successfully, silently passing
+        # `input(0)` instead of erroring on the bare `/`.
+        bad = self.peek()
+        raise SyntaxError(f"Line {self.line_no}: expected an expression, got {bad[0]} {bad[1]!r}")
 
     def _parse_istring_parts(self, raw):
         """Parse an i"..." string body into an InterpolatedStr node.

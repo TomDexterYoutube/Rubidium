@@ -3191,13 +3191,17 @@ class CodeGen:
         reset_ptr = self.new_tmp()
         self.emit(f"  {reset_ptr} = getelementptr [{reset_len} x i8], [{reset_len} x i8]* {reset_lbl}, i64 0, i64 0")
         self.emit(f"  call i32 (i8*, ...) @printf(i8* {reset_ptr})")
-         # If printing a dropped variable, emit error message only
-        if isinstance(value, Var) and value.name in self.dropped_vars:
-            err_lbl, err_len = self.intern_str("ERROR: variable does not exist\\n")
-            ptr = self.new_tmp()
-            self.emit(f"  {ptr} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
-            self.emit(f"  call i32 (i8*, ...) @printf(i8* {ptr})")
-            return
+        # BUGFIX: this used to be its own special case — print a fixed
+        # "ERROR: variable does not exist" message and return, without ever
+        # reaching emit_expr's own dropped-variable handling below. That
+        # meant print(x) on a dropped variable NEVER got the real, catchable
+        # "Accessing dropped memory" error (or the precise runtime re-check
+        # for heap types) — it just always printed this generic message
+        # and silently moved on, completely bypassing emit_expr's Var
+        # branch (see there for the full fix). Removed so print() goes
+        # through the exact same single, correct code path as every other
+        # use of a dropped variable, instead of duplicating (and
+        # under-implementing) the same check a second time here.
         # OPEN-4 (scalar Null): only a value the compiler KNOWS is an explicit
         # Null prints as "Null". A raw scalar that merely computed/clamped to the
         # type's minimum prints its real number (handled by the plain-int print
@@ -4279,7 +4283,15 @@ class CodeGen:
             if node.prompt is not None:
                 pv, pt = self.emit_expr(node.prompt)
                 if pt == "i8*":
-                    fmt, flen = self.intern_str("%s"); ptr = self.new_tmp()
+                    # BUGFIX: same cut corner as emit_print (see the reset
+                    # note there) — this printed the prompt with a bare
+                    # "%s", no leading '\r\x1b[K'. println() never emits a
+                    # real '\n', so a prompt shown right after one (e.g.
+                    # input("Enter to finish Turn") following the
+                    # typewriter-effect wheel_draw() calls in a hotseat
+                    # loop) glued onto the end of whatever println() last
+                    # left on screen instead of starting on a clean line.
+                    fmt, flen = self.intern_str("\r%s\x1b[K"); ptr = self.new_tmp()
                     self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
                     self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, i8* {pv})')
                     self.emit(f'  call i32 @fflush(i8* null)')
@@ -4310,13 +4322,63 @@ class CodeGen:
             return result, "%Box*"
         if isinstance(node, Var):
             if node.name in self.dropped_vars:
-                # Runtime behavior: print error message instead of crash
-                err_lbl, err_len = self.intern_str("ERROR: variable does not exist\\n")
-                fmt_ptr = self.new_tmp()
-                self.emit(f"  {fmt_ptr} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
-                self.emit(f"  call i32 (i8*, ...) @printf(i8* {fmt_ptr})")
-                return "0", "i64"
-            
+                # BUGFIX: this used to unconditionally print a message and
+                # substitute a hardcoded i64 0 in place of the real value,
+                # then let execution just CONTINUE — not the runtime error
+                # the spec documents ("Accessing dropped memory causes a
+                # runtime error"), and not catchable via try/error either.
+                # Confirmed: `x.drop(); let y = x + 1` printed 1 (treated x
+                # as 0) and kept running silently; a dropped `str` used in
+                # concatenation produced "0 world" instead of erroring.
+                #
+                # self.dropped_vars is only a STATIC, compile-time
+                # approximation though — Drop marks a name unconditionally,
+                # with no notion of which branch actually executed, so a
+                # name dropped inside one `if` branch would still trip this
+                # check on a completely different, valid branch that never
+                # touched it. For %Box*/i8* (heap) types that's fully
+                # solvable: .drop() already nulls the slot for real (see the
+                # double-drop guard just above this method), so a genuine
+                # RUNTIME null-check here is 100% precise — it only raises
+                # when the variable is ACTUALLY null right now, and falls
+                # through to a normal read otherwise (static hint was wrong,
+                # no harm done). Scalar types have no such runtime sentinel
+                # to check, so they fall back to trusting the static
+                # approximation directly — imprecise across untaken
+                # branches, but now at least raises the documented,
+                # catchable error instead of silently substituting a wrong 0.
+                peek_t = None
+                for scope in reversed(self.local_vars_stack):
+                    if node.name in scope:
+                        peek_t = scope[node.name]; break
+                if peek_t is None:
+                    peek_t = self.global_vars.get(node.name)
+                err_lbl, err_len = self.intern_str(f"Accessing dropped memory: '{node.name}'")
+                if peek_t in ("%Box*", "i8*"):
+                    ptr_str = (self._shadow_active.get(node.name, f"%ptr_{node.name}")
+                               if any(node.name in scope for scope in self.local_vars_stack)
+                               else f"@_var_{node.name}" if node.name in {"pow", "sin", "cos", "tan", "sqrt", "log", "log10", "exp", "fabs", "floor", "ceil", "round"} else f"@{node.name}")
+                    cur = self.new_tmp()
+                    self.emit(f"  {cur} = load {peek_t}, {peek_t}* {ptr_str}")
+                    is_dropped = self.new_tmp()
+                    ok_l = self.new_label("dropped_read_ok")
+                    err_l = self.new_label("dropped_read_err")
+                    err_ptr = self.new_tmp()
+                    self.emit(f"  {is_dropped} = icmp eq {peek_t} {cur}, null")
+                    self.emit(f"  br i1 {is_dropped}, label %{err_l}, label %{ok_l}")
+                    self.emit(f"{err_l}:")
+                    self.emit(f"  {err_ptr} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
+                    self._emit_raise_or_propagate(err_ptr)
+                    self.emit(f"{ok_l}:")
+                    return cur, peek_t
+                else:
+                    err_ptr = self.new_tmp()
+                    self.emit(f"  {err_ptr} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
+                    self._emit_raise_or_propagate(err_ptr)
+                    cont_l = self.new_label("after_dropped_read")
+                    self.emit(f"{cont_l}:")
+                    return "0", (peek_t or "i64")
+
             # --- FIX: Implicitly access class field if it exists ---
             # BUGFIX (bugs.log #15): a LOCAL variable or PARAMETER must
             # always shadow a class field of the same name — this is
