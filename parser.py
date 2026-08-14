@@ -104,6 +104,34 @@ class Parser:
             return tok[1]
         return None
 
+    def expect(self, kind, what=None):
+        """Like match(), but a missing/mismatched token is a real compile
+        error instead of being silently skipped. Use this at points in the
+        grammar where the token is structurally required (block delimiters,
+        closing parens, etc.) — plain match() should stay reserved for
+        genuinely optional tokens and multi-alternative lookaheads (`match(A)
+        or match(B)`), where a None return is a normal, expected outcome."""
+        tok = self.peek()
+        if tok and tok[0] == kind:
+            self.advance()
+            return tok[1]
+        got = f"{tok[0]} {tok[1]!r}" if tok else "end of input"
+        raise SyntaxError(f"Line {self.line_no}: expected {what or kind}, got {got}")
+
+    def _expect_block_open(self, where):
+        """Consume the '{' that opens a block, with a targeted diagnostic
+        for the single most common cause of a missing '{' here: writing '='
+        instead of '==' in a condition. `=` isn't a valid condition operator
+        at all (comparison() only accepts ==/!=/</>/<=/>=), so expr() simply
+        stops before it, leaving a stray '=' sitting where '{' should be."""
+        tok = self.peek()
+        if tok and tok[0] == "OP" and tok[1] == "=":
+            raise SyntaxError(
+                f"Line {self.line_no}: unexpected '=' in {where} — "
+                f"'=' is assignment, not comparison; did you mean '=='?"
+            )
+        return self.expect("LBRACE", f"'{{' to open the {where} body")
+
     def _reject_void(self, t, where):
         """`void` is only meaningful as an FFI binding's return type (a real
         C function that returns nothing) — everywhere else in Rubidium every
@@ -462,8 +490,16 @@ class Parser:
             # — the call was never actually parsed or emitted.
             return [self.expr()]
         else:
-            self.advance()
-            return []
+            # BUGFIX: this used to silently `self.advance(); return []` for
+            # any token that doesn't start a known statement — meaning a
+            # leftover/orphaned token (e.g. a missing `+` between two
+            # expressions leaving a bare IDENT dangling, or a stray operator
+            # left over from a malformed condition) was quietly swallowed one
+            # token at a time instead of being reported. That let genuinely
+            # broken programs "compile" into a silently wrong AST. Anything
+            # reaching here is a real syntax error.
+            got = f"{t[0]} {t[1]!r}"
+            raise SyntaxError(f"Line {self.line_no}: unexpected {got} — not valid at the start of a statement")
 
     def open_stmt(self):
         """Parse: open("path") as var_name { statements }"""
@@ -602,18 +638,19 @@ class Parser:
     def if_stmt(self):
         self.match("IF")
         cond = self.expr()
-        self.match("LBRACE"); then_body = self.block(); self.match("RBRACE")
+        self._expect_block_open("if"); then_body = self.block(); self.expect("RBRACE", "'}' to close the if body")
         else_body = None
         if self.peek() and self.peek()[0] == "ELSE":
             self.match("ELSE")
             if self.peek() and self.peek()[0] == "IF": else_body = [self.if_stmt()]
             else:
-                self.match("LBRACE"); else_body = self.block(); self.match("RBRACE")
+                self._expect_block_open("else"); else_body = self.block(); self.expect("RBRACE", "'}' to close the else body")
         return If(cond, then_body, else_body)
 
     def while_stmt(self):
         self.match("WHILE")
-        cond = self.expr(); self.match("LBRACE"); body = self.block(); self.match("RBRACE")
+        cond = self.expr()
+        self._expect_block_open("while"); body = self.block(); self.expect("RBRACE", "'}' to close the while body")
         return While(cond, body)
 
     def for_stmt(self):
@@ -638,9 +675,9 @@ class Parser:
             iterable = self.expr()
             start = None
             end = None
-        self.match("LBRACE")
+        self.expect("LBRACE", "'{' to open the for body")
         body = self.block()
-        self.match("RBRACE")
+        self.expect("RBRACE", "'}' to close the for body")
         return For(var, start, end, body, iterable)
 
     # Token kinds that can never start an expression — seeing one of these
@@ -661,14 +698,16 @@ class Parser:
 
     def try_stmt(self):
         self.match("TRY")
-        self.match("LBRACE"); try_body = self.block(); self.match("RBRACE")
+        self.expect("LBRACE", "'{' to open the try body"); try_body = self.block(); self.expect("RBRACE", "'}' to close the try body")
         # Accept both `error` (as IDENT) and `on_error` as the catch keyword
         tok = self.peek()
         if tok and tok[0] == "ON_ERROR":
             self.match("ON_ERROR")
         elif tok and tok[0] == "IDENT" and tok[1] == "error":
             self.advance()  # consume `error`
-        self.match("LBRACE"); err_body = self.block(); self.match("RBRACE")
+        else:
+            raise SyntaxError(f"Line {self.line_no}: expected 'error' block after 'try'")
+        self.expect("LBRACE", "'{' to open the error body"); err_body = self.block(); self.expect("RBRACE", "'}' to close the error body")
         return Try(try_body, err_body)
 
     def file_global_stmt_list(self):
@@ -790,6 +829,18 @@ class Parser:
                 return ElementDrop(res.obj)
             obj_name = res.obj.name if hasattr(res.obj, "name") else str(res.obj)
             return Drop(obj_name)
+        # BUGFIX: a bare variable name with nothing else attached (no call,
+        # no assignment, no field/method access) can never do anything as a
+        # statement — reading a value and discarding it has no observable
+        # effect. In practice this shape only ever shows up when an operator
+        # got dropped between two expressions (e.g. `"text" tmp` instead of
+        # `"text" + tmp`), leaving `tmp` to be reparsed as its own orphaned
+        # statement. Reject it instead of silently accepting a no-op.
+        if isinstance(res, Var):
+            raise SyntaxError(
+                f"Line {self.line_no}: '{res.name}' by itself isn't a valid statement "
+                f"— likely a missing operator (e.g. '+') on the previous line"
+            )
         return res
 
     def _parse_os_stmt(self):

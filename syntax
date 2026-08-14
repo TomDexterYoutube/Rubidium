@@ -1268,13 +1268,16 @@ random.shuffle(items)
 # Pick a random value from a collection:
 
 random.choice(items)
+random.choice_index(items) # returns the index of the iteam isntead of th value
 
 let mut my_index: index = ["a": 1, "b": 2]
 random.choice(my_index)
+# random.choice_index does not work on index as it has one value per key
 
 let mut my_dict: dict = { "scores" = [10, 20, 30] }
 random.choice(my_dict)
 random.choice(my_dict("scores"))
+random.choice_index(my_dict("scores")) # can not return keys, with dict+ this rule does not change
 
 random.seed("seed")
 
