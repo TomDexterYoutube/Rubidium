@@ -2115,67 +2115,27 @@ class CodeGen:
                     if not any(d.startswith(f"{slot} =") for d in self.global_decls):
                         self.global_decls.append(f"{slot} = global i64 -1")
                     self.emit(f"  store i64 {val}, i64* {slot}")
-            elif self.cur_fn is not None and self.cur_fn != "_rubidium_init":
-                # Inside a regular function (not class method) — keep variables local
-                if is_class:
-                    struct_t = self.class_ir_type(cn)
-                    self.instances[node.name] = cn
-                    self.local_vars_stack[-1][node.name] = f"{struct_t}*"
-                    if node.mutable: self.mutable_vars.add(node.name)
-                    ptr_str = f"%ptr_{node.name}"
-                    if node.name not in self._alloca_emitted:
-                        self.emit(f"  {ptr_str} = alloca {struct_t}*")
-                        self._alloca_emitted.add(node.name)
-                    if is_class_copy_src:
-                        self.emit_class_copy(ptr_str, cn, is_class_copy_src)
-                    else:
-                        init_args = node.value.args if isinstance(node.value, (FnCall, ClassInstantiate, MethodCall)) else []  # bugs.log OPEN-O
-                        self.emit_class_init(ptr_str, cn, init_args)
-                    return False
-                ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
-                if node.name in getattr(self, "_local_polymorphic", ()):
-                    ir_t = "%Box*"
-                self.local_vars_stack[-1][node.name] = ir_t
-                # Track element type for collection type enforcement (bugs.log #2)
-                if node.element_type:
-                    self.element_types[node.name] = node.element_type
-                if node.mutable: self.mutable_vars.add(node.name)
-                ptr_str = f"%ptr_{node.name}"
-                # BUG-3: a FIRST declaration owns its storage for exactly this
-                # block, so its value can stay arena-tracked and be auto-dropped
-                # at scope exit (the spec's local-variable rule). A REPEAT `let`
-                # of the same name reuses an alloca that may belong to an
-                # enclosing block, so that value must escape instead.
-                first_decl = node.name not in self._alloca_emitted
-                if first_decl:
-                    self.emit(f"  {ptr_str} = alloca {ir_t}")
-                    self._alloca_emitted.add(node.name)
-                    self._emit_null_flag_decl(node.name, ir_t, is_local=True)  # bugs.log OPEN-J
-                val, val_t = self.emit_expr(node.value)
-                # OPEN-10: copy the %Box* before coercing (see the detailed note
-                # at the is_local branch above — same stale-val_t bug otherwise).
-                val = self._deep_copy_if_var(val, val_t, node.value)
-                val = self.coerce(val, val_t, ir_t)
-                if not (first_decl and node.is_local):
-                    val = self._escape_temp(val, ir_t)
-                self.emit(f"  store {ir_t} {val}, {ir_t}* {ptr_str}")
-                self._emit_null_flag_store(node.name, node.value)  # bugs.log OPEN-J
-                if isinstance(node.value, FFILoad):
-                    slot = f"@_ffi_slot_{node.name}"
-                    # BUG-1 (RIG report): `d.startswith(slot)` is a substring
-                    # check against the WHOLE declaration line, not an exact
-                    # global-name check — "@_ffi_slot_glfw = global i64 -1"
-                    # starts with "@_ffi_slot_gl" too, so declaring `gl` after
-                    # `glfw` false-positived as "already declared" and skipped
-                    # emitting @_ffi_slot_gl entirely, leaving a later `store`
-                    # into it referencing an undefined global (LLVM codegen
-                    # error). Match the exact declaration prefix ("slot =")
-                    # instead, so a name that happens to be a prefix of an
-                    # earlier one is never mistaken for it.
-                    if not any(d.startswith(f"{slot} =") for d in self.global_decls):
-                        self.global_decls.append(f"{slot} = global i64 -1")
-                    self.emit(f"  store i64 {val}, i64* {slot}")
             else:
+                # BUGFIX: a non-local `let` inside an ordinary (non-class-
+                # method) function used to hit a separate branch here that
+                # allocated it as a plain function-local (a stack `alloca`,
+                # gone the moment the function returns) — silently
+                # contradicting the spec's GLOBAL BY DEFAULT rule ("Variables
+                # created normally are placed into the global memory pool...
+                # Global variables can be accessed anywhere"), which draws no
+                # distinction between a `let` at true top level and one
+                # inside a regular function. Confirmed: `fn set_it() { let
+                # mut counter = 42 }` then `set_it(); print(counter)` from
+                # `main()` printed 0, not 42 — every one of a real program's
+                # helper-function-initialized globals (a shuffled deck, dealt
+                # hands, starting coin totals, ...) silently reset to their
+                # type's zero value the moment the initializing function
+                # returned, while still LOOKING like ordinary global state
+                # everywhere else in the source. This branch is now removed
+                # entirely so those declarations fall through to the same
+                # `else` below as a true top-level `let` — the exact same
+                # real-global codegen path, regardless of which function
+                # first declares the name.
                 if is_class:
                     struct_t = self.class_ir_type(cn)
                     self.instances[node.name] = cn
@@ -5614,8 +5574,26 @@ class CodeGen:
         # the result with the arena so it is released at block exit. The one
         # exception is `.to(str)`, which hands back the receiver unchanged;
         # tracking that would free a buffer this call does not own.
+        #
+        # BUGFIX (double free): this used to detect that passthrough case by
+        # comparing `res != obj_val` (the ORIGINAL parameter). But
+        # _emit_string_method_impl immediately reassigns its OWN local
+        # `obj_val` to a fresh temp via _null_safe_str's `select` before any
+        # method body runs — that reassignment is local to that function and
+        # never visible here, so `.to(str)`'s "return obj_val unchanged" was
+        # always returning a DIFFERENT temp name than the one this function
+        # started with, making `res != obj_val` true even on a genuine
+        # passthrough. That silently defeated the guard: the same heap
+        # pointer already tracked once (by the box-unboxing call site, e.g.
+        # `hand1(x).to(str)`) got tracked a SECOND time here, so the arena
+        # freed it twice — confirmed crashing ("double free detected in
+        # tcache") on any `tmp = tmp + " " + something(x).to(str)` pattern
+        # inside a loop. `.to(str)` is the only method that can ever hand
+        # back an unowned receiver, so key off the method name directly
+        # instead of trying to detect it after the fact.
         res, res_t = self._emit_string_method_impl(obj_val, method, args)
-        if res_t == "i8*" and res != obj_val:
+        is_to_str_passthrough = (method == "to" and res_t == "i8*")
+        if res_t == "i8*" and not is_to_str_passthrough:
             res = self._track_temp(res, "i8*")
         return res, res_t
 
