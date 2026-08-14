@@ -218,6 +218,17 @@ class CodeGen:
         self.index_typed_vars = set()  # names declared `let x: index = ...` — see _check_index_values_are_scalar
         self.cur_class    = None
         self._alloca_emitted = set()  # local var names that already have an alloca in current fn
+        # BUGFIX (real per-block scoping / shadowing): _shadow_active maps a
+        # name to the alloca pointer CURRENTLY in effect for it, only while
+        # that name is genuinely shadowing an outer same-named binding (an
+        # enclosing block's local, a global, or a for-loop variable). Absent
+        # here means "use the ordinary %ptr_name convention" — the common
+        # case, completely unaffected. _shadow_stack_by_name keeps the full
+        # LIFO history per name so nested shadows-of-shadows unwind in the
+        # right order as each block's scope closes. See _declare_local /
+        # _push_scope / _pop_scope.
+        self._shadow_active = {}
+        self._shadow_stack_by_name = {}
         self._math_block_type = None  # typed math block `(expr): TYPE` — forces every arithmetic op inside to compute at this IR type
         self._try_error_label = None  # set while inside a try body for div-by-zero guards
         self._fn_error_exit_label = None  # OPEN-7: per-function block that returns a default value to propagate an uncaught error to the caller
@@ -701,6 +712,77 @@ class CodeGen:
         else:
             self.global_decls.append(f"@{ir_name} = global {ir_type} 0")
 
+    def _declare_local(self, name, ir_t):
+        """Register `name` as a local of type `ir_t` in the CURRENT
+        (innermost, still-open) scope frame, and return (ptr_str,
+        needs_alloca) — the alloca pointer this declaration should use, and
+        whether the caller must actually emit the `alloca` instruction for
+        it (False means reuse of already-emitted storage).
+
+        BUGFIX (shadowing shared storage): every local declaration used to
+        resolve to the exact same '%ptr_name' pointer no matter how deeply
+        nested it was — so a `local x` inside an inner if-block and a
+        `local x` inside its enclosing if-block were literally the SAME
+        LLVM alloca, and a `for x in ...` loop wrote its counter into the
+        exact same slot a same-named GLOBAL used. Visibility (which
+        declaration's TYPE is currently in scope) was already correctly
+        tracked per-block via local_vars_stack (emit_body pushes/pops a
+        frame per block already), but the underlying MEMORY wasn't
+        independent, so restoring visibility after a block closed didn't
+        restore the outer value — it had already been overwritten in place.
+        Confirmed: `if {local x=2; if {local x=3}; print(x)}` printed 3, not
+        2; `for x in range(0,3){...}; print(x)` (with a same-named global
+        `x`) left the global permanently clobbered with the loop's last
+        counter value instead of restoring it.
+
+        Fix: a declaration that's a genuine SHADOW of something already
+        visible (an enclosing block's local of the same name, or a global)
+        gets its OWN freshly-named storage instead of reusing '%ptr_name' —
+        so writes to it can never alias the thing it's shadowing. A repeat
+        declaration in the SAME still-open frame (the ordinary "VARIABLE
+        OVERWRITE RULE": `let x = 1 ... let x = 2` in one block) is NOT a
+        shadow and keeps reusing '%ptr_name' exactly as before. The shadow
+        pointer is tracked in _shadow_active/_shadow_stack_by_name and
+        automatically un-shadowed by _pop_scope_frame when this frame
+        closes, restoring whatever it was hiding.
+        """
+        is_shadow = (name in self.global_vars
+                     or any(name in scope for scope in self.local_vars_stack))
+        self.local_vars_stack[-1][name] = ir_t
+        if is_shadow:
+            ptr_str = f"%ptr_{name}__shadow{self.new_tmp()[1:]}"
+            self._shadow_stack_by_name.setdefault(name, []).append(ptr_str)
+            self._shadow_active[name] = ptr_str
+            return ptr_str, True
+        ptr_str = f"%ptr_{name}"
+        needs_alloca = name not in self._alloca_emitted
+        if needs_alloca:
+            self._alloca_emitted.add(name)
+        return ptr_str, needs_alloca
+
+    def _push_scope(self):
+        """Open a new lexical scope frame. Use ONLY for constructs that
+        don't already go through emit_body (which pushes/pops its own frame
+        per block already) — currently just the for-loop's own variable,
+        whose scope spans the whole loop construct, not just its body."""
+        self.local_vars_stack.append({})
+
+    def _pop_scope_frame(self, frame):
+        """Counterpart to _declare_local: for every name this closing frame
+        declared, un-shadow it (pop its entry off _shadow_stack_by_name and
+        restore whatever _shadow_active entry — if any — was underneath),
+        so a name that shadowed an outer binding correctly resolves back to
+        that outer binding once this scope closes. A no-op for any name
+        that was never a shadow (the common case)."""
+        for name in frame:
+            stack = self._shadow_stack_by_name.get(name)
+            if stack:
+                stack.pop()
+                if stack:
+                    self._shadow_active[name] = stack[-1]
+                else:
+                    self._shadow_active.pop(name, None)
+
     def get_var_ptr(self, name):
         # BUGFIX (bugs.log #5): scalar variable-level `link` (e.g. `let b = link a`)
         # previously fell through LinkArg's no-op passthrough in emit_expr, which
@@ -725,7 +807,7 @@ class CodeGen:
         # Look for variable in the innermost scope first
         for scope in reversed(self.local_vars_stack):
             if name in scope:
-                return f"%ptr_{name}", scope[name]
+                return self._shadow_active.get(name, f"%ptr_{name}"), scope[name]
         # FEATURE: class methods cannot see global variables — they only see
         # their own instance fields (handled earlier, before get_var_ptr is
         # even called — see is_class_field()/emit_field_access in the Var
@@ -1718,6 +1800,8 @@ class CodeGen:
         self.local_vars_stack = [{}]  # Stack of scopes, each scope is a dict of variable names to types
         self.dropped_vars = set()
         self._alloca_emitted = set()  # track which local names have had alloca emitted
+        self._shadow_active = {}
+        self._shadow_stack_by_name = {}
         _type_map = {}
         self._gather_local_types(node.body, _type_map, only_local=False)
         self._local_polymorphic = {n for n, ts in _type_map.items() if len(ts) > 1}
@@ -1876,7 +1960,8 @@ class CodeGen:
         if not returned:
             self._emit_temp_release(mark)
         # Pop the scope when leaving the block
-        self.local_vars_stack.pop()
+        frame = self.local_vars_stack.pop()
+        self._pop_scope_frame(frame)
         return returned
 
     def _emit_class_method(self, mfn, class_name):
@@ -1884,6 +1969,8 @@ class CodeGen:
         self.local_vars_stack = [{}]  # Stack of scopes, each scope is a dict of variable names to types
         self.dropped_vars = set()
         self._alloca_emitted = set()
+        self._shadow_active = {}
+        self._shadow_stack_by_name = {}
         _type_map = {}
         self._gather_local_types(mfn.body, _type_map, only_local=True)
         self._local_polymorphic = {n for n, ts in _type_map.items() if len(ts) > 1}
@@ -2030,23 +2117,36 @@ class CodeGen:
                 ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
                 if node.name in getattr(self, "_local_polymorphic", ()):
                     ir_t = "%Box*"
-                self.local_vars_stack[-1][node.name] = ir_t
                 # Track element type for collection type enforcement (bugs.log #2)
                 if node.element_type:
                     self.element_types[node.name] = node.element_type
                 if node.mutable: self.mutable_vars.add(node.name)
-                ptr_str = f"%ptr_{node.name}"
+                # BUGFIX (evaluation order — shadowing): the initializer must
+                # be evaluated BEFORE this name is registered as a local, so
+                # a self-referencing initializer (`let local x = x + 1`,
+                # where the RHS `x` means the OUTER x being shadowed) reads
+                # the outer binding instead of this brand-new, not-yet-
+                # initialized one. Confirmed crashing once shadows got their
+                # own real storage (see _declare_local): `let tmp = ""` then
+                # `let local tmp = tmp + "a"` read straight out of the fresh,
+                # never-stored-to shadow alloca — a garbage i8* handed to
+                # strlen(), segfaulting. Previously masked (wrong value, not
+                # a crash) only because every declaration of a name reused
+                # the SAME storage regardless of nesting, so a self-read hit
+                # stale-but-real memory instead of literally uninitialized.
+                val, val_t = self.emit_expr(node.value)
                 # BUG-3: a FIRST declaration owns its storage for exactly this
                 # block, so its value can stay arena-tracked and be auto-dropped
                 # at scope exit (the spec's local-variable rule). A REPEAT `let`
                 # of the same name reuses an alloca that may belong to an
-                # enclosing block, so that value must escape instead.
-                first_decl = node.name not in self._alloca_emitted
+                # enclosing block, so that value must escape instead. A
+                # genuine SHADOW of an outer/global same-named binding always
+                # gets fresh storage (see _declare_local) — same as a first
+                # declaration, since it isn't aliased to anything outer.
+                ptr_str, first_decl = self._declare_local(node.name, ir_t)
                 if first_decl:
                     self.emit(f"  {ptr_str} = alloca {ir_t}")
-                    self._alloca_emitted.add(node.name)
                     self._emit_null_flag_decl(node.name, ir_t, is_local=True)  # bugs.log OPEN-J
-                val, val_t = self.emit_expr(node.value)
                 # OPEN-10: deep-copy the %Box* BEFORE coercing, not after. The
                 # old order coerced first (e.g. %Box* -> i8* via unbox_s, which
                 # REASSIGNS val to a raw string pointer) and THEN called
@@ -2338,7 +2438,17 @@ class CodeGen:
             if ir_t is None:
                 ir_t = self.global_vars.get(node.name)
             if ir_t:
-                ptr_str = f"%ptr_{node.name}" if any(node.name in scope for scope in self.local_vars_stack) else f"@_var_{node.name}" if node.name in {"pow", "sin", "cos", "tan", "sqrt", "log", "log10", "exp", "fabs", "floor", "ceil", "round"} else f"@{node.name}"
+                # BUGFIX: this used to build '%ptr_name' directly instead of
+                # going through get_var_ptr/_shadow_active, so a `local` that
+                # was genuinely shadowing an outer/global same-named binding
+                # (its real storage is a distinct '%ptr_name__shadowNN'
+                # pointer — see _declare_local) still tried to load/free
+                # the OLD, never-allocated plain pointer here — an "use of
+                # undefined value" LLVM verifier error. Reuse the same
+                # shadow-aware pointer resolution as every other read.
+                ptr_str = (self._shadow_active.get(node.name, f"%ptr_{node.name}")
+                           if any(node.name in scope for scope in self.local_vars_stack)
+                           else f"@_var_{node.name}" if node.name in {"pow", "sin", "cos", "tan", "sqrt", "log", "log10", "exp", "fabs", "floor", "ceil", "round"} else f"@{node.name}")
                 val = self.new_tmp()
                 self.emit(f"  {val} = load {ir_t}, {ir_t}* {ptr_str}")
                 # BUG-3: an explicit .drop() frees the value NOW, so the arena
@@ -3269,6 +3379,19 @@ class CodeGen:
             if isinstance(node.iterable, Var) and node.iterable.name in self._file_handle_vars:
                 self._emit_for_file(node)
                 return
+        # BUGFIX (shadowing): the loop variable's own scope must span the
+        # WHOLE loop construct (declaration through every iteration), not
+        # just the body — emit_body already pushes/pops its own frame for
+        # the body statements, but node.var itself used to be declared
+        # straight into whatever frame was already open when the loop
+        # started, so it never got un-shadowed/removed once the loop ended.
+        # Confirmed: `for x in range(0,3){...}` with a same-named global `x`
+        # left the global permanently overwritten with the loop's last
+        # counter value afterward, instead of restoring it. This frame is
+        # popped at every exit path below (the early `return` in the
+        # integer-iterable branch, and the shared fall-through at the end).
+        self._push_scope()
+        if node.iterable:
             iter_v, iter_t = self.emit_expr(node.iterable)
 
             # Integer iterable: for i in N → loop from 1 to N (inclusive)
@@ -3285,17 +3408,13 @@ class CodeGen:
                     if is_poly:
                         ctr_ptr = f"%ptr_{node.var}_ctr_{self.new_tmp()[1:]}"
                         self.emit(f"  {ctr_ptr} = alloca i64")
-                        var_ptr = f"%ptr_{node.var}"
-                        if node.var not in self._alloca_emitted:
+                        var_ptr, needs_alloca = self._declare_local(node.var, "%Box*")
+                        if needs_alloca:
                             self.emit(f"  {var_ptr} = alloca %Box*")
-                            self._alloca_emitted.add(node.var)
-                        self.local_vars_stack[-1][node.var] = "%Box*"
                     else:
-                        ctr_ptr = f"%ptr_{node.var}"
-                        if node.var not in self._alloca_emitted:
+                        ctr_ptr, needs_alloca = self._declare_local(node.var, "i64")
+                        if needs_alloca:
                             self.emit(f"  {ctr_ptr} = alloca i64")
-                            self._alloca_emitted.add(node.var)
-                        self.local_vars_stack[-1][node.var] = "i64"
                 else:
                     self.declare_global(node.var, "i64")
                     ctr_ptr = f"@{node.var}"
@@ -3319,25 +3438,20 @@ class CodeGen:
                 inc, cur2 = self.new_tmp(), self.new_tmp()
                 self.emit(f"  {cur2} = load i64, i64* {ctr_ptr}\n  {inc} = add i64 {cur2}, 1\n  store i64 {inc}, i64* {ctr_ptr}")
                 self.emit(f"  br label %{cond_l}\n{end_l}:")
+                self._pop_scope_frame(self.local_vars_stack.pop())
                 return
 
             iter_b = self.coerce_to_box(iter_v, iter_t)
-            
+
             idx_ptr = self.new_tmp()
             self.emit(f"  {idx_ptr} = alloca i32")
             self.emit(f"  store i32 0, i32* {idx_ptr}")
-            
+
             item_t = "%Box*"
             if self.cur_fn is not None and self.cur_fn != "_rubidium_init":
-                var_ptr = f"%ptr_{node.var}"
-                if node.var not in self._alloca_emitted:
-                    self.local_vars_stack[-1][node.var] = item_t
+                var_ptr, needs_alloca = self._declare_local(node.var, item_t)
+                if needs_alloca:
                     self.emit(f"  {var_ptr} = alloca {item_t}")
-                    self._alloca_emitted.add(node.var)
-                else:
-                    self.local_vars_stack[-1][node.var] = item_t
-                    # Already alloca'd — just update the type in case it changed
-                    self.local_vars_stack[-1][node.var] = item_t
             else:
                 self.declare_global(node.var, item_t)
                 var_ptr = f"@{node.var}"
@@ -3388,17 +3502,13 @@ class CodeGen:
                 if is_poly:
                     ctr_ptr = f"%ptr_{node.var}_ctr_{self.new_tmp()[1:]}"
                     self.emit(f"  {ctr_ptr} = alloca i64")
-                    var_ptr = f"%ptr_{node.var}"
-                    if node.var not in self._alloca_emitted:
+                    var_ptr, needs_alloca = self._declare_local(node.var, "%Box*")
+                    if needs_alloca:
                         self.emit(f"  {var_ptr} = alloca %Box*")
-                        self._alloca_emitted.add(node.var)
-                    self.local_vars_stack[-1][node.var] = "%Box*"
                 else:
-                    ctr_ptr = f"%ptr_{node.var}"
-                    if node.var not in self._alloca_emitted:
+                    ctr_ptr, needs_alloca = self._declare_local(node.var, "i64")
+                    if needs_alloca:
                         self.emit(f"  {ctr_ptr} = alloca i64")
-                        self._alloca_emitted.add(node.var)
-                    self.local_vars_stack[-1][node.var] = "i64"
             else:
                 self.declare_global(node.var, "i64")
                 ctr_ptr = f"@{node.var}"
@@ -3430,6 +3540,7 @@ class CodeGen:
             self.emit(f"  {step} = select i1 {is_up}, i64 1, i64 -1")
             self.emit(f"  {cur2} = load i64, i64* {ctr_ptr}\n  {inc} = add i64 {cur2}, {step}\n  store i64 {inc}, i64* {ctr_ptr}")
             self.emit(f"  br label %{cond_l}\n{end_l}:")
+        self._pop_scope_frame(self.local_vars_stack.pop())
 
     def _emit_for_file(self, node):
         """for line in file_handle { body } — iterate file lines one-by-one."""
