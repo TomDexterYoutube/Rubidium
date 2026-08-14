@@ -3064,6 +3064,22 @@ class CodeGen:
         return lo, hi
 
     def emit_print(self, value):
+        # BUGFIX: println() never emits a real '\n' — it only ever writes
+        # '\r<text>\x1b[K' so the next println overwrites the same line. If
+        # a print() call comes right after one (e.g. printing a finished
+        # line right after the typewriter-effect loop that built it), the
+        # cursor is still sitting wherever that last println left it —
+        # mid-line — so puts()/printf's own text lands glued onto the end
+        # of that leftover line instead of starting fresh. Confirmed: `for
+        # x in range(...) { println(...) } print(result)` visibly ran the
+        # two together on screen. Reset to a known-clean line (return to
+        # column 0, clear anything after the cursor) unconditionally before
+        # any of the type-specific printing below — a no-op on an already-
+        # blank line, so this is safe even when nothing preceded it.
+        reset_lbl, reset_len = self.intern_str("\r\x1b[K")
+        reset_ptr = self.new_tmp()
+        self.emit(f"  {reset_ptr} = getelementptr [{reset_len} x i8], [{reset_len} x i8]* {reset_lbl}, i64 0, i64 0")
+        self.emit(f"  call i32 (i8*, ...) @printf(i8* {reset_ptr})")
          # If printing a dropped variable, emit error message only
         if isinstance(value, Var) and value.name in self.dropped_vars:
             err_lbl, err_len = self.intern_str("ERROR: variable does not exist\\n")
