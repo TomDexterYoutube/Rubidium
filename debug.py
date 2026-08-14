@@ -2096,9 +2096,12 @@ def _token_syntax_check(tokens: list, source_lines: list) -> list:
             depth += 1
         elif kind in ('RPAREN', 'RBRACKET', 'RBRACE'):
             depth -= 1
-        elif kind in ('IF', 'WHILE') and depth == 0:
+        elif kind in ('IF', 'WHILE'):
             # Scan forward past the condition (depth inside parens handled naturally),
-            # then check if LBRACE follows.
+            # then check if LBRACE follows. Not gated on `depth == 0` — real
+            # if/while statements are almost always nested inside a function
+            # body (depth >= 1), so requiring top-level depth here meant this
+            # check silently never fired for ordinary code.
             j = i + 1
             cond_depth = 0
             while j < n:
@@ -2109,6 +2112,18 @@ def _token_syntax_check(tokens: list, source_lines: list) -> list:
                     cond_depth -= 1
                 elif kk == 'LBRACE' and cond_depth == 0:
                     break
+                elif kk == 'OP' and tokens[j][1] == '=' and cond_depth == 0:
+                    # '=' is assignment, not a valid comparison operator — the
+                    # expression parser simply stops before it, which is what
+                    # lets `if x = 0 { ... }` silently misparse. Report every
+                    # occurrence (don't break — keep scanning the same
+                    # condition so a later missing '{' is still caught too).
+                    kw = tokens[i][1]
+                    cond_line = tokens[j][2]
+                    emit(cond_line, 'Assignment In Condition',
+                         f"'=' is assignment, not comparison, inside this '{kw}' condition\n"
+                         f"  {ANSI['DIM']}→  {src(cond_line)}{ANSI['RESET']}",
+                         "Use '==' to compare values, e.g. 'if x == 0 { ... }'")
                 elif kk in ('LET','FN','CLASS','IF','WHILE','FOR','PRINT','PRINTLN','RETURN') and cond_depth == 0:
                     # Hit a statement keyword before a brace — brace is missing
                     kw = tokens[i][1]
@@ -2165,6 +2180,12 @@ def check_file(filepath: str, strict: bool = False) -> bool:
             if errs:
                 print(f"{ANSI['ERROR']}✖  {len(errs)} syntax error{'s' if len(errs) != 1 else ''} "
                       f"— analysis may be unreliable{ANSI['RESET']}\n")
+                # Stop here rather than also handing the same broken tokens to
+                # the parser: the parser now raises on the FIRST structural
+                # problem it hits and exits, which would bury the full list
+                # above under one more, differently-formatted single-line
+                # error instead of leaving every issue visible together.
+                sys.exit(1)
 
         # ── Pre-parsing Keyword & Typo Pass ──
         KEYWORD_MAPPING = {
