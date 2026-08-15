@@ -2316,6 +2316,28 @@ class CodeGen:
                 expected = self.rubi_type_to_ir(self.functions[self.cur_fn].ret_type)
             else:
                 expected = getattr(self, '_cur_fn_ret_ir', val_t)
+                # BUG-32: per syntax file ("Return type is optional. A
+                # function with no return type returns nothing."), a
+                # function with no declared `-> TYPE` has its IR return type
+                # silently defaulted to i64 above (see emit_fn). That's a
+                # harmless default for a bare `return` or an int value — but
+                # `return <value>` here with a non-integer value (a string,
+                # a bool, a collection/Any) previously fell straight into
+                # coerce()'s i8*/%Box*-to-i64 paths (atol() on a string
+                # pointer, unboxing, ...), silently turning the real value
+                # into IR-type-confused garbage. The CALLER then reads that
+                # garbage back as whatever type it actually expected (e.g.
+                # `let x: str = f()`), typically dereferencing a bogus
+                # pointer and segfaulting — a real, hard-to-diagnose crash
+                # for what is actually just a missing `-> str` annotation.
+                # Catch it here as a clear compile-time error instead.
+                if node.value is not None and val_t not in self._INT_IR_SET and val_t != expected:
+                    raise RubidiumTypeError(
+                        f"Function '{self.cur_fn}' returns a value but has no "
+                        f"declared return type — per the syntax file, a function "
+                        f"with no '-> TYPE' returns nothing. Add the appropriate "
+                        f"'-> TYPE' (e.g. '-> str') to its signature."
+                    )
             val = self.coerce(val, val_t, expected)
             # BUG-3: deliberately NOT escaped. A returning block skips its own
             # release (see emit_body), so a tracked return value simply stays
