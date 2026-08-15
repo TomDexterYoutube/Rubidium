@@ -247,7 +247,11 @@ class Parser:
 
     def use_stmt(self):
         self.match("USE")
-        name = self.match("IDENT")
+        # "file" tokenizes as its own FILE keyword (not IDENT), so a plain
+        # match("IDENT") silently fails to consume it, leaving the FILE
+        # token to leak into the next top-level statement dispatch and
+        # desync the whole parse from there on.
+        name = self.match("IDENT") or self.match("FILE")
         alias = None
         if self.peek() and self.peek()[0] == "AS":
             self.match("AS")
@@ -500,11 +504,17 @@ class Parser:
             return [Raise(self.expr())]
         elif t[0] == "FN":      return [self.fn_def()]
         elif t[0] == "OPEN":    return [self.open_stmt()]
-        elif t[0] == "FILE":    
+        elif t[0] == "FILE":
             result = self.file_global_stmt_list()
             if result is not None:
                 return [result]
-            return []
+            # Not a file.method() call — file_global_stmt_list() rolled back
+            # to before the FILE token, so `file` here is just an ordinary
+            # identifier (e.g. a bare variable named `file`). Fall through to
+            # normal identifier-statement parsing instead of dropping the
+            # token, which would otherwise leave the position unchanged and
+            # spin the caller's while loop forever.
+            return [self.ident_stmt()]
         elif t[0] == "IDENT" or t[0] == "TYPE":   return [self.ident_stmt()]
         elif t[0] == "LPAREN":
             # BUGFIX/FEATURE (bugs.log #2): a statement starting with `(` is a
@@ -737,9 +747,21 @@ class Parser:
     def file_global_stmt_list(self):
         """Parse: file.write(...), file.append(...), file.read(...), file.exists(...), file.delete(...), file.rename(...), file.copy(...), file.new(...)"""
         # Peek at the FILE token value to check if it's an active file handle var
+        # BUGFIX: save position so every "this isn't actually a file.method()
+        # call" exit below can restore to right before the FILE token and
+        # return None cleanly. Callers (factor()'s FILE branch, and the
+        # top-level FILE dispatch) rely on that — a partial, inconsistent
+        # consume here (e.g. eating FILE and DOT but not landing on a real
+        # method) desyncs the whole rest of the parse, since `file` also
+        # doubles as an ordinary identifier (e.g. a function parameter named
+        # `file` passed to `open(file)`).
+        saved = self.pos
         file_tok = self.peek()
         file_var = file_tok[1] if file_tok else "file"
         self.match("FILE")
+        if not (self.peek() and self.peek()[0] == "DOT"):
+            self.pos = saved
+            return None
         self.match("DOT")
         # BUGFIX: use match_attr() (accepts any token kind), not match("IDENT").
         # Method names after a dot can collide with reserved keywords — e.g.
@@ -800,12 +822,15 @@ class Parser:
                 self._active_file_handles.discard("file")
             return FileNew(path, body)
         else:
-            return None  # Will be handled as file handle method
+            self.pos = saved
+            return None  # Not a recognized file.method() call — roll back
 
     def ident_stmt(self):
-        # Accept both IDENT and TYPE tokens for variable names (e.g., "list" is a TYPE but can be a variable name)
+        # Accept IDENT, TYPE, and FILE tokens for variable names (e.g., "list"
+        # is a TYPE and "file" is its own FILE token, but both are valid
+        # variable names — e.g. a function parameter literally called `file`).
         tok = self.peek()
-        if tok and tok[0] in ("IDENT", "TYPE"):
+        if tok and tok[0] in ("IDENT", "TYPE", "FILE"):
             name = self.match(tok[0])
         else:
             name = self.match("IDENT")
