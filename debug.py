@@ -59,6 +59,17 @@ NUMERIC_TYPES = {
     'f32', 'f64', 'f128', 'f256', 'f512', 'f1024', 'f2048',
 }
 
+# BUG-32 (codegen.py): a function with no declared '-> TYPE' has its IR
+# return type silently defaulted to i64. That default is harmless for a
+# bare `return` or a genuinely integer/bool value (both fit i64 losslessly)
+# but corrupts anything else (str/float/collection/Any) into IR-type-
+# confused garbage — codegen now rejects that shape outright at compile
+# time instead of letting it segfault at runtime, but by then a full build
+# has already been attempted. These are exactly the types that stay SAFE
+# to return with no declared type — anything else should be flagged here,
+# before compiling even starts.
+SAFE_UNDECLARED_RETURN_TYPES = {'bool', 'i32', 'i64', 'i128', 'i256', 'i512', 'i1024', 'i2048'}
+
 HEAP_TYPES = {'list', 'index', 'dict', 'str'}
 
 ALL_TYPES = NUMERIC_TYPES | {'str', 'bool', 'list', 'index', 'dict', 'Any', 'Null'}
@@ -140,7 +151,21 @@ class Scope:
 
 class Analyzer:
 
-    def __init__(self):
+    def __init__(self, is_module_file: bool = False):
+        # BUG-33 follow-up: True when this Analyzer is checking a file
+        # reached via import/xeon rather than the project's entry file
+        # (see check_file's per-file analysis loop). A module file's
+        # top-level functions/globals are, by definition, meant to be used
+        # by WHOEVER imports it — this analyzer only ever sees one file at
+        # a time (see check_file's own comment on why: real cross-file
+        # resolution is the deferred, harder BUG-27-style problem), so it
+        # has no way to know whether an importer elsewhere calls them.
+        # Without this, EVERY exported function/global in EVERY module file
+        # in a real project would report as "unused" — pure noise, on
+        # perfectly correct code. Local, single-function-scoped unused-
+        # variable/leak checks are unaffected (those stay meaningful
+        # regardless of what other files do).
+        self.is_module_file = is_module_file
         self.issues: list = []
         self.functions: dict  = {}
         self.classes:   dict  = {}
@@ -1249,6 +1274,36 @@ class Analyzer:
                         f"'{node.ret_type}' but 'return' has no value.",
                         f"Use 'return <{node.ret_type} value>'."
                     )
+                elif not node.ret_type and stmt.value is not None:
+                    # BUG-32: see SAFE_UNDECLARED_RETURN_TYPES above. A known
+                    # unsafe type (str/float/list/dict/Any/...) is a
+                    # guaranteed compile failure — flag it as an ERROR. An
+                    # unknown type (most often a call through another file's
+                    # namespace, e.g. `cf.read(...)` — this analyzer
+                    # deliberately doesn't resolve types across files, see
+                    # check_file's own comment on that) might still be fine
+                    # (an int/bool call the analyzer just can't see into),
+                    # so it's flagged as a WARNING rather than a hard error.
+                    inferred = self._infer(stmt.value, fn_scope)
+                    if inferred is None:
+                        self._emit(
+                            'WARNING', self._ln('fn', node.name), 'Return Type Error',
+                            f"Function '{node.name}' has no declared return type "
+                            f"but returns a value of unknown type. Per the syntax "
+                            f"file, a function with no '-> TYPE' returns nothing — "
+                            f"if this value isn't an int/bool, it will fail to "
+                            f"compile.",
+                            f"Add the appropriate '-> TYPE' to function '{node.name}'."
+                        )
+                    elif inferred not in SAFE_UNDECLARED_RETURN_TYPES:
+                        self._emit(
+                            'ERROR', self._ln('fn', node.name), 'Return Type Error',
+                            f"Function '{node.name}' returns a '{inferred}' value "
+                            f"but has no declared return type. Per the syntax "
+                            f"file, a function with no '-> TYPE' returns nothing — "
+                            f"this will fail to compile.",
+                            f"Add '-> {inferred}' to function '{node.name}'."
+                        )
 
         param_names = {p[0] for p in (node.params or [])}
         self._fn_depth -= 1
@@ -1935,6 +1990,14 @@ class Analyzer:
                     self._scan_race(sub, fn_name)
 
     def _check_unused(self, global_scope: Scope):
+        # BUG-33 follow-up: none of these are meaningful for a module file
+        # analyzed on its own — see is_module_file's own comment. A top-
+        # level function/global/class/field that looks unused from inside
+        # THIS file alone is exactly what every legitimately-exported
+        # module symbol looks like; only the entry file's own top level is
+        # actually "nothing else could possibly call this."
+        if self.is_module_file:
+            return
         for fname, finfo in self.functions.items():
             if fname == 'main':
                 continue
@@ -1962,6 +2025,14 @@ class Analyzer:
 
     def _check_global_leaks(self, global_scope: Scope):
         leaks = []
+
+        # BUG-33 follow-up: same cross-file blind spot as _check_unused — a
+        # module-file global can legitimately be .drop()'d from a DIFFERENT
+        # file (the shared-instance model means whoever imports it can),
+        # which this analyzer, looking at only one file, has no way to see.
+        if self.is_module_file:
+            self._leak_vars = leaks
+            return
 
         for vname, vinfo in global_scope.vars.items():
 
@@ -2246,14 +2317,150 @@ def _token_syntax_check(tokens: list, source_lines: list) -> list:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CLI entry point
+# Project-wide syntax pre-check
 # ──────────────────────────────────────────────────────────────────────────────
+#
+# BUGFIX (owner report): check_file() below only ever tokenizes/parses the
+# ONE file it's handed (src/main.rub, per xeon.py's _require_src()) — it
+# never follows `import`/`xeon` at all. Two consequences, both reported by
+# the owner in the same breath: a syntax error anywhere in an IMPORTED file
+# is completely invisible to `xeon check`/`xeon run`'s debug pass (the real
+# compiler DOES recursively parse every import — see compiler.py's
+# parse_file — so this was a real debugger/compiler gap, the same class of
+# bug as BUG-27/28/29), and even when the error IS in the one file that
+# does get checked, the error text never says which file it's in — with an
+# 8-file project, "Line 26" alone tells you nothing.
+#
+# Fix: before running the existing (unchanged) full analysis on the entry
+# file, walk every file transitively reachable via import/xeon from it —
+# same relative-path and `~/.xeon/packages/<name>/pkg.rub` resolution
+# compiler.py uses — tokenizing and parsing each just far enough to (a)
+# discover its own imports and (b) surface a SyntaxError with its real
+# filename attached, the instant the first broken file is hit.
+
+def _find_imports_in_body(stmts):
+    """Recursively collect Import nodes from a statement list, including
+    ones nested inside functions/classes/control flow — mirrors
+    compiler.py's own _find_imports so the same import shapes are found."""
+    imports = []
+    for stmt in stmts:
+        if isinstance(stmt, ast.Import):
+            imports.append(stmt)
+        elif isinstance(stmt, ast.FnDef):
+            imports.extend(_find_imports_in_body(stmt.body))
+        elif isinstance(stmt, ast.If):
+            imports.extend(_find_imports_in_body(stmt.then_body))
+            imports.extend(_find_imports_in_body(stmt.else_body or []))
+        elif isinstance(stmt, ast.While):
+            imports.extend(_find_imports_in_body(stmt.body))
+        elif isinstance(stmt, ast.For):
+            imports.extend(_find_imports_in_body(stmt.body))
+        elif isinstance(stmt, ast.Try):
+            imports.extend(_find_imports_in_body(stmt.try_body))
+            imports.extend(_find_imports_in_body(stmt.error_body))
+        elif isinstance(stmt, ast.ClassDef):
+            for m in stmt.methods:
+                imports.extend(_find_imports_in_body(m.body))
+    return imports
+
+
+def _resolve_import_path(node, importer_path):
+    if node.is_xeon_pkg:
+        return os.path.join(os.path.expanduser("~"), ".xeon", "packages",
+                             node.module_name, "pkg.rub")
+    mod_file = node.module_name.replace(".", os.sep) + ".rub"
+    base_dir = os.path.dirname(importer_path)
+    return os.path.join(base_dir, mod_file) if base_dir else mod_file
+
+
+def check_project_syntax(entry_path: str):
+    """Returns (files, error). `files` is every file reachable from
+    entry_path (entry first, each path appearing once, in discovery order)
+    that parsed cleanly. `error` is None if the whole project parsed
+    cleanly, otherwise (filepath, exception) for the first file that
+    didn't — either a genuine syntax error, or (rare) some other
+    parse-time exception, reported the same way check_file() already
+    reports one for the entry file alone. `files` is always complete up to
+    (but not including) whatever `error` names."""
+    visited = set()
+    files = []
+
+    def visit(path, mod_name_override=None):
+        abs_path = os.path.abspath(path)
+        key = (abs_path, mod_name_override or "")
+        if key in visited:
+            return None
+        visited.add(key)
+        if not os.path.exists(path):
+            # Not this pass's job to report missing-import errors — the
+            # real compiler already does (parse_file's own FileNotFoundError
+            # handling), and doing it here too would just duplicate/race
+            # that message. Silently skip; nothing further to walk into.
+            return None
+        try:
+            with open(path, "r") as f:
+                src = f.read()
+        except OSError:
+            return None
+        try:
+            tokens = tokenize(src)
+            tree = Parser(tokens).parse()
+        except SyntaxError as e:
+            return (path, e)
+        except Exception as e:
+            return (path, e)
+        files.append(path)
+        for node in _find_imports_in_body(tree):
+            err = visit(_resolve_import_path(node, path),
+                        mod_name_override=node.module_name if node.is_xeon_pkg else None)
+            if err:
+                return err
+        return None
+
+    error = visit(entry_path)
+    return files, error
+
 
 def check_file(filepath: str, strict: bool = False) -> bool:
     if not os.path.exists(filepath):
         print(f"✖ Error: File not found: {filepath}")
         sys.exit(1)
 
+    # Project-wide pass FIRST: catches a syntax error in an IMPORTED file
+    # (previously invisible here entirely — see check_project_syntax's own
+    # comment) and, either way, reports which file the error is actually in
+    # instead of a bare line number.
+    project_files, project_err = check_project_syntax(filepath)
+    if project_err:
+        bad_path, exc = project_err
+        kind = "Syntax Error" if isinstance(exc, SyntaxError) else "Parse Error"
+        print(f"✖ {kind} in {bad_path}: {exc}")
+        sys.exit(1)
+
+    # Full semantic analysis (unused vars, sibling-call checks, the
+    # runtime-crash-shape checks below, etc.) on the entry file — unchanged
+    # from before this pass existed — plus the SAME analysis run
+    # independently on every imported file, so a real bug local to e.g.
+    # coop.rub is no longer invisible to `xeon check` just because it isn't
+    # main.rub. Each file is analyzed on its own (not merged into one
+    # combined scope): the Analyzer already treats a call through another
+    # file's namespace (`config.player_name()`) permissively without
+    # needing that file's AST (see self.namespaces) — resolving symbols
+    # ACROSS files for real is the harder, deliberately-deferred BUG-27-style
+    # problem (a class method needs its DEFINING file's scope, not the
+    # caller's) that this stays clear of; this only catches what's wrong
+    # WITHIN a single file, for every file in the project instead of just
+    # one.
+    ok = _analyze_single_file(filepath, strict, exit_on_fatal=True, is_module_file=False)
+    for other in project_files:
+        if os.path.abspath(other) == os.path.abspath(filepath):
+            continue
+        ok = _analyze_single_file(other, strict, exit_on_fatal=False, is_module_file=True) and ok
+    return ok
+
+
+def _analyze_single_file(filepath: str, strict: bool, exit_on_fatal: bool,
+                          is_module_file: bool = False) -> bool:
     with open(filepath, 'r') as f:
         source = f.read()
 
@@ -2292,7 +2499,9 @@ def check_file(filepath: str, strict: bool = False) -> bool:
                 # problem it hits and exits, which would bury the full list
                 # above under one more, differently-formatted single-line
                 # error instead of leaving every issue visible together.
-                sys.exit(1)
+                if exit_on_fatal:
+                    sys.exit(1)
+                return False
 
         # ── Pre-parsing Keyword & Typo Pass ──
         KEYWORD_MAPPING = {
@@ -2354,18 +2563,28 @@ def check_file(filepath: str, strict: bool = False) -> bool:
                     has_typo_errors = True
 
         if has_typo_errors:
-            sys.exit(1)
+            if exit_on_fatal:
+                sys.exit(1)
+            return False
 
         ast_tree = Parser(tokens).parse()
 
     except SyntaxError as e:
-        print(f"✖ Syntax Error: {e}")
-        sys.exit(1)
+        # Dead in practice now — check_project_syntax() above already parses
+        # this exact file first and would have caught/reported this. Kept as
+        # a safety net (with the same filename attribution) in case that
+        # pass's file-resolution ever diverges from this one's.
+        print(f"✖ Syntax Error in {filepath}: {e}")
+        if exit_on_fatal:
+            sys.exit(1)
+        return False
     except Exception as e:
-        print(f"✖ Parse Error: {e}")
-        sys.exit(1)
+        print(f"✖ Parse Error in {filepath}: {e}")
+        if exit_on_fatal:
+            sys.exit(1)
+        return False
 
-    analyzer = Analyzer()
+    analyzer = Analyzer(is_module_file=is_module_file)
     analyzer.analyze(ast_tree, tokens)
     return analyzer.report(filepath, strict=strict)
 
