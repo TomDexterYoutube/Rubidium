@@ -65,6 +65,12 @@ declare i64 @rub_temp_mark()
 declare void @rub_temp_release_to(i64)
 @_rub_error_msg = global i8* null
 @_rub_error_flag = global i1 0
+; syntax: arg() — the process's command-line arguments, set once from
+; main's real argc/argv (see emit_fn / _inject_init_call) and read back by
+; @_rubidium_get_args() from anywhere in the program.
+@_rub_argc = global i32 0
+@_rub_argv = global i8** null
+@.argsep = private constant [2 x i8] c" \00"
 declare %Box* @collection_get_at(%Box*, i32)
 declare void @collection_set_at(%Box*, i32, %Box*)
 declare void @box_drop(%Box*)
@@ -338,6 +344,53 @@ class CodeGen:
             "strip:",
             "  store i8 0, i8* %last_char_ptr",
             "  br label %done",
+            "done:",
+            "  ret i8* %buf",
+            "}"
+        ]
+
+    def _emit_args_helpers(self):
+        """syntax: arg() — @_rubidium_set_args stashes main's real argc/argv
+        into globals (called once, from main's entry — see
+        _inject_init_call); @_rubidium_get_args() builds the space-joined
+        "argv[1] argv[2] ..." string arg() returns (program name, argv[0],
+        is deliberately excluded — same convention as every other language's
+        argv-minus-program-name helper)."""
+        self.fn_lines += [
+            "define void @_rubidium_set_args(i32 %argc, i8** %argv) {",
+            "  store i32 %argc, i32* @_rub_argc",
+            "  store i8** %argv, i8*** @_rub_argv",
+            "  ret void",
+            "}",
+            "define i8* @_rubidium_get_args() {",
+            "entry:",
+            "  %argc = load i32, i32* @_rub_argc",
+            "  %argv = load i8**, i8*** @_rub_argv",
+            # Fixed 64KB scratch buffer — same pragmatic sizing as
+            # _rubidium_input_line's fixed 1024-byte line buffer, and far
+            # beyond any realistic argv total length.
+            "  %buf = call i8* @malloc(i64 65536)",
+            "  store i8 0, i8* %buf",
+            "  br label %loop",
+            "loop:",
+            "  %i = phi i32 [1, %entry], [%i.next, %append_arg]",
+            "  %argc64 = sext i32 %argc to i64",
+            "  %i64 = sext i32 %i to i64",
+            "  %cont = icmp slt i64 %i64, %argc64",
+            "  br i1 %cont, label %body, label %done",
+            "body:",
+            "  %is_first = icmp eq i32 %i, 1",
+            "  br i1 %is_first, label %append_arg, label %append_sep",
+            "append_sep:",
+            "  %sp = getelementptr [2 x i8], [2 x i8]* @.argsep, i64 0, i64 0",
+            "  %r1 = call i8* @strcat(i8* %buf, i8* %sp)",
+            "  br label %append_arg",
+            "append_arg:",
+            "  %argp = getelementptr i8*, i8** %argv, i32 %i",
+            "  %argstr = load i8*, i8** %argp",
+            "  %r2 = call i8* @strcat(i8* %buf, i8* %argstr)",
+            "  %i.next = add i32 %i, 1",
+            "  br label %loop",
             "done:",
             "  ret i8* %buf",
             "}"
@@ -969,6 +1022,7 @@ class CodeGen:
         ]
 
         self._emit_input_line_helper()
+        self._emit_args_helpers()
         
         # Inject RNG seed
         self.fn_lines += [
@@ -1085,10 +1139,15 @@ class CodeGen:
             if in_main and injected and " phi " in line and "%entry" in line:
                 line = re.sub(r"%entry(?=\s*\])", "%_rub_init_ok_l", line)
             patched.append(line)
-            if line.strip() == "define i32 @main() {": in_main = True
+            # syntax: arg() — main's real signature is now
+            # `(i32 %argc, i8** %argv)` (see emit_fn) instead of `()`.
+            if line.strip() == "define i32 @main(i32 %argc, i8** %argv) {": in_main = True
             elif in_main and line.strip() == "}":
                 in_main = False; injected = False
             elif in_main and not injected and line.strip() == "entry:":
+                # Must run before _rubidium_init() — top-level statements
+                # (run by _rubidium_init) may themselves call arg().
+                patched.append("  call void @_rubidium_set_args(i32 %argc, i8** %argv)")
                 patched.append("  call void @_rubidium_init_rng()")
                 patched.append("  call i64 @_rubidium_init()")
                 # OPEN-7: top-level init code (_rubidium_init) runs before any of
@@ -1761,9 +1820,27 @@ class CodeGen:
 
         ret_ir = "i32" if node.name == "main" else (self.rubi_type_to_ir(node.ret_type) if node.ret_type else "i64")
         self._cur_fn_ret_ir = ret_ir   # Return handler uses this when fn has no declared ret type
-        param_ir = ", ".join(f"{self.rubi_type_to_ir(pt)} %param_{pn}" for pn, pt in node.params)
+        # syntax: arg() — main is the real C-ABI process entry point, so it's
+        # the only place argc/argv are ever available. The user's `fn main()`
+        # never declares parameters (node.params is always empty here), so
+        # overriding its IR signature to the real `(i32 %argc, i8** %argv)`
+        # is safe and doesn't collide with anything.
+        if node.name == "main":
+            param_ir = "i32 %argc, i8** %argv"
+        else:
+            param_ir = ", ".join(f"{self.rubi_type_to_ir(pt)} %param_{pn}" for pn, pt in node.params)
         self.emit(f"define {ret_ir} @{node.name}({param_ir}) {{")
         self.emit("entry:")
+        # NOTE: the @_rubidium_set_args call is NOT emitted here even though
+        # this is main's entry block — _inject_init_call() below patches in
+        # @_rubidium_init()'s call (which runs all top-level statements,
+        # including any that call arg()) at this exact point via a text pass
+        # over fn_lines, and needs to be the one inserting set_args too so it
+        # can guarantee set_args runs FIRST, before _rubidium_init(). Adding
+        # it here would put it AFTER _rubidium_init()'s call instead (that
+        # patch always inserts immediately following the literal "entry:"
+        # line, regardless of what's already after it), leaving any
+        # top-level arg() call reading argc/argv before they were ever set.
 
         # OPEN-7: block this function branches to (instead of crashing/silently
         # continuing) when a raise or division-by-zero happens with no enclosing
@@ -4660,6 +4737,14 @@ class CodeGen:
 
         if node.name == "input":
             return self.emit_expr(Input(node.args[0] if node.args else None))
+
+        # syntax: arg() — returns the program's command-line arguments
+        # (everything after the binary name) as a single space-joined str,
+        # e.g. `./prog --mode speed` -> "--mode speed"; `./prog` -> "".
+        if node.name == "arg":
+            tmp = self.new_tmp()
+            self.emit(f"  {tmp} = call i8* @_rubidium_get_args()")
+            return tmp, "i8*"
 
         # syntax: PRINT & INPUT — clear() wipes the whole terminal (println()
         # already overwrites just the current line).

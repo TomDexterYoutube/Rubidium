@@ -2293,21 +2293,26 @@ static void* _ffi_try_versioned(const char* name) {
 
 long long ffi_load(const char* path) {
     void* h = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
-    if(!h && !strchr(path, '/')) {
+    // BUG (found running a real xeon-built project from its PROJECT ROOT,
+    // not build/): the exe-dir-relative retry below used to only fire for
+    // a BARE name (no '/' at all) — a NESTED relative path like
+    // FFI("lib/libraylib.so") (exactly what the smart FFI bundler
+    // preserves under build/) was left "exactly as given" on the theory
+    // that an explicit path meant the caller already knew where the
+    // library was — but the caller only knows where it is RELATIVE TO THE
+    // COMPILED OUTPUT, not relative to whatever directory the process
+    // happens to be launched from (build/ when run directly, the project
+    // ROOT when launched via `xeon run`/most other conventions). ANY
+    // relative path (doesn't start with '/') gets this retry now, not
+    // just a bare name — an absolute path is left alone (already fully
+    // specified, no ambiguity to resolve).
+    if(!h && path[0] != '/') {
         char exe_dir[4096];
         _exe_dir(exe_dir, sizeof(exe_dir));
         if(exe_dir[0]) {
             char candidate[4096];
-            snprintf(candidate, sizeof(candidate), "%s/lib/%s", exe_dir, path);
+            snprintf(candidate, sizeof(candidate), "%s/%s", exe_dir, path);
             h = dlopen(candidate, RTLD_LAZY | RTLD_LOCAL);
-            // BUG-25: also look right NEXT TO the binary. The bundler copies
-            // src/**.so into the build dir preserving its path under src/, so
-            // a lib at src/foo.so lands at build/foo.so — which the lib/
-            // candidate above would never find.
-            if(!h) {
-                snprintf(candidate, sizeof(candidate), "%s/%s", exe_dir, path);
-                h = dlopen(candidate, RTLD_LAZY | RTLD_LOCAL);
-            }
         }
     }
     // BUG-25: last resort for a bare name — find the installed versioned soname.

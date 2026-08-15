@@ -48,6 +48,10 @@ BUILTIN_FNS = {
     # reasoning as clear() above: real in codegen.py, must be registered
     # here too or every legitimate call is reported as unknown.
     'exit',
+    # arg() — returns the program's command-line arguments (everything
+    # after the binary name) as a single space-joined str. Same reasoning
+    # as clear()/exit() above.
+    'arg',
 }
 
 NUMERIC_TYPES = {

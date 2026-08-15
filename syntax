@@ -668,6 +668,20 @@ print("this line never runs")
 
 exit()
 
+# arg() — returns the program's command-line arguments (everything after
+# the binary name) as a single space-joined str. Takes no arguments.
+# Callable from anywhere (not just main()), same as exit().
+
+# ./Rub_program            -> arg() returns ""
+# ./Rub_program --help     -> arg() returns "--help"
+# ./Rub_program --mode speed -> arg() returns "--mode speed"
+
+let cmdline: str = arg()
+if cmdline.has("--help") {
+    print("usage: Rub_program [--mode speed]")
+    exit(0)
+}
+
 # =========================================
 # FILES
 # =========================================
