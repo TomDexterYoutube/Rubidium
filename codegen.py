@@ -217,7 +217,7 @@ class CodeGen:
         self._prescan_instances = {}
         self.cur_fn       = None
         self.functions    = {}
-        self.ffi_functions = set()  # names of FFI-bound functions — their calls must use _ffi_type_to_ir (Any->i64), matching emit_ffi_bind's define, not rubi_type_to_ir (Any->%Box*)
+        self.ffi_functions = set()  # names of FFI-bound functions — only used to pick the "no -> ret means void" default (see emit_ffi_bind); FFI signatures otherwise use the same types as any Rubidium call
         self.loop_end_stack = []
         self.loop_cond_stack = []  # continue target labels
         self.linked_to = {}  # bugs.log #5: name -> target name for scalar `link` aliasing
@@ -513,12 +513,6 @@ class CodeGen:
     _INT_BITS = {"i32": 32, "i64": 64, "i128": 128,
                  "i256": 256, "i512": 512, "i1024": 1024, "i2048": 2048}
 
-    # syntax: FFI C TYPES — FFI.type(list) only supports the widths a real C
-    # ABI actually uses; wider Rubidium int/float types (i128+/f128+) already
-    # can't round-trip through the boxed-scalar 64-bit `i`/`f` fields (same
-    # existing limitation noted for print/coerce_to_box).
-    _FFI_BUFFER_KINDS = {"i32": 0, "i64": 1, "f32": 2, "f64": 3}
-
     def _int_bounds(self, ir_type):
         """Return (min, max) representable signed values for an integer IR type."""
         bits = self._INT_BITS[ir_type]
@@ -537,114 +531,18 @@ class CodeGen:
         if t in self._TYPE_RANK: return t
         return "i64"
 
-    def _is_ffi_type_call(self, t):
-        """True if t LOOKS LIKE an attempted `FFI.type(...)` call — valid or
-        not. Used to give a clear error for a malformed one (a string
-        argument, e.g. FFI.type("list"), the old removed spelling; zero/
-        extra args) instead of letting it silently fall through to whatever
-        generic-type handling treats an unrecognized value as."""
-        return isinstance(t, MethodCall) and t.method == "type" \
-            and isinstance(t.obj, Var) and t.obj.name == "FFI"
-
-    def _c_type_name(self, t):
-        """If t is an `FFI.type(name)` marker parsed at an FFI-bind
-        parameter-type position (the argument is a bare Rubidium type
-        keyword, e.g. `list` — TYPE tokens parse as Var(name), same as any
-        other "TYPE token used as an argument" spot), return its name
-        string, else None (including when it LOOKS like an attempted
-        FFI.type(...) call but is malformed — see _is_ffi_type_call)."""
-        if self._is_ffi_type_call(t) and t.args and isinstance(t.args[0], Var):
-            return t.args[0].name
-        return None
-
     def _ffi_type_to_ir(self, t):
-        """Like rubi_type_to_ir, but for FFI signatures. 'Any' here means an opaque
-        C pointer or int-sized value (e.g. GLFWwindow*, int) — mapping it to
-        Rubidium's %Box* (an internal boxed-value struct pointer) would be an ABI
-        mismatch with the foreign function, which knows nothing about Boxes."""
-        c_type_name = self._c_type_name(t)
-        if c_type_name == "list": return "i8*"
-        # syntax: FFI C TYPES — FFI.type(X) for any other X (a scalar type
-        # with an already-well-defined raw ABI shape, e.g. FFI.type(i32)) is
-        # just an explicit spelling of that same type — same IR either way.
-        if c_type_name is not None: return self._ffi_type_to_ir(c_type_name)
-        if t == "Any": return "i64"
+        """Type mapping for FFI-bound function signatures. FFI now only
+        targets OTHER RUBIDIUM-COMPILED shared libraries (`FFI("lib.so")`
+        where lib.so was itself built by this compiler with `-s`) — both
+        sides share the exact same %Box*/RList/RDict layout, so there's no
+        foreign-C-ABI mismatch to guard against. A parameter/return type is
+        just whatever the real Rubidium type is (dict+, list, Any, a class
+        instance, ...), same as an ordinary function — the only thing this
+        adds over rubi_type_to_ir is 'void', meaningful for an FFI return
+        type (no return value at all) but not a real Rubidium type."""
         if t == "void": return "void"
         return self.rubi_type_to_ir(t)
-
-    # syntax: FFI C TYPES — a Rubidium type with no defined raw-ABI layout
-    # (Rubidium's own boxed list/index/dict/dict+ collections, or a bare
-    # user-defined class/struct instance) can't cross an FFI call as-is —
-    # no foreign C-ABI-based language has a matching shape for an internal
-    # %Box*/struct. Without this check the type silently fell back to a
-    # plain i64 (see rubi_type_to_ir's fallback), passing a garbage
-    # pointer-sized integer instead of erroring. FFI.type(...) (recognized
-    # via _c_type_name above) is the documented escape hatch for the one
-    # shape that IS convertible today (list).
-    _FFI_ABI_ILLEGAL_BARE_TYPES = {"list", "index", "dict", "dict+"}
-
-    # syntax: FFI C TYPES — index/dict/dict+ have no defined raw-ABI layout
-    # for FFI.type(...) to convert them into. Unlike `list` (homogeneous,
-    # ordered, a forced element type + count maps directly onto a C array),
-    # index has arbitrary-typed keys, dict's values are themselves variable-
-    # length lists, and dict+ nests to unbounded depth — none of that fits
-    # the flat "pointer + count" shape list gets. Not implemented; explicit
-    # rejection instead of the silent %Box*/garbage-i64 fallback these used
-    # to get by slipping past this check inside an FFI.type(...) wrapper.
-    _FFI_TYPE_UNSUPPORTED_COLLECTIONS = {"index", "dict", "dict+"}
-
-    def _check_ffi_param_types(self, fn_display_name, params):
-        for pname, ptype in params:
-            c_type_name = self._c_type_name(ptype)
-            if c_type_name is not None:
-                # FFI.type(...) only actually CONVERTS `list` (see
-                # _ffi_type_to_ir) — everything else it accepts is a
-                # passthrough of an already-ABI-safe scalar. A class
-                # instance wrapped in it is still illegal: wrapping doesn't
-                # give it a raw-ABI layout it doesn't otherwise have.
-                if c_type_name in self.class_defs:
-                    raise RubidiumTypeError(
-                        f"FFI binding '{fn_display_name}': parameter '{pname}' "
-                        f"has type 'FFI.type({c_type_name})', but '{c_type_name}' is "
-                        f"a class instance with no defined raw-ABI layout — "
-                        f"FFI.type(...) converts a list, not a class instance."
-                    )
-                if c_type_name in self._FFI_TYPE_UNSUPPORTED_COLLECTIONS:
-                    raise RubidiumTypeError(
-                        f"FFI binding '{fn_display_name}': parameter '{pname}' "
-                        f"has type 'FFI.type({c_type_name})' — {c_type_name} isn't "
-                        f"supported by FFI.type(...); only list is convertible today."
-                    )
-                # syntax: void means "no value at all" — meaningful only as
-                # an FFI binding's RETURN type (a real C function with no
-                # return value slot). A parameter always receives a real
-                # argument on every call, so "a parameter of no value" has
-                # no meaning here either, same as it has none in C itself.
-                if c_type_name == "void":
-                    raise RubidiumTypeError(
-                        f"FFI binding '{fn_display_name}': parameter '{pname}' "
-                        f"has type 'FFI.type(void)' — void isn't a valid parameter "
-                        f"type (only a return type). Remove this parameter if the "
-                        f"foreign function doesn't take it, or declare it 'Any' and "
-                        f"pass Null if it expects a real argument that just carries "
-                        f"no value."
-                    )
-                continue
-            if self._is_ffi_type_call(ptype):
-                raise RubidiumTypeError(
-                    f"FFI binding '{fn_display_name}': parameter '{pname}' has a "
-                    f"malformed FFI.type(...) — it takes exactly one bare type "
-                    f"keyword argument (e.g. FFI.type(list), FFI.type(i32)), not "
-                    f"a string or a missing/extra argument."
-                )
-            if ptype in self._FFI_ABI_ILLEGAL_BARE_TYPES or ptype in self.class_defs:
-                raise RubidiumTypeError(
-                    f"FFI binding '{fn_display_name}': parameter '{pname}' "
-                    f"has type '{ptype}', which can't cross an FFI call directly "
-                    f"— there's no defined raw-ABI layout for a Rubidium "
-                    f"{'collection' if ptype in self._FFI_ABI_ILLEGAL_BARE_TYPES else 'class instance'}. "
-                    f"Use a primitive/pointer type, or FFI.type(list) for a list."
-                )
 
     def promote_type(self, a, b):
         """Return the higher-ranked IR type for mixed-width arithmetic."""
@@ -1054,7 +952,6 @@ class CodeGen:
             "declare i64 @strtol(i8*, i8**, i32)", "declare i64 @atol(i8*)",
             "declare i8* @strndup(i8*, i64)", "declare i32 @fclose(i8*)",
             "declare i8* @list_combine(%Box*)",
-            "declare i8* @list_to_flat_buffer(%Box*, i32)",   # syntax: FFI C TYPES — FFI.type(list)
             "declare %Box* @box_deep_copy(%Box*)",
             "declare i8* @fopen(i8*, i8*)", "declare i64 @fread(i8*, i64, i64, i8*)",
             "declare i64 @fwrite(i8*, i64, i64, i8*)", "declare i64 @fseek(i8*, i64, i32)",
@@ -1940,12 +1837,12 @@ class CodeGen:
         pending.append(f"  {mark_tmp} = call i64 @rub_temp_mark()")
 
         # Marshal each C-typed incoming arg into what the real function
-        # expects. Every declared type maps identically under
-        # _ffi_type_to_ir/rubi_type_to_ir EXCEPT Any (i64 at the C boundary,
-        # %Box* internally, same as any other Any-typed value) — box it the
-        # same way box_i() already boxes any other raw integer/handle, and
-        # track it the same way _track_temp() tracks any other freshly
-        # boxed value so the release below actually finds it.
+        # expects. FFI now only targets other Rubidium-compiled shared
+        # libraries (both sides share the same %Box* layout), so
+        # _ffi_type_to_ir and rubi_type_to_ir map every type identically —
+        # this branch is dead in practice today, kept only in case a future
+        # boundary type needs different C-side vs. internal representations
+        # again (box the raw value + track it, same as box_i() elsewhere).
         call_args = []
         for i, (c_t, internal_t) in enumerate(zip(c_param_types, internal_param_types)):
             if c_t == internal_t:
@@ -4119,10 +4016,6 @@ class CodeGen:
           3. Calls it with the provided args
         We store the binding so calling symbol(args) works normally afterwards.
         """
-        # syntax: FFI C TYPES — reject any parameter type with no defined
-        # raw-ABI layout before emitting anything against it.
-        self._check_ffi_param_types(node.alias or node.symbol_name, node.params)
-
         # Build param IR types
         param_ir_types = [self._ffi_type_to_ir(pt) for _, pt in node.params]
         # bugs.log: an FFI binding with no `-> ret` was previously assumed
@@ -4976,84 +4869,23 @@ class CodeGen:
             node.args = self._resolve_call_args(
                 node.name, fn_obj.params or [], getattr(fn_obj, "defaults", {}), node.args)
             self._check_arg_count(node.name, fn_obj.params or [], node.args)
-            # BUG (GLFW FFI report): FFI-bound functions (`fn lib symbol(...) as
-            # name`) are DEFINED by emit_ffi_bind using _ffi_type_to_ir, which
-            # maps `Any` to i64 (a raw pointer-sized integer — correct ABI for a
-            # foreign function that knows nothing about Rubidium's Box struct).
-            # But this call site used rubi_type_to_ir, which maps `Any` to
-            # %Box* — a signature mismatch with the actual `define`. Worse,
-            # coercing a `Null` argument to %Box* produced an actual heap
-            # pointer (box_null()'s allocation), not a null pointer — so
-            # `glfwCreateWindow(..., Null, Null)` passed GLFW two garbage
-            # non-null "monitor"/"share" pointers instead of NULL, corrupting
-            # the call. Use _ffi_type_to_ir for an FFI function's signature,
-            # matching its actual `define`.
+            # FFI-bound functions (`fn lib symbol(...) as name`) now target
+            # only another Rubidium-compiled shared library (`FFI("lib.so")`
+            # built by this same compiler with `-s`) — both sides share the
+            # exact same %Box*/RList/RDict layout, so a call here is
+            # marshaled exactly like an ordinary Rubidium function call, no
+            # FFI-specific type mapping needed. The only FFI-specific bit
+            # left is the return-type default: no `-> ret` means void (a
+            # real C-style function with no return slot), where an ordinary
+            # internal function without one defaults to i64.
             is_ffi = target_name in self.ffi_functions
-            type_map = self._ffi_type_to_ir if is_ffi else self.rubi_type_to_ir
-            param_types = [type_map(pt) for _, pt in fn_obj.params] if fn_obj.params else []
-            param_rubi_types = [pt for _, pt in fn_obj.params] if fn_obj.params else []
+            param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_obj.params] if fn_obj.params else []
             args_ir = []
             for i, a in enumerate(node.args):
                 v, t = self.emit_expr(a)
                 if i < len(param_types):
                     target_t = param_types[i]
-                    # syntax: FFI C TYPES — `FFI.type(list)` flattens a
-                    # type-forced Rubidium list into a raw C-compatible
-                    # buffer for this parameter, in place of you calling a
-                    # manual conversion method yourself.
-                    if is_ffi and self._c_type_name(param_rubi_types[i]) == "list":
-                        if not isinstance(a, Var):
-                            raise RubidiumTypeError(
-                                f"FFI.type(list) parameter requires a plain list variable, got {type(a).__name__}"
-                            )
-                        elem_t = self.element_types.get(a.name)
-                        kind = self._FFI_BUFFER_KINDS.get(elem_t)
-                        if kind is None:
-                            raise RubidiumTypeError(
-                                f"'{a.name}' passed to an FFI.type(list) parameter must be a list with a "
-                                f"forced element type of i32/i64/f32/f64 (e.g. `let {a.name}: list: f32 = [...]`), "
-                                f"got {elem_t!r}"
-                            )
-                        buf_tmp = self.new_tmp()
-                        self.emit(f"  {buf_tmp} = call i8* @list_to_flat_buffer(%Box* {v}, i32 {kind})")
-                        # BUG: list_to_flat_buffer mallocs a fresh buffer with
-                        # no Rubidium-level handle for the caller to .drop()
-                        # themselves (unlike the old .as_ffi_buffer(), this
-                        # conversion happens inline in argument evaluation) —
-                        # track it in the scope's temp arena the same way
-                        # every other freshly-malloc'd i8* result is (e.g.
-                        # box_to_cstr's _track_temp call above), so it's
-                        # freed automatically at the end of the block instead
-                        # of leaking on every call.
-                        v = self._track_temp(buf_tmp, "i8*")
-                    # An explicit `Null` passed for an `Any` FFI parameter means
-                    # the actual C NULL pointer (0), not Rubidium's %Box*
-                    # Null-sentinel value — an FFI signature has no `%Box*` to
-                    # even coerce into correctly.
-                    elif is_ffi and param_rubi_types[i] == "Any" and isinstance(a, None_):
-                        v = "0"
-                    elif is_ffi and target_t == "i64" and t == "i8*":
-                        # BUG: the generic coerce() path for i8*->i64 calls
-                        # @atol() — correct for "parse this string's TEXT as
-                        # a number" (e.g. .to(i64) on a str), but an i8* value
-                        # crossing into an Any-typed FFI parameter is a raw
-                        # pointer, not text to parse: an FFI-bound function
-                        # expecting `Any` almost always wants the pointer's
-                        # ADDRESS (a void* in C terms). atol() on a buffer of
-                        # raw bytes reads them as if they were an ASCII
-                        # decimal string — confirmed crashing (SIGSEGV)
-                        # end-to-end. This path was never previously
-                        # exercised: every existing FFI call site passes
-                        # str-typed params directly (already i8*, no i64
-                        # coercion needed) or an explicit Null literal
-                        # (handled above) into Any slots — ptrtoint
-                        # (reinterpret the address, don't parse it) is correct
-                        # for every case that actually reaches here.
-                        tmp_pi = self.new_tmp()
-                        self.emit(f"  {tmp_pi} = ptrtoint i8* {v} to i64")
-                        v = tmp_pi
-                    else:
-                        v = self.coerce(v, t, target_t)
+                    v = self.coerce(v, t, target_t)
                     t = target_t
                 args_ir.append(f"{t} {v}")
             fn_ret = fn_obj.ret_type
@@ -5061,7 +4893,7 @@ class CodeGen:
             # emit_ffi_bind) — matches this same default there. Non-FFI
             # internal functions keep the pre-existing i64 default
             # unchanged, since that's an established, separate behavior.
-            ret_ir = type_map(fn_ret) if fn_ret else ("void" if is_ffi else "i64")
+            ret_ir = self._ffi_type_to_ir(fn_ret) if fn_ret else ("void" if is_ffi else "i64")
             # BUGFIX (bugs.log #1): call fn_obj.name, the actual emitted symbol,
             # which differs from target_name only for reserved-C-symbol collisions.
             if ret_ir == "void":
@@ -5840,14 +5672,7 @@ class CodeGen:
                     v, t = self.emit_expr(a)
                     if i < len(fn_def.params):
                         target_t = self._ffi_type_to_ir(fn_def.params[i][1])
-                        # GLFW FFI report: an explicit Null for an `Any` FFI
-                        # param means the real NULL pointer (0), not a boxed
-                        # Null-sentinel value (see the PRIORITY-3 call site's
-                        # matching fix for the full explanation).
-                        if fn_def.params[i][1] == "Any" and isinstance(a, None_):
-                            v = "0"
-                        else:
-                            v = self.coerce(v, t, target_t)
+                        v = self.coerce(v, t, target_t)
                         t = target_t
                     args_ir.append(f"{t} {v}")
                 tmp = self.new_tmp()

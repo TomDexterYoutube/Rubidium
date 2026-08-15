@@ -57,16 +57,6 @@ NUMERIC_TYPES = {
 
 HEAP_TYPES = {'list', 'index', 'dict', 'str'}
 
-# syntax: FFI C TYPES — mirror codegen.py's identical constants, kept in
-# sync so the analyzer flags the same violations the real compiler will,
-# instead of reporting "COMPILATION ALLOWED" for FFI bindings that actually
-# fail to compile.
-FFI_ABI_ILLEGAL_BARE_TYPES = {"list", "index", "dict", "dict+"}
-# index/dict/dict+ have no defined raw-ABI layout for FFI.type(...) to
-# convert them into (unlike `list` — see codegen.py's identical constant for
-# why) — not implemented, explicit rejection instead of a silent fallback.
-FFI_TYPE_UNSUPPORTED_COLLECTIONS = {"index", "dict", "dict+"}
-
 ALL_TYPES = NUMERIC_TYPES | {'str', 'bool', 'list', 'index', 'dict', 'Any', 'Null'}
 
 MUTATING_METHODS = {'add', 'remove', 'set', 'pop', 'clear', 'sort',
@@ -378,35 +368,7 @@ class Analyzer:
             return True
         return isinstance(node, ast.None_)
 
-    def _is_ffi_type_call(self, t):
-        """True if t LOOKS LIKE an attempted `FFI.type(...)` call — valid or
-        not. Mirrors codegen.py's identical helper."""
-        return isinstance(t, ast.MethodCall) and t.method == "type" \
-            and isinstance(t.obj, ast.Var) and t.obj.name == "FFI"
-
-    def _c_type_name(self, t):
-        """If t is an `FFI.type(name)` marker (an FFI-bind parameter type
-        parsed as MethodCall(Var("FFI"), "type", [Var(name)]) — the argument
-        is a bare Rubidium type keyword, e.g. `list`), return its name
-        string, else None (including when it LOOKS like an attempted
-        FFI.type(...) call but is malformed — see _is_ffi_type_call).
-        Mirrors codegen.py's identical helper."""
-        if self._is_ffi_type_call(t) and t.args and isinstance(t.args[0], ast.Var):
-            return t.args[0].name
-        return None
-
     def _types_compat(self, expected: str, received: str) -> bool:
-        # syntax: FFI C TYPES — FFI.type(list) accepts an ordinary Rubidium
-        # list (converted to a raw C buffer at the call site by codegen.py);
-        # FFI.type(X) for any other X is just X itself, same compatibility
-        # rules as writing X plainly. Neither is a plain string type name,
-        # so the checks below (which assume both sides are strings) never
-        # apply to the marker itself.
-        c_type = self._c_type_name(expected)
-        if c_type is not None:
-            if c_type == "list":
-                return received == "list"
-            return self._types_compat(c_type, received)
         if expected == received:
             return True
         if 'Any' in (expected, received):
@@ -425,64 +387,6 @@ class Analyzer:
         if {expected, received} == {'str', 'str+'}:
             return True
         return False
-
-    def _check_ffi_param_types(self, fn_display_name, params):
-        """Analyzer-side mirror of codegen.py's identically-named method —
-        same ABI-illegality rule, reported as an Issue instead of raised."""
-        for pname, ptype in params:
-            c_type_name = self._c_type_name(ptype)
-            if c_type_name is not None:
-                # FFI.type(...) only actually CONVERTS `list` — everything
-                # else it accepts is a passthrough of an already-ABI-safe
-                # scalar. A class instance wrapped in it is still illegal.
-                if c_type_name in self.classes:
-                    self._emit(
-                        'ERROR', None, 'FFI Type Error',
-                        f"FFI binding '{fn_display_name}': parameter '{pname}' "
-                        f"has type 'FFI.type({c_type_name})', but '{c_type_name}' is "
-                        f"a class instance with no defined raw-ABI layout — "
-                        f"FFI.type(...) converts a list, not a class instance."
-                    )
-                if c_type_name in FFI_TYPE_UNSUPPORTED_COLLECTIONS:
-                    self._emit(
-                        'ERROR', None, 'FFI Type Error',
-                        f"FFI binding '{fn_display_name}': parameter '{pname}' "
-                        f"has type 'FFI.type({c_type_name})' — {c_type_name} isn't "
-                        f"supported by FFI.type(...); only list is convertible today."
-                    )
-                # syntax: void means "no value at all" — meaningful only as
-                # an FFI binding's RETURN type. A parameter always receives
-                # a real argument on every call, so "a parameter of no
-                # value" has no meaning here either, same as in C itself.
-                if c_type_name == "void":
-                    self._emit(
-                        'ERROR', None, 'FFI Type Error',
-                        f"FFI binding '{fn_display_name}': parameter '{pname}' "
-                        f"has type 'FFI.type(void)' — void isn't a valid parameter "
-                        f"type (only a return type). Remove this parameter if the "
-                        f"foreign function doesn't take it, or declare it 'Any' and "
-                        f"pass Null if it expects a real argument that just carries "
-                        f"no value."
-                    )
-                continue
-            if self._is_ffi_type_call(ptype):
-                self._emit(
-                    'ERROR', None, 'FFI Type Error',
-                    f"FFI binding '{fn_display_name}': parameter '{pname}' has a "
-                    f"malformed FFI.type(...) — it takes exactly one bare type "
-                    f"keyword argument (e.g. FFI.type(list), FFI.type(i32)), not "
-                    f"a string or a missing/extra argument."
-                )
-                continue
-            if ptype in FFI_ABI_ILLEGAL_BARE_TYPES or ptype in self.classes:
-                self._emit(
-                    'ERROR', None, 'FFI Type Error',
-                    f"FFI binding '{fn_display_name}': parameter '{pname}' "
-                    f"has type '{ptype}', which can't cross an FFI call directly "
-                    f"— there's no defined raw-ABI layout for a Rubidium "
-                    f"{'collection' if ptype in FFI_ABI_ILLEGAL_BARE_TYPES else 'class instance'}.",
-                    f'Use a primitive/pointer type, or FFI.type(list) for a list.'
-                )
 
     def _pre_pass(self, nodes: list):
         for node in nodes:
@@ -540,12 +444,6 @@ class Analyzer:
                         'used':     False,
                         'line':     None,
                     }
-                # syntax: FFI C TYPES — flag the same ABI-illegal parameter
-                # types codegen.py's compiler will reject, so this doesn't
-                # report "COMPILATION ALLOWED" for code that fails to
-                # actually compile.
-                self._check_ffi_param_types(callable_name or node.symbol_name, node.params)
-
         for node in nodes:
             self._find_thread_fns(node)
 

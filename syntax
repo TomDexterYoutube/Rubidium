@@ -1457,69 +1457,28 @@ os(1).drop()
 # FFI — FOREIGN FUNCTION INTERFACE
 # =========================================
 
+# FFI loads another RUBIDIUM-COMPILED shared library — not an arbitrary C/
+# C++/Rust .so. Build one with `-s` (no main entry, every top-level fn
+# exported): `rubidium -s mylib.rub mylib.so`. Both sides of the call are
+# the same compiler's own output, so they share the exact same value
+# layout — any real Rubidium type (i32, str, list, dict+, a class instance,
+# Any, ...) just crosses the boundary directly, the same way it would in an
+# ordinary same-file function call. No conversion step, no restricted type
+# subset.
+
 use FFI
 
+let lib = FFI("lib.so")
 
-# Load a compiled shared library.
+# Bind an exported function. Parameter/return types are normal Rubidium
+# types — including collections, which a real foreign-C FFI could never
+# accept directly.
 
-let ffi_lib = FFI("libs/mylib.so")
-
-# Bind the foreign symbol.
-
-fn ffi_lib my_c_function(msg: str) -> i32 as my_function
+fn lib lib_fn(var: i32, var2: dict+) as fnut
 
 # Call using the Rubidium name.
 
-my_function("hello from Rubidium")
-
-# -----------------------------------------
-# FFI C TYPES — AUTOMATIC CONVERSION
-# -----------------------------------------
-
-# A foreign function's parameters aren't Rubidium values — they're raw,
-# fixed-shape types: a bare array + count, a null-terminated char*, a plain
-# struct, none of which know anything about Rubidium's boxed list/dict/str
-# values. This is the same whether the .so was built from C, C++, or Rust —
-# what actually crosses the FFI boundary is only what the EXPORTED SYMBOL's
-# own C-ABI signature declares (a Rust function has to be written
-# `#[no_mangle] pub extern "C" fn(...)` with C-compatible parameter types to
-# be `dlsym`-callable at all), so Rubidium doesn't need to know which
-# language produced the library.
-
-# FFI.type(name) is used IN PLACE of a normal type in an `fn <lib> ...`
-# binding's parameter list to tell Rubidium "this parameter is really this
-# raw C-ABI shape" — the argument is a bare Rubidium type keyword, not a
-# string. For most types this is just an explicit spelling of that same
-# type (FFI.type(i32) means exactly what writing `i32` does — i32/i64/f32/
-# f64/bool/str/Any all already have a well-defined raw C-ABI layout on
-# their own). For `list` it's more than a spelling: Rubidium's own boxed
-# collections have no C or Rust equivalent, so FFI.type(list) is also the
-# one legal way to pass one — it converts whatever ordinary Rubidium list
-# you pass at the call site into a flat raw buffer automatically, instead
-# of you hand-rolling the conversion yourself. A collection type
-# (list/index/dict/dict+) or a bare class instance used WITHOUT this
-# wrapper is a compile error — there's no defined layout to fall back to.
-
-let lib_c = FFI("lib/lib.so")
-
-let verts: list: f32 = [0.0, 1.0, 0.0, -1.0, -1.0, 0.0]
-
-fn lib_c test(var: FFI.type(list))
-
-# Call it with that list — Rubidium flattens it into the raw C array `test`
-# actually expects before the call, no manual buffer-prep step needed on
-# your end. Only i32/i64/f32/f64 are supported (the widths a real C ABI
-# actually uses), and the list must have its element type FORCED with
-# `: TYPE` as above — required, not optional, so Rubidium knows the
-# per-element width to lay it out flat.
-
-test(verts)
-
-# Caveat: i128 and up, and f128 and up, are NOT guaranteed identical across
-# languages the way the types above are. Rust's own docs call i128/u128's
-# FFI ABI unspecified (unlike GCC/Clang's de facto-stable __int128, which
-# is what these map to), and stable Rust has no public 128-bit float type
-# at all — avoid these widths in a binding against a non-C library.
+fnut(1, my_dictplus)
 
 # -----------------------------------------
 # FFI FUNCTION RENAMING
