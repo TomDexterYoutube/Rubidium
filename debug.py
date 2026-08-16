@@ -56,7 +56,7 @@ BUILTIN_FNS = {
 
 NUMERIC_TYPES = {
     'i32', 'i64', 'i128', 'i256', 'i512', 'i1024', 'i2048',
-    'f32', 'f64', 'f128', 'f256', 'f512', 'f1024', 'f2048',
+    'f32', 'f64', 'f128',
 }
 
 # BUG-32 (codegen.py): a function with no declared '-> TYPE' has its IR

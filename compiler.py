@@ -504,10 +504,10 @@ char* bignum_to_str(unsigned long long* limbs, int num_limbs) {
 }
 
 // ---- fp128 EXACT decimal conversion (float precision-display fix) ----
-// print()/string-interpolation of an f128+ value used to narrow it to
+// print()/string-interpolation of an f128 value used to narrow it to
 // `double` and format with printf's default "%g" (6 significant digits),
 // silently discarding all the extra precision a typed math block
-// `(expr): f2048` (or any f128+ arithmetic) actually computed. This is the
+// `(expr): f128` (or any f128 arithmetic) actually computed. This is the
 // same class of gap the i256+ bignum printing fix (OPEN-6) closed for wide
 // INTEGERS, done here for wide FLOATS: convert the raw IEEE-754 binary128
 // bit pattern to its EXACT decimal representation directly — no double
@@ -1336,7 +1336,11 @@ char* box_to_cstr(Box* b) {
     // misprinted as "Null" — only an actual box_null() prints "Null" here.
     else if(b->type==6) { snprintf(buf, 64, "Null"); }
     else if(b->type==4) { snprintf(buf, 64, "%s", b->i ? "True" : "False"); }
-    else if(b->type==1) { snprintf(buf, 64, "%g",   b->f); }
+    // bugs.log OPEN-R: was bare "%g" (6-sig-fig default), silently
+    // truncating real digits. b->f is always stored as a C double here
+    // (float values are widened to double before boxing), so "%.17g"
+    // (DBL_DECIMAL_DIG) is the minimum precision that round-trips exactly.
+    else if(b->type==1) { snprintf(buf, 64, "%.17g", b->f); }
     else if(b->type==2) { free(buf); return strdup(b->s ? b->s : ""); }
     else if(b->type==3 && b->p) {
         int* magic = (int*)b->p;

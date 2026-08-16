@@ -535,8 +535,10 @@ class CodeGen:
     # Type system: rank-based promotion for mixed-width math
     # -------------------------------------------------------
     # Integer IR types are exact LLVM widths (iN).
-    # Float types: f32→float, f64→double, f128+→fp128
-    # (LLVM only has native float/double/fp128; f256+ map to fp128)
+    # Float types: f32→float, f64→double, f128→fp128
+    # (LLVM only has native float/double/fp128 — bugs.log OPEN-R follow-up:
+    # f256/f512/f1024/f2048 were removed since they were only ever cosmetic
+    # aliases of fp128 with no real extra precision behind them)
     # Null sentinel: INT32_MIN (-2147483648). Chosen because sign-extension/truncation
     # preserves this exact value across ALL int widths (i32..i2048), so a Null stored
     # in an i32 var compares equal to a Null stored in an i64 var. Per spec, Null
@@ -546,9 +548,7 @@ class CodeGen:
 
     _INT_IR = {"i32": "i32", "i64": "i64", "i128": "i128",
                "i256": "i256", "i512": "i512", "i1024": "i1024", "i2048": "i2048"}
-    _FLT_IR = {"f32": "float", "f64": "double",
-               "f128": "fp128", "f256": "fp128", "f512": "fp128",
-               "f1024": "fp128", "f2048": "fp128"}
+    _FLT_IR = {"f32": "float", "f64": "double", "f128": "fp128"}
     # Rank: higher = wider. Floats outrank all ints.
     _TYPE_RANK = {
         "i1": 0, "i32": 1, "i64": 2, "i128": 3,
@@ -572,6 +572,14 @@ class CodeGen:
         max_v = (1 << (bits - 1)) - 1
         min_v = -(1 << (bits - 1))
         return min_v, max_v
+
+    def _float_print_fmt(self, ir_type):
+        """bugs.log OPEN-R: printf format string for a `float`/`double` IR
+        value that's guaranteed to round-trip back to the exact same bit
+        pattern — FLT_DECIMAL_DIG (9) / DBL_DECIMAL_DIG (17), the C
+        standard's own minimum precision for this. A bare "%g" (6 sig
+        figs) silently drops real digits for anything but toy values."""
+        return "%.9g" if ir_type == "float" else "%.17g"
 
     def rubi_type_to_ir(self, t):
         if t in ("list", "index", "dict", "dict+", "Any"): return "%Box*"
@@ -1472,7 +1480,7 @@ class CodeGen:
             if node.method == "to": 
                 if len(node.args) == 1:
                     arg = node.args[0]
-                    if hasattr(arg, 'name') and arg.name in ("i32", "i64", "i128", "i256", "i512", "i1024", "i2048", "f32", "f64", "f128", "f256", "f512", "f1024", "f2048", "str", "bool"):
+                    if hasattr(arg, 'name') and arg.name in ("i32", "i64", "i128", "i256", "i512", "i1024", "i2048", "f32", "f64", "f128", "str", "bool"):
                         return self.rubi_type_to_ir(arg.name)
                     elif hasattr(arg, 'value'):
                         return self.rubi_type_to_ir(arg.value)
@@ -1542,7 +1550,7 @@ class CodeGen:
                     type_name = ""
                     if len(node.args) >= 3:
                         arg3 = node.args[2]
-                        if isinstance(arg3, Var) and arg3.name in ("f32", "f64", "f128", "f256", "f512", "f1024", "f2048"):
+                        if isinstance(arg3, Var) and arg3.name in ("f32", "f64", "f128"):
                             type_name = arg3.name
                         elif isinstance(arg3, Str):
                             type_name = arg3.value
@@ -2668,7 +2676,7 @@ class CodeGen:
         # Box type tags: 0=int, 1=float, 2=string, 3=collection, 4=bool
         type_tag_map = {
             "i32": 0, "i64": 0, "i128": 0, "i256": 0, "i512": 0, "i1024": 0, "i2048": 0,
-            "f32": 1, "f64": 1, "f128": 1, "f256": 1, "f512": 1, "f1024": 1, "f2048": 1,
+            "f32": 1, "f64": 1, "f128": 1,
             "str": 2,
             "bool": 4,
         }
@@ -3342,7 +3350,7 @@ class CodeGen:
             cv = self.coerce(val, val_t, "i64")
             self.emit(f'  call void @print_int_plain(i64 {cv})')
         elif val_t == "fp128":
-            # Float-precision fix: fp128 (f128/f256/.../f2048's IR type — see
+            # Float-precision fix: fp128 (f128's IR type — see
             # a typed math block `(expr): TYPE`) used to be narrowed to
             # double and printed with printf's default 6-sig-fig "%g",
             # throwing away all the extra precision that was actually
@@ -3351,7 +3359,7 @@ class CodeGen:
             lo, hi = self._emit_fp128_halves(val)
             self.emit(f'  call void @print_fp128_exact(i64 {lo}, i64 {hi})')
         elif val_t in ("float", "double"):
-            fmt, flen = self.intern_str("%g\n")
+            fmt, flen = self.intern_str(self._float_print_fmt(val_t) + "\n")
             ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
             dv = self.coerce(val, val_t, "double")
@@ -3385,7 +3393,8 @@ class CodeGen:
             self.emit(f'  call i32 (i8*, ...) @printf(i8* {ptr}, i64 {cv})')
             self.emit(f'  call i32 @fflush(i8* null)')
         elif val_t in ("float", "double", "fp128"):
-            fmt, flen = self.intern_str("\r%g\x1b[K")
+            print_t = "double" if val_t == "fp128" else val_t
+            fmt, flen = self.intern_str("\r" + self._float_print_fmt(print_t) + "\x1b[K")
             ptr = self.new_tmp()
             self.emit(f'  {ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt}, i64 0, i64 0')
             dv = self.coerce(val, val_t, "double")
@@ -4267,7 +4276,7 @@ class CodeGen:
                 # precision). Ordinary literals (<=17 significant digits,
                 # the overwhelming majority) are completely unaffected —
                 # same "double" output as before, avoiding any behavior/perf
-                # change for code that never asked for f128+.
+                # change for code that never asked for f128.
                 raw = node.raw
                 if raw and sum(ch.isdigit() for ch in raw) > 17:
                     return _decimal_str_to_fp128_hex(raw), "fp128"
@@ -5357,7 +5366,7 @@ class CodeGen:
         if node.method == "to" and isinstance(node.obj, Var) and node.args:
             val, val_t = self.emit_expr(node.obj)
             arg = node.args[0]
-            if hasattr(arg, 'name') and arg.name in ("i32", "i64", "i128", "i256", "i512", "i1024", "i2048", "f32", "f64", "f128", "f256", "f512", "f1024", "f2048", "str", "bool"):
+            if hasattr(arg, 'name') and arg.name in ("i32", "i64", "i128", "i256", "i512", "i1024", "i2048", "f32", "f64", "f128", "str", "bool"):
                 target_type = arg.name
             elif hasattr(arg, 'value'):
                 target_type = arg.value
@@ -5943,7 +5952,7 @@ class CodeGen:
             if len(node.args) == 1:
                 # Check if arg is a Var with type-looking name (str, i32, etc.)
                 arg = node.args[0]
-                if hasattr(arg, 'name') and arg.name in ("i32", "i64", "i128", "i256", "i512", "i1024", "i2048", "f32", "f64", "f128", "f256", "f512", "f1024", "f2048", "str", "bool"):
+                if hasattr(arg, 'name') and arg.name in ("i32", "i64", "i128", "i256", "i512", "i1024", "i2048", "f32", "f64", "f128", "str", "bool"):
                     target_type = arg.name
                 elif hasattr(arg, 'value'):
                     target_type = arg.value
@@ -6373,7 +6382,7 @@ class CodeGen:
             return self._track_temp(buf, "i8*"), "i8*"   # BUG-3
         if from_t in ("float","double") and to_t == "i8*":
             buf, fmt_ptr = self.new_tmp(), self.new_tmp()
-            fmt_lbl, flen = self.intern_str("%g")
+            fmt_lbl, flen = self.intern_str(self._float_print_fmt(from_t))
             self.emit(f"  {buf} = call i8* @malloc(i64 32)")
             self.emit(f"  {fmt_ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt_lbl}, i64 0, i64 0")
             dv = self.coerce(val, from_t, "double")
@@ -6412,7 +6421,7 @@ class CodeGen:
         TYPE's precision. Sets the _math_block_type override so every arithmetic
         op emitted while the inner expression is generated computes at that type
         (see emit_binop), then coerces the final result to it (covers the case
-        where the inner expr has no arithmetic, e.g. `(5): f2048`). Save/restore
+        where the inner expr has no arithmetic, e.g. `(5): f128`). Save/restore
         makes nested typed blocks work: the inner block's type applies to its own
         ops, the outer's resumes afterward."""
         block_ir = self.rubi_type_to_ir(node.vtype)
@@ -6629,8 +6638,8 @@ class CodeGen:
         common = self.promote_type(lt, rt)
         # FEATURE (typed math block `(expr): TYPE`): inside such a block every
         # arithmetic operation is computed AT the block's type/precision, not the
-        # promoted operand type. So `(10 as i32 / 3 as i32): f2048` narrows each
-        # operand to i32 (10, 3) but then runs the division at f2048 -> 3.333...,
+        # promoted operand type. So `(10 as i32 / 3 as i32): f128` narrows each
+        # operand to i32 (10, 3) but then runs the division at f128 -> 3.333...,
         # rather than i32's integer division -> 3. Only reached for numeric
         # arithmetic (string-concat `+` paths above already returned).
         if self._math_block_type is not None:
@@ -6972,7 +6981,7 @@ class CodeGen:
             self.emit(f"  {tmp} = call i8* @fp128_to_exact_decimal_str(i64 {lo}, i64 {hi})")
             return self._track_temp(tmp, "i8*")   # BUG-3
         elif t in ("float", "double"):
-            fmt_lbl, flen = self.intern_str("%g")
+            fmt_lbl, flen = self.intern_str(self._float_print_fmt(t))
             fmt_ptr = self.new_tmp()
             self.emit(f"  {buf} = call i8* @malloc(i64 32)")
             self.emit(f"  {fmt_ptr} = getelementptr [{flen} x i8], [{flen} x i8]* {fmt_lbl}, i64 0, i64 0")

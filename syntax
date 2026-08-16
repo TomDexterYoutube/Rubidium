@@ -70,7 +70,7 @@ fn main() {
 #   i32, i64, i128, i256, i512, i1024, i2048
 
 # Floats:
-#   f32, f64, f128, f256, f512, f1024, f2048
+#   f32, f64, f128
 
 # Other:
 #   str   — text string
@@ -265,12 +265,12 @@ let r = (10 / 3): f64        # 3.3333...  (division done as f64, not int)
 # Per-operand `as` casts still apply — they convert each operand first,
 # then the block type governs every operation's result:
 
-let s = (10 as i32 / 3 as i32): f2048   # operands are i32 (10, 3), but the
-                                        # division runs at f2048 -> 3.3333...
+let s = (10 as i32 / 3 as i32): f128   # operands are i32 (10, 3), but the
+                                        # division runs at f128 -> 3.3333...
 
-# Use a wide float type for high-precision math:
+# Use the widest float type for higher-precision math:
 
-let big = (22 / 7): f2048    # pi approximation computed at f2048 precision
+let big = (22 / 7): f128    # pi approximation computed at f128 precision
 
 # An integer block type keeps integer arithmetic:
 
@@ -282,7 +282,7 @@ let e = (1 + 2 * 3): f64     # 7.0
 
 # Blocks can nest; each block's type governs its own operations:
 
-let n = ((10 / 3): f64 + 1): f2048   # 4.3333...
+let n = ((10 / 3): f64 + 1): f128   # 4.3333...
 
 # =========================================
 # COMPARISON & LOGIC

@@ -267,8 +267,8 @@ class MathBlock:
     """A parenthesised math expression with a result-type annotation:
     `(expr): TYPE`. Every arithmetic operation inside is computed AT that
     type/precision (not just the final value cast) — e.g.
-    `(10 as i32 / 3 as i32): f2048` narrows the operands to i32 then runs
-    the division at f2048, giving 3.333..., not integer 3. See codegen's
+    `(10 as i32 / 3 as i32): f128` narrows the operands to i32 then runs
+    the division at f128, giving 3.333..., not integer 3. See codegen's
     `_math_block_type` override in emit_binop."""
     def __init__(self, expr, vtype):
         self.expr = expr
