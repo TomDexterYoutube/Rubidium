@@ -1435,18 +1435,21 @@ use os
 
 os.start(1)
 
-# Run a command in a terminal session:
+# Run a command in a terminal session. The terminal ID is the LAST
+# argument — same convention as thread(function(), id) below, so an
+# os.run(...) call can be dropped straight into thread(...) unchanged
+# (see THREADING + OS below).
 
-os.run(1, "ls -a")
+os.run("ls -a", 1)
 
 # Capture command output:
 
-let output = os.run(1, "echo hello")
+let output = os.run("echo hello", 1)
 
 # Pass input automatically when the command asks for it:
-# The third argument is sent as soon as input is requested.
+# The (optional) middle argument is sent as soon as input is requested.
 
-let result = os.run(1, "sudo apt update", "y")
+let result = os.run("sudo apt update", "y", 1)
 
 # os.run waits for the command to actually finish before returning, so
 # slow or bursty output (e.g. a streaming download) is captured in full,
@@ -1466,6 +1469,24 @@ let listing = os.run({cmd: "ls", args: ["-l", "/tmp"]})
 # Drop a terminal session to free its resources:
 
 os(1).drop()
+
+# -----------------------------------------
+# RUNNING OS COMMANDS ON A THREAD
+# -----------------------------------------
+
+# os.run(...) (normal form only — not the struct form) can be passed
+# straight to thread(...), the same way any other function call can, to
+# run a command in the background without blocking:
+
+use thread
+
+thread(os.run("sleep 5 && echo done", 3), 3)
+
+# The terminal session is started automatically if it wasn't already
+# (no need to call os.start(3) yourself first) — its output is discarded,
+# since there's no caller left waiting to receive a return value once the
+# command is running in the background. Use os.start(id) + a normal,
+# non-threaded os.run(...) instead if you need to capture the output.
 
 # =========================================
 # FFI — FOREIGN FUNCTION INTERFACE

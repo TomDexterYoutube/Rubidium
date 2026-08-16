@@ -2456,7 +2456,103 @@ def check_file(filepath: str, strict: bool = False) -> bool:
         if os.path.abspath(other) == os.path.abspath(filepath):
             continue
         ok = _analyze_single_file(other, strict, exit_on_fatal=False, is_module_file=True) and ok
+
+    # Owner report: the analyzer above is PURE AST-LEVEL static analysis —
+    # it never generates real code, so entire classes of bug are
+    # structurally invisible to it no matter how many more checks get
+    # added: a type coercion that only goes wrong once real LLVM values
+    # exist (e.g. `code as i32` on a str silently handing back the raw
+    # pointer — BUG-34's follow-up fixes), or two sibling `if`/`else if`
+    # branches each allocating the same LLVM register name (invalid IR,
+    # but nothing at the AST level is wrong). All three bugs chased down
+    # alongside the os.run() reorder work this session compiled clean
+    # through this analyzer and only failed at the REAL `xeon build` —
+    # exactly the "debugger says fine, build says no, with no clue why"
+    # gap being reported here. Once the AST-level analysis above finds
+    # nothing wrong, ALSO run the real parse-and-generate pipeline
+    # (compiler.py's own parse_file + CodeGen — the literal same code path
+    # `xeon build` uses, not a shadow reimplementation that could drift
+    # out of sync with it) plus a syntax-only clang pass over the
+    # resulting IR, so a bug that's invisible to static analysis is still
+    # caught HERE — before `xeon build` — with whatever attribution the
+    # real compiler's own error carries (a clear RubidiumTypeError/
+    # RubidiumNameError message where one exists, otherwise clang's own
+    # IR-line-level diagnostic — strictly more than "nothing," which is
+    # what a from-scratch build failure with no prior debug output gives
+    # you today).
+    if ok:
+        codegen_err = _check_project_codegen(filepath)
+        if codegen_err:
+            print(f"\n{ANSI['BOLD']}Rubidium Build Check{ANSI['RESET']}")
+            print(f"{ANSI['DIM']}This program passed static analysis, but the real "
+                  f"compiler's own code generation rejects it:{ANSI['RESET']}\n")
+            print(f"{ANSI['ERROR']}✖ {codegen_err}{ANSI['RESET']}\n")
+            ok = False
     return ok
+
+
+def _check_project_codegen(entry_path: str):
+    """Attempt the real compiler's own parse-and-generate pipeline
+    (compiler.py's parse_file + CodeGen().gen() — not a reimplementation,
+    the literal same functions `xeon build` calls), plus a syntax-only
+    clang pass over the resulting IR. Returns None if it would compile
+    cleanly, otherwise a human-readable description of what's wrong."""
+    import compiler as _compiler
+    from codegen import CodeGen, RubidiumTypeError, RubidiumNameError
+
+    parsed_files = set()
+    combined_ast = []
+    try:
+        _compiler.parse_file(entry_path, parsed_files, combined_ast, is_main=True)
+    except SyntaxError as e:
+        return f"Syntax Error: {e}"
+    except SystemExit:
+        # parse_file calls sys.exit(1) itself (after printing) on a
+        # missing import file — already reported, nothing more to add.
+        return None
+    except Exception as e:
+        return f"Parse Error: {e}"
+
+    try:
+        gen = CodeGen(import_aliases={
+            node.alias: os.path.splitext(os.path.basename(node.module_name.replace(".", os.sep)))[0].replace("-", "_")
+            for node in _find_imports_in_body(combined_ast)
+            if getattr(node, 'alias', None)
+        })
+        ir_code = gen.gen(combined_ast)
+    except RubidiumTypeError as e:
+        return f"Type Error: {e}"
+    except RubidiumNameError as e:
+        return f"Name Error: {e}"
+    except Exception as e:
+        return f"Compilation Error: {e}"
+
+    # Codegen completed without raising — but that doesn't mean the IR it
+    # produced is actually valid (see BUG-34 follow-up's file-alloca
+    # collision: two sibling branches emitting the same LLVM register name
+    # completes `gen()` fine and only fails once something actually
+    # parses/verifies the resulting text). A syntax-only clang pass over
+    # the IR catches that class of bug too, the same way the real
+    # compiler's own build step eventually would — just here, first.
+    import subprocess, tempfile
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".ll", delete=False, mode="w") as f:
+            f.write(ir_code)
+            ir_path = f.name
+        result = subprocess.run(
+            ["clang", "-S", "-emit-llvm", ir_path, "-o", os.devnull],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            return "Compilation failed (generated code is invalid):\n" + result.stderr.strip()
+    except FileNotFoundError:
+        pass  # clang not installed — skip this half of the check rather than fail check_file over it
+    finally:
+        try:
+            os.unlink(ir_path)
+        except OSError:
+            pass
+    return None
 
 
 def _analyze_single_file(filepath: str, strict: bool, exit_on_fatal: bool,

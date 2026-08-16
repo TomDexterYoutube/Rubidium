@@ -1605,6 +1605,21 @@ void os_terminal_drop(long long id) {
     t->active=0;
 }
 
+// thread(os.run(cmd[, input], id), id) — runs a command in the background.
+// os_start() is idempotent (returns immediately if `id` is already active),
+// so the caller doesn't need its own os.start(id) first. Owns cmd/input
+// (frees them — see codegen.py's _emit_os_thread_call, which always hands
+// this an independent strdup'd copy) and discards the captured output:
+// there's no caller left waiting for a return value once this is running
+// on a background thread.
+void rub_os_run_thread(long long id, char* cmd, char* input, long long timeout_ms) {
+    os_start(id);
+    char* out = os_run(id, cmd, input, timeout_ms);
+    if (out) free(out);
+    free(cmd);
+    free(input);
+}
+
 // -------------------------------------------------------
 // NET MODULE — LAN discovery + peer messaging (see `syntax`'s NET section)
 //

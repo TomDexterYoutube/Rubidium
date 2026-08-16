@@ -916,6 +916,16 @@ class Parser:
             self.match("DOT")
             method = self.match_attr()
             if method == "drop":
+                # BUGFIX: `.drop()` is a call, like every other method call
+                # syntax in the language — its `()` was never consumed here,
+                # left sitting in the token stream to be mis-parsed as the
+                # START of the NEXT statement (an empty `()` — a dynamic SY
+                # call/reference per the LPAREN statement branch — which then
+                # failed with "expected an expression, got RPAREN" trying to
+                # parse nothing between the parens). `os(1).drop()` as a bare
+                # statement never worked at all until this was fixed.
+                self.match("LPAREN")
+                self.match("RPAREN")
                 return OsDrop(id_expr)
             raise SyntaxError(f"Unknown os() method: {method}")
         # os.start(...) or os.run(...)
@@ -927,23 +937,35 @@ class Parser:
             self.match("RPAREN")
             return OsStart(id_expr)
         if method == "run":
-            self.match("LPAREN")
-            # Detect struct form: os.run({ cmd: ..., args: ..., input: ... })
-            if self.peek() and self.peek()[0] == "LBRACE":
-                struct_args = self._parse_os_run_struct()
-                self.match("RPAREN")
-                return OsRun(None, None, struct_args=struct_args)
-            # Normal form: os.run(id, cmd) or os.run(id, cmd, input)
-            id_expr = self.expr()
-            self.match("COMMA")
-            cmd_expr = self.expr()
-            input_expr = None
-            if self.peek() and self.peek()[0] == "COMMA":
-                self.match("COMMA")
-                input_expr = self.expr()
-            self.match("RPAREN")
-            return OsRun(id_expr, cmd_expr, input_expr=input_expr)
+            return self._parse_os_run_call()
         raise SyntaxError(f"Unknown os module method: {method}")
+
+    def _parse_os_run_call(self):
+        """Parse everything after `os.run` — the `(...)` through its
+        closing paren — for both the struct form and the normal
+        (cmd[, input], id) form. id is LAST (matching thread(call, id)'s
+        own convention) so os.run(...) can be dropped straight into
+        thread(os.run(...), id) with no argument-order mismatch between
+        the two."""
+        self.match("LPAREN")
+        # Detect struct form: os.run({ cmd: ..., args: ..., input: ... })
+        if self.peek() and self.peek()[0] == "LBRACE":
+            struct_args = self._parse_os_run_struct()
+            self.match("RPAREN")
+            return OsRun(None, None, struct_args=struct_args)
+        # Normal form: os.run(cmd, id) or os.run(cmd, input, id)
+        cmd_expr = self.expr()
+        self.match("COMMA")
+        second_expr = self.expr()
+        input_expr = None
+        if self.peek() and self.peek()[0] == "COMMA":
+            self.match("COMMA")
+            input_expr = second_expr
+            id_expr = self.expr()
+        else:
+            id_expr = second_expr
+        self.match("RPAREN")
+        return OsRun(id_expr, cmd_expr, input_expr=input_expr)
 
     def _parse_os_run_struct(self):
         """Parse { cmd: expr, args: [...], input: expr }"""
@@ -1339,26 +1361,15 @@ class Parser:
                 path_expr = self.expr()
                 self.match("RPAREN")
                 return FFILoad(path_expr)
-            # os.run(...) in expression context
+            # os.run(...) in expression context — e.g. thread(os.run(...), id)
+            # or `let out = os.run(...)`. Shares _parse_os_run_call with the
+            # statement-context path (_parse_os_stmt) so both stay in sync.
             if name == "os" and self.peek() and self.peek()[0] == "DOT":
                 saved = self.pos
                 self.match("DOT")
                 method = self.match_attr()
                 if method == "run":
-                    self.match("LPAREN")
-                    if self.peek() and self.peek()[0] == "LBRACE":
-                        struct_args = self._parse_os_run_struct()
-                        self.match("RPAREN")
-                        return OsRun(None, None, struct_args=struct_args)
-                    id_expr = self.expr()
-                    self.match("COMMA")
-                    cmd_expr = self.expr()
-                    input_expr = None
-                    if self.peek() and self.peek()[0] == "COMMA":
-                        self.match("COMMA")
-                        input_expr = self.expr()
-                    self.match("RPAREN")
-                    return OsRun(id_expr, cmd_expr, input_expr=input_expr)
+                    return self._parse_os_run_call()
                 self.pos = saved
             # Handle thread.wait(...) / thread.running(...) in expression context
             if name == "thread" and self.peek() and self.peek()[0] == "DOT":

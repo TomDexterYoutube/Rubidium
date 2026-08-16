@@ -1016,6 +1016,7 @@ class CodeGen:
             "declare void @os_start(i64)",
             "declare i8* @os_run(i64, i8*, i8*, i64)",  # OPEN-13: 4th arg = absolute timeout in ms (<=0 => default)
             "declare void @os_terminal_drop(i64)",
+            "declare void @rub_os_run_thread(i64, i8*, i8*, i64)",  # thread(os.run(...), id)
             "declare i64 @ffi_load(i8*)",
             "declare i64 @ffi_sym(i64, i8*)",
             ""
@@ -3867,8 +3868,24 @@ class CodeGen:
             if self.cur_fn is not None and self.cur_fn != "_rubidium_init":
                 self.local_vars_stack[-1][node.var_name] = "i64"
                 ptr = f"%ptr_{node.var_name}"
-                self.emit(f"  {ptr} = alloca i64")
-                self._alloca_emitted.add(node.var_name)
+                # BUGFIX: two sibling `open(...) as file { ... }` blocks in
+                # mutually-exclusive branches (e.g. an `if`/`else if` chain,
+                # each opening a DIFFERENT path under the same handle name)
+                # each reach here with var_exists False — `local_vars_stack`
+                # reflects Rubidium-level lexical scope, which resets
+                # between sibling branches, but the LLVM register this
+                # allocates (`%ptr_file`) is a single per-FUNCTION name
+                # regardless of how many source-level branches declare it.
+                # Allocating it again for the second branch is invalid LLVM
+                # IR ("multiple definition of local value named 'ptr_file'")
+                # — confirmed failing to compile two `open(...) as file`
+                # blocks in an if/else-if chain. _alloca_emitted already
+                # tracks this per-function (not per-scope) for exactly this
+                # kind of case elsewhere in this file; only alloca once, and
+                # just re-store into the existing pointer on later branches.
+                if node.var_name not in self._alloca_emitted:
+                    self.emit(f"  {ptr} = alloca i64")
+                    self._alloca_emitted.add(node.var_name)
                 self.emit(f"  store i64 {slot_val}, i64* {ptr}")
             else:
                 self.declare_global(node.var_name, "i64")
@@ -4870,10 +4887,11 @@ class CodeGen:
             h_ptr = self.new_tmp()
             self.emit(f"  {h_ptr} = getelementptr [1024 x i64], [1024 x i64]* @_thread_handles, i64 0, i64 {tid_v}")
 
-            # `thread(net.process(...), id)` / `thread(net.listen(...), id)` —
-            # the callee isn't a Rubidium FnDef at all (it's a runtime C
-            # function), so it can't go through the fn_def-lookup trampoline
-            # logic below. Handled separately with its own fixed signature.
+            # `thread(net.process(...), id)` / `thread(net.listen(...), id)` /
+            # `thread(os.run(...), id)` — the callee isn't a Rubidium FnDef
+            # at all (it's a runtime C function), so it can't go through the
+            # fn_def-lookup trampoline logic below. Handled separately with
+            # its own fixed signature.
             if isinstance(func_call_node, MethodCall):
                 _mc_obj_name = func_call_node.obj.name if hasattr(func_call_node.obj, 'name') else str(func_call_node.obj)
                 _mc_obj_name = self.use_aliases.get(_mc_obj_name, _mc_obj_name)
@@ -4881,9 +4899,40 @@ class CodeGen:
                     return self._emit_net_thread_call(func_call_node, h_ptr)
                 if _mc_obj_name == "keyboard" and func_call_node.method == "thread":
                     return self._emit_keyboard_thread_call(func_call_node, h_ptr)
+            if isinstance(func_call_node, OsRun):
+                return self._emit_os_thread_call(func_call_node, h_ptr)
 
-            fn_name = func_call_node.name if isinstance(func_call_node, FnCall) else str(func_call_node)
-            call_args = func_call_node.args if isinstance(func_call_node, FnCall) else []
+            # BUGFIX: anything reaching here that ISN'T a plain FnCall to a
+            # real user function (a MethodCall that didn't match one of the
+            # net.process/net.listen/keyboard.thread special cases just
+            # above — e.g. a typo like `net.procces(...)`, or ANY other
+            # call shape entirely) used to fall through to
+            # `str(func_call_node)` — Python's default object repr
+            # (`<rub_ast.MethodCall object at 0x...>`) — silently embedded
+            # as the trampoline's LLVM symbol name. That produced
+            # syntactically invalid IR that only failed much later, deep
+            # inside clang, with a cryptic "expected 'to' after cast value"
+            # pointing at a temp file — no indication the real problem was
+            # an unsupported argument to thread() at all. Reject it clearly
+            # here instead, matching what thread() actually supports per
+            # the syntax file: a plain function call, or net.process(...) /
+            # net.listen(...) / key.thread(...) / os.run(...) (normal form
+            # only — the struct form isn't supported here, see
+            # _emit_os_thread_call).
+            if not isinstance(func_call_node, FnCall):
+                shape = type(func_call_node).__name__
+                detail = ""
+                if isinstance(func_call_node, MethodCall):
+                    obj_name = func_call_node.obj.name if hasattr(func_call_node.obj, 'name') else '?'
+                    detail = f" (`{obj_name}.{func_call_node.method}(...)` isn't one of those)"
+                raise RubidiumTypeError(
+                    f"thread(...)'s first argument must be a call to a plain "
+                    f"Rubidium function, or one of net.process(...), "
+                    f"net.listen(...), key.thread(...), os.run(...) — got a "
+                    f"{shape}{detail}."
+                )
+            fn_name = func_call_node.name
+            call_args = func_call_node.args
             fn_def = self.functions.get(fn_name)
             param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_def.params] if (fn_def and fn_def.params) else []
             ret_ir = self.rubi_type_to_ir(fn_def.ret_type) if (fn_def and fn_def.ret_type) else "i64"
@@ -5145,6 +5194,45 @@ class CodeGen:
         rate_d = self.coerce(rate_v, rate_t, "double")
         return self._emit_raw_thread_trampoline(
             h_ptr, "_tramp_keyboard_thread", "rub_keyboard_thread", ["double"], [rate_d])
+
+    def _emit_os_thread_call(self, func_call_node, h_ptr):
+        """Marshal + trampoline for thread(os.run(cmd[, input], id), id) — runs
+        the command in the background; the terminal session is auto-started
+        (os_start is idempotent — see the C runtime) if not already, so the
+        caller doesn't need its own os.start(id) first. Output is discarded:
+        there's no caller left waiting for a return value once this is
+        running on a background thread (same reasoning as
+        net.process/net.listen never returning anything into the caller)."""
+        if func_call_node.struct_args is not None:
+            raise RubidiumTypeError(
+                "thread(os.run(...), id) doesn't support the struct form "
+                "(os.run({cmd: ...})) — use the normal form: "
+                "os.run(cmd[, input], id)."
+            )
+        id_v, id_t = self.emit_expr(func_call_node.id_expr)
+        id_v = self.coerce(id_v, id_t, "i64")
+        cmd_v, cmd_t = self.emit_expr(func_call_node.cmd_expr)
+        cmd_s = self.coerce(cmd_v, cmd_t, "i8*")
+        if func_call_node.input_expr is not None:
+            inp_v, inp_t = self.emit_expr(func_call_node.input_expr)
+            inp_s = self.coerce(inp_v, inp_t, "i8*")
+        else:
+            null_lbl, null_len = self.intern_str("")
+            inp_s = self.new_tmp()
+            self.emit(f"  {inp_s} = getelementptr [{null_len} x i8], [{null_len} x i8]* {null_lbl}, i64 0, i64 0")
+        # rub_os_run_thread() takes ownership of cmd/input (frees them) —
+        # same reasoning as net.process's name_dup: the incoming pointer may
+        # be an unowned interned string literal, or a temporary this
+        # function's own scope-exit would otherwise free out from under the
+        # still-running background thread. Give the thread its own
+        # independent heap copies.
+        cmd_dup = self.new_tmp()
+        self.emit(f"  {cmd_dup} = call i8* @strdup(i8* {cmd_s})")
+        inp_dup = self.new_tmp()
+        self.emit(f"  {inp_dup} = call i8* @strdup(i8* {inp_s})")
+        return self._emit_raw_thread_trampoline(
+            h_ptr, "_tramp_os_run", "rub_os_run_thread",
+            ["i64", "i8*", "i8*", "i64"], [id_v, cmd_dup, inp_dup, "0"])
 
     def emit_method_call_expr(self, node):
         # 1. Resolve the object name
@@ -6291,10 +6379,32 @@ class CodeGen:
             dv = self.coerce(val, from_t, "double")
             self.emit(f"  call i32 (i8*, i8*, ...) @sprintf(i8* {buf}, i8* {fmt_ptr}, double {dv})")
             return self._track_temp(buf, "i8*"), "i8*"   # BUG-3
-        if from_t == "i8*" and to_t in ("i1","i64"):
-            t2 = self.new_tmp()
-            self.emit(f"  {t2} = call i64 @atol(i8* {val})")
-            return self.coerce(t2, "i64", to_t), to_t
+        # BUGFIX: this only ever matched to_t in {"i1","i64"} — `code as i32`
+        # (or i128/i256/.../i2048, any width other than exactly i64/i1)
+        # fell straight through to the `return val, to_t` catch-all below,
+        # silently handing back the ORIGINAL, UNCONVERTED i8* string
+        # pointer just relabeled as if it were already an i32 — no atol(),
+        # no truncation, nothing. That's not just wrong output: storing an
+        # 8-byte pointer into a 4-byte i32 slot is a real LLVM type
+        # mismatch ("defined with type 'ptr' but expected 'i32'"), so this
+        # was a hard compile failure for ANY `<str> as <int-width other
+        # than i64>` cast, not silent data corruption. coerce() already
+        # implements the i8*->integer conversion correctly for every width
+        # in _INT_IR_SET (atol + truncate/widen as needed) — delegate to it
+        # instead of this narrower, incomplete reimplementation.
+        if from_t == "i8*" and to_t in self._INT_IR_SET:
+            return self.coerce(val, from_t, to_t), to_t
+        # Same gap for string -> float ("3.14" as f64) — never had ANY
+        # handling at all (not even the narrow i1/i64 case above covered
+        # it), so it also silently fell through to the raw-pointer
+        # catch-all. strtod() parses the numeric prefix of the string,
+        # same spirit as atol() for the integer case just above.
+        if from_t == "i8*" and to_t in self._FLOAT_IR_SET:
+            dbl = self.new_tmp()
+            self.emit(f"  {dbl} = call double @strtod(i8* {val}, i8** null)")
+            if to_t == "double":
+                return dbl, to_t
+            return self.coerce(dbl, "double", to_t), to_t
         return val, to_t
 
     def emit_math_block(self, node):
