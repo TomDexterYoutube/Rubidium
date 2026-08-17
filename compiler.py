@@ -876,6 +876,19 @@ void dict_set(Box* dct, Box* k, Box* v) {
     if(d->count==d->cap){d->cap*=2; d->keys=realloc(d->keys,d->cap*sizeof(Box*)); d->vals=realloc(d->vals,d->cap*sizeof(Box*));}
     d->keys[d->count]=k; d->vals[d->count]=v; d->count++;
 }
+// bugs.log OPEN-U: does this dict/index already contain this key? Backs the
+// spec's "index().add(key, value) — If the key already exists, this will
+// error" rule (syntax INDEX section). dict_set alone silently OVERWRITES an
+// existing key, which is correct for .set() but wrong for .add(); codegen
+// calls this first and raises a catchable runtime error when it returns 1.
+// Takes no ownership of `k` (unlike dict_set) — it only reads it.
+int dict_has_key(Box* dct, Box* k) {
+    if(!dct || dct->type != 3) return 0;
+    RDict* d=dct->p;
+    if(!d || !IS_DICT_MAGIC(d->magic)) return 0;
+    for(int i=0;i<d->count;i++) if(box_eq(d->keys[i],k)) return 1;
+    return 0;
+}
 // Single-arg .add(): dispatches based on the collection's runtime type.
 // list.add(val)    -> append val to the list.
 // dict.add(new_key) -> create a new top-level key with value Null (per spec).

@@ -40,6 +40,7 @@ declare void @list_swap(%Box*, i32, i32)
 declare %Box* @make_dict()
 declare %Box* @make_dictplus()
 declare void @dict_set(%Box*, %Box*, %Box*)
+declare i32 @dict_has_key(%Box*, %Box*)
 declare %Box* @collection_get(%Box*, %Box*)
 declare void @collection_set(%Box*, %Box*, %Box*)
 declare void @print_boxed(%Box*)
@@ -1376,6 +1377,75 @@ class CodeGen:
             return tracked
         return val
 
+    # bugs.log OPEN-T: static type-family checking for assignments/declarations.
+    # The syntax file's TYPE CHECKING section ("Rubidium checks types at compile
+    # time. Assigning the wrong type raises a compiler error.") was never
+    # actually enforced by codegen — Assign/VarDecl just called coerce() blindly,
+    # which reinterprets the raw value bits for whatever the target IR type is.
+    # See _check_assign_type for the failure modes that produced.
+    _VALUE_FAMILY_NODES = (
+        (Str, 'str'), (InterpolatedStr, 'str'),
+        (Number, 'num'), (Bool, 'bool'),
+        (ListExpr, 'coll'), (DictExpr, 'coll'),
+    )
+    # Every cross-family pair is a real error EXCEPT num<->bool, which stay
+    # mutually assignable on purpose: bool is 0/1 numerically, and
+    # number-as-truthiness is used throughout the language itself.
+    _COMPATIBLE_FAMILIES = {('num', 'bool'), ('bool', 'num')}
+
+    def _value_family(self, node):
+        """The type FAMILY of an expression, but ONLY when it is certain from
+        the node itself ('str', 'num', 'bool', 'coll'). Returns None meaning
+        "not confident — do not type-check this" for everything else.
+
+        Deliberately conservative: _infer_type falls back to "i64" for a whole
+        class of things whose real type it cannot know (an untyped function's
+        return value, a cross-namespace call, an unresolved import). Checking
+        against those fallbacks would reject valid programs, so only literals —
+        whose type is unambiguous by construction — are checked. A Null literal
+        is excluded on purpose: per the syntax file's NULL BEHAVIOR section Null
+        is a valid value for EVERY type."""
+        for node_cls, family in self._VALUE_FAMILY_NODES:
+            if isinstance(node, node_cls):
+                return family
+        return None
+
+    def _ir_family(self, ir_t):
+        """The type family of a target IR type, or None when the target is not
+        meaningfully checkable. %Box* is deliberately None: it backs both `Any`
+        and every collection type, so it is genuinely dynamic and must keep
+        accepting any value."""
+        if ir_t == "i8*": return 'str'
+        if ir_t == "i1":  return 'bool'
+        if ir_t in self._INT_IR_SET or ir_t in self._FLOAT_IR_SET: return 'num'
+        return None
+
+    def _check_assign_type(self, name, target_ir, value_node, what="assign"):
+        """bugs.log OPEN-T: reject a statically-certain type mismatch instead of
+        silently reinterpreting the value's bits.
+
+        Without this, coerce() happily turned an i8* string pointer into an
+        integer (`let mut v: i32 = 5` then `v = "hello"` printed 0 — silent data
+        corruption), and, far worse, turned an integer/bool into an i8* string
+        pointer (`let mut s: str = "hi"` then `s = 42` made print() dereference
+        42 as an address — a hard SEGFAULT). A third shape (`str` into an f64)
+        didn't even reach a clean error: it leaked a raw LLVM
+        "'%t2' defined with type 'ptr' but expected 'double'" diagnostic out to
+        the user. All three are the same missing check."""
+        src = self._value_family(value_node)
+        if src is None:
+            return
+        dst = self._ir_family(target_ir)
+        if dst is None or src == dst:
+            return
+        if (dst, src) in self._COMPATIBLE_FAMILIES:
+            return
+        readable = {'str': 'str', 'num': 'a number', 'bool': 'bool', 'coll': 'a collection'}
+        action = (f"Cannot assign {readable[src]} to '{name}'" if what == "assign"
+                  else f"Cannot initialize '{name}' with {readable[src]}")
+        raise RubidiumTypeError(
+            f"{action}: variable is declared {readable[dst]}, not {readable[src]}")
+
     def _infer_type(self, node):
         if isinstance(node, FileList): return "%Box*"
         if isinstance(node, LinkArg):
@@ -2075,6 +2145,14 @@ class CodeGen:
             return
         if isinstance(node, VarDecl):
             if node.name in self.dropped_vars: self.dropped_vars.discard(node.name)
+            # bugs.log OPEN-T: an EXPLICIT type annotation must actually be
+            # honoured — `let v: i32 = "hello"` was silently accepted (and
+            # printed 0) before this. Only checked when the declaration
+            # names a type; an inferred `let v = ...` takes the value's own
+            # type by definition and can never mismatch it.
+            if node.vtype:
+                self._check_assign_type(node.name, self.rubi_type_to_ir(node.vtype),
+                                        node.value, what="init")
             self._track_null_valued(node.name, node.value)  # OPEN-4 scalar Null
             # `index` must hold exactly one SCALAR value per key (never a
             # list/index/dict/dict+) — see _check_index_values_are_scalar.
@@ -2371,6 +2449,7 @@ class CodeGen:
                     ptr_str, ir_t = self._unlink_var(node.name)
                 else:
                     ptr_str, ir_t = self.get_var_ptr(node.name)
+                self._check_assign_type(node.name, ir_t, node.value)  # bugs.log OPEN-T
                 val, val_t = self.emit_expr(node.value)
                 val = self.coerce(val, val_t, ir_t)
                 # Deep copy only if the COERCED value is a Box* (collection), not the original value
@@ -2711,6 +2790,27 @@ class CodeGen:
         # OK block: continue
         self.emit(f"{ok_label}:")
     
+    def _emit_dup_key_guard(self, col_b, key_b, base_var_name):
+        """bugs.log OPEN-U: raise a catchable runtime error if `key_b` is already
+        present in `col_b`, backing the spec's `index().add(key, value)` rule
+        ("If the key already exists, this will error"). Uses the standard
+        catch-or-propagate path so a try/error block can handle it, matching the
+        static analyzer's own message, which already called this "a runtime
+        error" even though nothing actually raised one before this fix."""
+        has = self.new_tmp(); dup = self.new_tmp()
+        self.emit(f"  {has} = call i32 @dict_has_key(%Box* {col_b}, %Box* {key_b})")
+        self.emit(f"  {dup} = icmp ne i32 {has}, 0")
+        dup_l, ok_l = self.new_label("addduperr"), self.new_label("adddupok")
+        self.emit(f"  br i1 {dup}, label %{dup_l}, label %{ok_l}")
+        self.emit(f"{dup_l}:")
+        name = base_var_name or "index"
+        err_lbl, err_len = self.intern_str(
+            f"Key already exists in '{name}' — use .set() to change an existing key")
+        err_ptr = self.new_tmp()
+        self.emit(f"  {err_ptr} = getelementptr [{err_len} x i8], [{err_len} x i8]* {err_lbl}, i64 0, i64 0")
+        self._emit_raise_or_propagate(err_ptr)
+        self.emit(f"{ok_l}:")
+
     def _check_os_run_error(self, res):
         """Check if os_run returned NULL (command failed); catch-or-propagate (OPEN-7)."""
         is_null = self.new_tmp()
@@ -3015,6 +3115,10 @@ class CodeGen:
                 val_b = self.coerce_to_box(val_v, val_t)
                 # Check element type constraint for the value (bugs.log #2)
                 self._check_element_type(base_var_name, val_b)
+                # bugs.log OPEN-U: .add() on an ALREADY-EXISTING key is an error
+                # per the spec's INDEX section — dict_set on its own silently
+                # overwrites it (right for .set(), wrong for .add()).
+                self._emit_dup_key_guard(col_b, key_b, base_var_name)
                 self.emit(f"  call void @dict_set(%Box* {col_b}, %Box* {key_b}, %Box* {val_b})")
 
         return "0", "i64"
