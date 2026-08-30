@@ -1823,8 +1823,16 @@ class Analyzer:
                     if existing_keys:
                         new_key = self._literal_key(node.args[0])
                         if new_key is not None and new_key in existing_keys:
+                            # bugs.log OPEN-U: this is a RUNTIME error, and
+                            # try/error exists precisely to handle those — so
+                            # inside a try block it is a deliberate, handled
+                            # case, not a defect. Reporting it as a hard ERROR
+                            # there blocked compilation of correct code that
+                            # was already catching it (caught on this file's
+                            # own regression test for the feature).
                             self._emit(
-                                'ERROR', info.get('line'), 'Duplicate Key',
+                                'WARNING' if self._try_depth > 0 else 'ERROR',
+                                info.get('line'), 'Duplicate Key',
                                 f"Key {new_key[1]!r} already exists in index '{cname}'.\n"
                                 f".add() on an existing key is a runtime error.",
                                 f"Use {cname}({new_key[1]!r}).set(...) to update "

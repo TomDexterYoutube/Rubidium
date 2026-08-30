@@ -870,6 +870,11 @@ class CodeGen:
         field_types = []
         for f in cls.fields:
             ir_t = self.rubi_type_to_ir(f.vtype) if f.vtype else self._infer_type(f.value)
+            # bugs.log OPEN-T: an explicitly-typed field must actually match its
+            # initializer — `let mut hp: i32 = "hello"` inside a class was
+            # silently accepted and read back as 0.
+            if f.vtype:
+                self._check_assign_type(f.name, ir_t, f.value, what="field")
             field_types.append(ir_t)
         field_types_str = ", ".join(field_types)
         if not field_types_str: field_types_str = "i8"
@@ -1420,7 +1425,7 @@ class CodeGen:
         if ir_t in self._INT_IR_SET or ir_t in self._FLOAT_IR_SET: return 'num'
         return None
 
-    def _check_assign_type(self, name, target_ir, value_node, what="assign"):
+    def _check_assign_type(self, name, target_ir, value_node, what="assign", ctx=None):
         """bugs.log OPEN-T: reject a statically-certain type mismatch instead of
         silently reinterpreting the value's bits.
 
@@ -1441,6 +1446,16 @@ class CodeGen:
         if (dst, src) in self._COMPATIBLE_FAMILIES:
             return
         readable = {'str': 'str', 'num': 'a number', 'bool': 'bool', 'coll': 'a collection'}
+        if what == "arg":
+            raise RubidiumTypeError(
+                f"{ctx} '{name}' expects {readable[dst]}, got {readable[src]}")
+        if what == "return":
+            raise RubidiumTypeError(
+                f"{ctx} declares it returns {readable[dst]}, but returns {readable[src]}")
+        if what == "field":
+            raise RubidiumTypeError(
+                f"Cannot assign {readable[src]} to field '{name}': "
+                f"field is declared {readable[dst]}, not {readable[src]}")
         action = (f"Cannot assign {readable[src]} to '{name}'" if what == "assign"
                   else f"Cannot initialize '{name}' with {readable[src]}")
         raise RubidiumTypeError(
@@ -2471,6 +2486,18 @@ class CodeGen:
         elif isinstance(node, While): self.emit_while(node)
         elif isinstance(node, For): self.emit_for(node)
         elif isinstance(node, Return):
+            # bugs.log OPEN-T: check the declared return type BEFORE emitting the
+            # value — `fn f() -> i32 { return "hello" }` used to coerce the
+            # string pointer to an int (printed 0), and `fn f() -> str { return
+            # 42 }` returned 42 as a pointer for the caller to dereference
+            # (SEGFAULT). BUG-32's check below only covers UNDECLARED return
+            # types; a wrong-but-declared one fell straight through it.
+            if (node.value is not None and self.cur_fn in self.functions
+                    and self.functions[self.cur_fn].ret_type):
+                self._check_assign_type(
+                    self.cur_fn,
+                    self.rubi_type_to_ir(self.functions[self.cur_fn].ret_type),
+                    node.value, what="return", ctx=f"Function '{self.cur_fn}'")
             val, val_t = self.emit_expr(node.value)
             # Determine the expected return type:
             # 1. Use the registered function's declared return type if available
@@ -3308,6 +3335,11 @@ class CodeGen:
             raise RubidiumTypeError(f"Cannot assign to field '{node.field}': field is not declared 'mut' in class '{class_name}'")
 
         idx, ir_t  = self.field_index(class_name, node.field)
+        # bugs.log OPEN-T: same missing check as plain assignment, on class
+        # fields — `c.hp = "hello"` (i32 field) silently stored a string
+        # pointer as an int, `c.nm = 42` (str field) stored 42 as a pointer
+        # for the next read to dereference (SEGFAULT).
+        self._check_assign_type(node.field, ir_t, node.value, what="field")
         struct_t   = self.class_ir_type(class_name)
         
         ptr_str, _ = self.get_var_ptr(obj_name)
@@ -4787,6 +4819,17 @@ class CodeGen:
             raise RubidiumTypeError(
                 f"Function '{fn_name}' expects {len(params)} argument(s), got {len(args)}."
             )
+        # bugs.log OPEN-T: the same missing type check as assignment/declaration,
+        # at the call site. `fn f(n: i32)` called as `f("hello")` passed the raw
+        # string POINTER into an integer slot (printed 0), and `fn f(s: str)`
+        # called as `f(42)` made the callee dereference 42 as an address — a
+        # SEGFAULT. This is the shared validation point every real call path
+        # already routes through, so checking here covers them all at once.
+        for (pname, ptype), arg in zip(params, args):
+            if not ptype:
+                continue
+            self._check_assign_type(pname, self.rubi_type_to_ir(ptype), arg,
+                                    what="arg", ctx=f"Function '{fn_name}' parameter")
 
     def emit_call_expr(self, node):
         # Chained collection access: nested(0)(1) parses as FnCall(FnCall("nested",[0]),[1])
