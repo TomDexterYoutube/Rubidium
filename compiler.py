@@ -221,8 +221,27 @@ Box* box_copy(Box* src) {
     return src;
 }
 
-long long unbox_i(Box* b) { return b ? b->i : 0; }
-double unbox_f(Box* b) { return b ? b->f : 0.0; }
+// BUGFIX (bugs.log #2/#4, confirmed to also affect Rubidium — see the
+// identical fix + explanation in Vire's compiler.py): both of these used
+// to blindly read a single fixed field (->i or ->f) regardless of the
+// Box's ACTUAL type tag. A Box only ever populates ONE of ->i/->f when
+// created; reading the OTHER field back out is reading garbage, not a
+// real value. An int-valued element (e.g. `255` in a list also containing
+// floats like `0.5`) read through unbox_f() — the path every coercion to
+// a float-typed variable/parameter or cast.f32()-style conversion goes
+// through — came back as stale/garbage data instead of the correct
+// numeric value, while dynamic access (print() on the Box itself, which
+// switches on ->type) read the same element correctly.
+long long unbox_i(Box* b) {
+    if(!b) return 0;
+    if(b->type==1) return (long long)b->f;
+    return b->i;
+}
+double unbox_f(Box* b) {
+    if(!b) return 0.0;
+    if(b->type==0) return (double)b->i;
+    return b->f;
+}
 char* unbox_s(Box* b) { return (b && b->type==2) ? b->s : ""; }
 // bugs.log OPEN-9: accept type==5 (boxed class instance) too, not just the
 // generic type==3 pointer/collection tag — every EXISTING static-type

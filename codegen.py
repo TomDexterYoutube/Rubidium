@@ -604,6 +604,25 @@ class CodeGen:
         adds over rubi_type_to_ir is 'void', meaningful for an FFI return
         type (no return value at all) but not a real Rubidium type."""
         if t == "void": return "void"
+        # bugs.log #3: `bool` across a REAL FFI boundary (a dynamically
+        # resolved, dlsym'd C function pointer — see emit_ffi_bind, which
+        # does a genuine indirect `call` through an `inttoptr`-cast function
+        # pointer, not a same-compiler Rubidium-to-Rubidium call) segfaulted
+        # the moment a bool-returning function (`should_close() -> bool`)
+        # was used as a loop condition. Rubidium's own LLVM IR representation
+        # of `bool` is `i1`, but no real C ABI has an `i1` return/parameter
+        # type — C's `_Bool`/`bool` is a full byte (commonly returned in a
+        # whole register, e.g. eax on x86-64), and declaring the foreign
+        # function pointer's LLVM type as `i1` instead mismatches the actual
+        # native calling convention (register/extension expectations differ
+        # for i1 vs. a real integer width), corrupting the call. Using `i32`
+        # end-to-end for FFI bool params/returns matches how a real C `bool`
+        # is actually passed on this platform, confirmed by the user to fix
+        # the crash immediately with no other changes. Ordinary (non-FFI)
+        # Rubidium bool variables/expressions are unaffected — `coerce()`
+        # already narrows/widens between i32 and i1 automatically at the
+        # point an FFI bool value is stored into or read from one.
+        if t == "bool": return "i32"
         return self.rubi_type_to_ir(t)
 
     def promote_type(self, a, b):
@@ -5181,17 +5200,22 @@ class CodeGen:
             node.args = self._resolve_call_args(
                 node.name, fn_obj.params or [], getattr(fn_obj, "defaults", {}), node.args)
             self._check_arg_count(node.name, fn_obj.params or [], node.args)
-            # FFI-bound functions (`fn lib symbol(...) as name`) now target
-            # only another Rubidium-compiled shared library (`FFI("lib.so")`
-            # built by this same compiler with `-s`) — both sides share the
-            # exact same %Box*/RList/RDict layout, so a call here is
-            # marshaled exactly like an ordinary Rubidium function call, no
-            # FFI-specific type mapping needed. The only FFI-specific bit
-            # left is the return-type default: no `-> ret` means void (a
-            # real C-style function with no return slot), where an ordinary
-            # internal function without one defaults to i64.
+            # FFI-bound functions (`fn lib symbol(...) as name`) call through
+            # a genuinely dynamically-resolved (dlsym'd) C function pointer
+            # (see emit_ffi_bind) — a REAL foreign ABI boundary, not another
+            # Rubidium-compiled binary. bugs.log #3: param/return types for
+            # such a call must use `_ffi_type_to_ir`, the SAME mapping the
+            # wrapper's own signature was declared with in emit_ffi_bind —
+            # using the plain `rubi_type_to_ir` here (as before) disagreed
+            # with the wrapper specifically for `bool` (i1 vs the FFI-only
+            # i32 fix just above), so a bool-typed argument was coerced to
+            # i1 by the CALLER while the wrapper's actual defined signature
+            # expected i32, an LLVM IR type mismatch on every such call.
+            # Non-FFI internal functions are unaffected: `_ffi_type_to_ir`
+            # maps every other type identically to `rubi_type_to_ir`.
             is_ffi = target_name in self.ffi_functions
-            param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_obj.params] if fn_obj.params else []
+            _type_map = self._ffi_type_to_ir if is_ffi else self.rubi_type_to_ir
+            param_types = [_type_map(pt) for _, pt in fn_obj.params] if fn_obj.params else []
             args_ir = []
             for i, a in enumerate(node.args):
                 v, t = self.emit_expr(a)
