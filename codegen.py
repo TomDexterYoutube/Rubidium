@@ -604,6 +604,25 @@ class CodeGen:
         adds over rubi_type_to_ir is 'void', meaningful for an FFI return
         type (no return value at all) but not a real Rubidium type."""
         if t == "void": return "void"
+        # bugs.log #3: `bool` across a REAL FFI boundary (a dynamically
+        # resolved, dlsym'd C function pointer — see emit_ffi_bind, which
+        # does a genuine indirect `call` through an `inttoptr`-cast function
+        # pointer, not a same-compiler Rubidium-to-Rubidium call) segfaulted
+        # the moment a bool-returning function (`should_close() -> bool`)
+        # was used as a loop condition. Rubidium's own LLVM IR representation
+        # of `bool` is `i1`, but no real C ABI has an `i1` return/parameter
+        # type — C's `_Bool`/`bool` is a full byte (commonly returned in a
+        # whole register, e.g. eax on x86-64), and declaring the foreign
+        # function pointer's LLVM type as `i1` instead mismatches the actual
+        # native calling convention (register/extension expectations differ
+        # for i1 vs. a real integer width), corrupting the call. Using `i32`
+        # end-to-end for FFI bool params/returns matches how a real C `bool`
+        # is actually passed on this platform, confirmed by the user to fix
+        # the crash immediately with no other changes. Ordinary (non-FFI)
+        # Rubidium bool variables/expressions are unaffected — `coerce()`
+        # already narrows/widens between i32 and i1 automatically at the
+        # point an FFI bool value is stored into or read from one.
+        if t == "bool": return "i32"
         return self.rubi_type_to_ir(t)
 
     def promote_type(self, a, b):
@@ -870,6 +889,11 @@ class CodeGen:
         field_types = []
         for f in cls.fields:
             ir_t = self.rubi_type_to_ir(f.vtype) if f.vtype else self._infer_type(f.value)
+            # bugs.log OPEN-T: an explicitly-typed field must actually match its
+            # initializer — `let mut hp: i32 = "hello"` inside a class was
+            # silently accepted and read back as 0.
+            if f.vtype:
+                self._check_assign_type(f.name, ir_t, f.value, what="field")
             field_types.append(ir_t)
         field_types_str = ", ".join(field_types)
         if not field_types_str: field_types_str = "i8"
@@ -1420,7 +1444,7 @@ class CodeGen:
         if ir_t in self._INT_IR_SET or ir_t in self._FLOAT_IR_SET: return 'num'
         return None
 
-    def _check_assign_type(self, name, target_ir, value_node, what="assign"):
+    def _check_assign_type(self, name, target_ir, value_node, what="assign", ctx=None):
         """bugs.log OPEN-T: reject a statically-certain type mismatch instead of
         silently reinterpreting the value's bits.
 
@@ -1441,6 +1465,16 @@ class CodeGen:
         if (dst, src) in self._COMPATIBLE_FAMILIES:
             return
         readable = {'str': 'str', 'num': 'a number', 'bool': 'bool', 'coll': 'a collection'}
+        if what == "arg":
+            raise RubidiumTypeError(
+                f"{ctx} '{name}' expects {readable[dst]}, got {readable[src]}")
+        if what == "return":
+            raise RubidiumTypeError(
+                f"{ctx} declares it returns {readable[dst]}, but returns {readable[src]}")
+        if what == "field":
+            raise RubidiumTypeError(
+                f"Cannot assign {readable[src]} to field '{name}': "
+                f"field is declared {readable[dst]}, not {readable[src]}")
         action = (f"Cannot assign {readable[src]} to '{name}'" if what == "assign"
                   else f"Cannot initialize '{name}' with {readable[src]}")
         raise RubidiumTypeError(
@@ -2471,6 +2505,18 @@ class CodeGen:
         elif isinstance(node, While): self.emit_while(node)
         elif isinstance(node, For): self.emit_for(node)
         elif isinstance(node, Return):
+            # bugs.log OPEN-T: check the declared return type BEFORE emitting the
+            # value — `fn f() -> i32 { return "hello" }` used to coerce the
+            # string pointer to an int (printed 0), and `fn f() -> str { return
+            # 42 }` returned 42 as a pointer for the caller to dereference
+            # (SEGFAULT). BUG-32's check below only covers UNDECLARED return
+            # types; a wrong-but-declared one fell straight through it.
+            if (node.value is not None and self.cur_fn in self.functions
+                    and self.functions[self.cur_fn].ret_type):
+                self._check_assign_type(
+                    self.cur_fn,
+                    self.rubi_type_to_ir(self.functions[self.cur_fn].ret_type),
+                    node.value, what="return", ctx=f"Function '{self.cur_fn}'")
             val, val_t = self.emit_expr(node.value)
             # Determine the expected return type:
             # 1. Use the registered function's declared return type if available
@@ -3308,6 +3354,11 @@ class CodeGen:
             raise RubidiumTypeError(f"Cannot assign to field '{node.field}': field is not declared 'mut' in class '{class_name}'")
 
         idx, ir_t  = self.field_index(class_name, node.field)
+        # bugs.log OPEN-T: same missing check as plain assignment, on class
+        # fields — `c.hp = "hello"` (i32 field) silently stored a string
+        # pointer as an int, `c.nm = 42` (str field) stored 42 as a pointer
+        # for the next read to dereference (SEGFAULT).
+        self._check_assign_type(node.field, ir_t, node.value, what="field")
         struct_t   = self.class_ir_type(class_name)
         
         ptr_str, _ = self.get_var_ptr(obj_name)
@@ -4787,6 +4838,17 @@ class CodeGen:
             raise RubidiumTypeError(
                 f"Function '{fn_name}' expects {len(params)} argument(s), got {len(args)}."
             )
+        # bugs.log OPEN-T: the same missing type check as assignment/declaration,
+        # at the call site. `fn f(n: i32)` called as `f("hello")` passed the raw
+        # string POINTER into an integer slot (printed 0), and `fn f(s: str)`
+        # called as `f(42)` made the callee dereference 42 as an address — a
+        # SEGFAULT. This is the shared validation point every real call path
+        # already routes through, so checking here covers them all at once.
+        for (pname, ptype), arg in zip(params, args):
+            if not ptype:
+                continue
+            self._check_assign_type(pname, self.rubi_type_to_ir(ptype), arg,
+                                    what="arg", ctx=f"Function '{fn_name}' parameter")
 
     def emit_call_expr(self, node):
         # Chained collection access: nested(0)(1) parses as FnCall(FnCall("nested",[0]),[1])
@@ -5138,17 +5200,22 @@ class CodeGen:
             node.args = self._resolve_call_args(
                 node.name, fn_obj.params or [], getattr(fn_obj, "defaults", {}), node.args)
             self._check_arg_count(node.name, fn_obj.params or [], node.args)
-            # FFI-bound functions (`fn lib symbol(...) as name`) now target
-            # only another Rubidium-compiled shared library (`FFI("lib.so")`
-            # built by this same compiler with `-s`) — both sides share the
-            # exact same %Box*/RList/RDict layout, so a call here is
-            # marshaled exactly like an ordinary Rubidium function call, no
-            # FFI-specific type mapping needed. The only FFI-specific bit
-            # left is the return-type default: no `-> ret` means void (a
-            # real C-style function with no return slot), where an ordinary
-            # internal function without one defaults to i64.
+            # FFI-bound functions (`fn lib symbol(...) as name`) call through
+            # a genuinely dynamically-resolved (dlsym'd) C function pointer
+            # (see emit_ffi_bind) — a REAL foreign ABI boundary, not another
+            # Rubidium-compiled binary. bugs.log #3: param/return types for
+            # such a call must use `_ffi_type_to_ir`, the SAME mapping the
+            # wrapper's own signature was declared with in emit_ffi_bind —
+            # using the plain `rubi_type_to_ir` here (as before) disagreed
+            # with the wrapper specifically for `bool` (i1 vs the FFI-only
+            # i32 fix just above), so a bool-typed argument was coerced to
+            # i1 by the CALLER while the wrapper's actual defined signature
+            # expected i32, an LLVM IR type mismatch on every such call.
+            # Non-FFI internal functions are unaffected: `_ffi_type_to_ir`
+            # maps every other type identically to `rubi_type_to_ir`.
             is_ffi = target_name in self.ffi_functions
-            param_types = [self.rubi_type_to_ir(pt) for _, pt in fn_obj.params] if fn_obj.params else []
+            _type_map = self._ffi_type_to_ir if is_ffi else self.rubi_type_to_ir
+            param_types = [_type_map(pt) for _, pt in fn_obj.params] if fn_obj.params else []
             args_ir = []
             for i, a in enumerate(node.args):
                 v, t = self.emit_expr(a)
