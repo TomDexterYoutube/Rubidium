@@ -3174,7 +3174,7 @@ def compile_files(source_files, output=None, shared_lib=False, native=None):
             if isinstance(node, Import) and getattr(node, 'alias', None)
         }, shared_lib=shared_lib)
         ir_code = gen.gen(combined_ast)
-        with open('tmp.ll', 'w') as _f:
+        with open('.dump.ll', 'w') as _f:
             _f.write(ir_code)
 
         if output: output_bin = output
