@@ -1765,7 +1765,21 @@ class CodeGen:
                 self._gather_vardecl_types(node.try_body, type_map)
                 self._gather_vardecl_types(node.error_body, type_map)
             elif isinstance(node, FnDef):
-                self._gather_vardecl_types(node.body, type_map)
+                # BUGFIX (bugs.log #1, ported from the identical fix in Vire's
+                # codegen.py — see its comment for the full explanation): this
+                # pre-scan runs before any function parameter is registered,
+                # so a call like `mesh(key)` on a function's OWN dict/list/Any
+                # parameter couldn't be recognized as %Box*, and a bare
+                # `let val = mesh(key)` (no explicit type) got a wrong fixed
+                # scalar global type instead. Push the function's own
+                # parameter types as a real scope before recursing, matching
+                # what emit_fn does later for real.
+                param_scope = {pn: self.rubi_type_to_ir(pt) for pn, pt in node.params}
+                self.local_vars_stack.append(param_scope)
+                try:
+                    self._gather_vardecl_types(node.body, type_map)
+                finally:
+                    self.local_vars_stack.pop()
             elif isinstance(node, FileOpen):
                 if node.var_name:
                     self._file_handle_vars[node.var_name] = -1  # sentinel during gather pass
@@ -1847,8 +1861,15 @@ class CodeGen:
             for s in node.try_body: self._collect_global(s)
             for s in node.error_body: self._collect_global(s)
         elif isinstance(node, FnDef):
+            # BUGFIX (bugs.log #1, ported from Vire): push param types before
+            # recursing — this is the pass that actually calls declare_global.
             # Variable pool: let declarations inside regular functions go to the global pool
-            for s in node.body: self._collect_global(s)
+            param_scope = {pn: self.rubi_type_to_ir(pt) for pn, pt in node.params}
+            self.local_vars_stack.append(param_scope)
+            try:
+                for s in node.body: self._collect_global(s)
+            finally:
+                self.local_vars_stack.pop()
         elif isinstance(node, FileOpen):
             if node.var_name:
                 self._file_handle_vars[node.var_name] = -1  # sentinel during collect pass
