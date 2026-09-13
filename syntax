@@ -669,6 +669,19 @@ println("Loading...");
 println("Done!");
 // The console shows: Done!
 
+// printc and printlnc are the same as print but inlclude color
+// it is in a list from color in rgb then text and repate for mutiable
+
+//        white                     red
+printc([
+    255,255,255, "This is a ",
+    255,0,0,     "ERROR"
+])
+
+// rgb values must be 3 i32 from 0 to 255
+
+// printlnc should be understandable from this
+
 // input() — reads a line of text from the user.
 
 let user: str = input("Enter your name: ");
