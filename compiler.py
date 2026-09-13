@@ -750,6 +750,40 @@ Box* make_dict() { RDict* d=malloc(sizeof(RDict)); d->magic=2; d->count=0; d->ca
 // dict+ that collection_add1 creates as a new key's default value.
 Box* make_dictplus() { RDict* d=malloc(sizeof(RDict)); d->magic=4; d->count=0; d->cap=8; d->keys=malloc(8*sizeof(Box*)); d->vals=malloc(8*sizeof(Box*)); return box_p(d); }
 
+// NEW SYNTAX: Fixed-size list N[] — creates a list of N Null elements
+Box* make_fixed_list(long long n) {
+    if (n < 0) n = 0;
+    if (n > 1000000) n = 1000000;  // Safety limit
+    RList* l = malloc(sizeof(RList));
+    l->magic = 1;
+    l->count = n;
+    l->cap = n > 8 ? n : 8;
+    l->items = malloc(l->cap * sizeof(Box*));
+    Box* null_box = box_null();
+    for (long long i = 0; i < n; i++) {
+        l->items[i] = box_copy(null_box);
+    }
+    return box_p(l);
+}
+
+// NEW SYNTAX: Fixed-size index N[] — creates an index with keys 0..N-1, all Null values
+Box* make_fixed_index(long long n) {
+    if (n < 0) n = 0;
+    if (n > 1000000) n = 1000000;  // Safety limit
+    RDict* d = malloc(sizeof(RDict));
+    d->magic = 2;
+    d->count = n;
+    d->cap = n > 8 ? n : 8;
+    d->keys = malloc(d->cap * sizeof(Box*));
+    d->vals = malloc(d->cap * sizeof(Box*));
+    Box* null_box = box_null();
+    for (long long i = 0; i < n; i++) {
+        d->keys[i] = box_i(i);
+        d->vals[i] = box_copy(null_box);
+    }
+    return box_p(d);
+}
+
 // Recursive content equality for any Box value, including nested list/index/dict
 // collections. Per spec: "Collection equality compares contents... checked
 // recursively... identical contents are equal" regardless of insertion order
@@ -1434,6 +1468,39 @@ Box* list_concat(Box* a, Box* b) {
         }
     }
     return result;
+}
+
+// NEW SYNTAX: Clist for FFI - list to Clist (opaque handle).
+// Shared ring buffer (not per-function statics) so list_to_clist/clist_to_list
+// see the same storage, and slots are reused+freed instead of growing
+// unbounded — safe to call every iteration of a tight loop.
+#define CLIST_CAPACITY 1024
+static Box* g_clist_storage[CLIST_CAPACITY];
+static long long g_clist_next = 0;
+
+long long list_to_clist(Box* list_box) {
+    if (!list_box || list_box->type != 3) return -1;
+    RList* l = (RList*)list_box->payload.p;
+    if (!l || *(int*)l != 1) return -1;
+    long long handle = g_clist_next;
+    int slot = (int)(handle % CLIST_CAPACITY);
+    if (g_clist_storage[slot]) { box_drop(g_clist_storage[slot]); g_clist_storage[slot] = NULL; }
+    // Deep copy the list for FFI safety
+    g_clist_storage[slot] = box_deep_copy(list_box);
+    g_clist_next++;
+    return handle;
+}
+
+// NEW SYNTAX: Clist for FFI - Clist to list
+Box* clist_to_list(long long handle) {
+    if (handle < 0) return box_null();
+    // Reject stale handles whose slot has since been overwritten by a
+    // later list_to_clist() call.
+    if (handle <= g_clist_next - 1 - CLIST_CAPACITY || handle > g_clist_next - 1) return box_null();
+    Box* stored = g_clist_storage[(int)(handle % CLIST_CAPACITY)];
+    if (!stored) return box_null();
+    // Return a deep copy so the original stays in storage
+    return box_deep_copy(stored);
 }
 
 // `+` between two boxed values: merges lists (per spec's list-concat

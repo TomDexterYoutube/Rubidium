@@ -384,3 +384,108 @@ class Raise:
     runtime error (program exits after printing the message)."""
     def __init__(self, message):
         self.message = message
+
+# NEW SYNTAX AST NODES
+
+class StructDef:
+    """struct Name { field: type; ... } — plain data type, no defaults, no methods"""
+    def __init__(self, name, fields):
+        self.name = name
+        self.fields = fields  # list of (name, type)
+
+class StructField:
+    def __init__(self, name, vtype):
+        self.name = name
+        self.vtype = vtype
+
+class StructLiteral:
+    """Point { x: 1, y: 2 } — all fields required, no defaults"""
+    def __init__(self, struct_name, fields):
+        self.struct_name = struct_name
+        self.fields = fields  # list of (name, expr)
+
+class StructAccess:
+    """p.x — field access on struct instance"""
+    def __init__(self, obj, field):
+        self.obj = obj
+        self.field = field
+
+class IndexAccess:
+    """my_list[0], my_index["key"], my_nested[1]["test"] — [ ] for READ access"""
+    def __init__(self, obj, index_expr):
+        self.obj = obj
+        self.index_expr = index_expr
+
+class IndexSet:
+    """my_list[0].set(val), my_index["k"].set(v) — write via .set() after [ ] path"""
+    def __init__(self, obj, index_path, value):
+        self.obj = obj
+        self.index_path = index_path  # list of index exprs, e.g. [1, "test"]
+        self.value = value
+
+class IndexAdd:
+    """my_list.add(val), my_index.add("k", v) — .add() on bare or after [ ] path"""
+    def __init__(self, obj, index_path, args):
+        self.obj = obj
+        self.index_path = index_path  # list of index exprs (empty for bare)
+        self.args = args
+
+class IndexDrop:
+    """my_list[1].drop(), my_nested[1]["k"].drop() — remove element at path"""
+    def __init__(self, obj, index_path):
+        self.obj = obj
+        self.index_path = index_path
+
+class BareBlock:
+    """A bare { } block — creates a scope, last expr without ; becomes block value"""
+    def __init__(self, body):
+        self.body = body  # list of statements
+
+class ImplicitReturn:
+    """Marker for last line without semicolon in function/block — codegen handles"""
+    pass
+
+class FixedSizeList:
+    """N[] — fixed-size list of N Nulls"""
+    def __init__(self, size_expr):
+        self.size_expr = size_expr
+
+class FixedSizeIndex:
+    """N[] — fixed-size index with keys 0..N-1, values Null"""
+    def __init__(self, size_expr):
+        self.size_expr = size_expr
+
+class ClistCast:
+    """my_list.cast() — list -> Clist for FFI"""
+    def __init__(self, list_expr):
+        self.list_expr = list_expr
+
+class ClistPull:
+    """clist.pull() — Clist -> list from FFI"""
+    def __init__(self, clist_expr):
+        self.clist_expr = clist_expr
+
+class PubDecl:
+    """pub fn/class/struct/let — wrapper for visibility"""
+    def __init__(self, decl):
+        self.decl = decl
+
+class ImportPath:
+    """import folder::file or import folder::file::symbol"""
+    def __init__(self, path_segments, alias=None, is_local=False, specific_symbol=None):
+        self.path_segments = path_segments  # ["folder", "file"] or ["folder", "file", "symbol"]
+        self.alias = alias
+        self.is_local = is_local
+        self.specific_symbol = specific_symbol  # last segment if it's a symbol import
+
+class ImplBlock:
+    """impl StructName { fn method() { ... } } — methods on structs"""
+    def __init__(self, struct_name, methods):
+        self.struct_name = struct_name
+        self.methods = methods  # list of FnDef
+
+class StructInstantiate:
+    """Struct literal: Point { x: 1, y: 2 }"""
+    def __init__(self, struct_name, fields):
+        self.struct_name = struct_name
+        self.fields = fields  # list of (name, expr)

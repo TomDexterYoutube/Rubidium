@@ -1,30 +1,26 @@
 import re
 
 TOKEN_SPEC = [
-    # OPEN-8 root cause: hex/binary/octal literals must be matched BEFORE the
-    # decimal rules, or `0x03` lexes as NUMBER `0` + NAME `x03` and the real
-    # value is silently lost (everything hex read back as 0). Order in the
-    # alternation matters: prefixed bases first, then float, then plain int.
+    # Hex/binary/octal first (before decimal)
     ("NUMBER",   r"0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|\d+\.\d+|\d+"),
-    ("ISTRING_PLACEHOLDER", r"i\"PLACEHOLDER\""),  # placeholder — handled below
-    # BUGFIX (bugs.log #3): triple-quoted multi-line strings (used for the `str+`
-    # type) must be matched BEFORE the single-quote STRING rule below, or a
-    # `"""..."""` literal gets split into three separate STRING tokens (two
-    # empty strings plus the real content), which previously produced a NULL
-    # value at runtime and crashed. [\s\S]*? matches across newlines, non-greedy
-    # so it stops at the first closing """.
+    # str+ (triple-quoted) before single-quoted
     ("STRING3",  r'"""[\s\S]*?"""'),
+    # String (double-quoted)
     ("STRING",   r'"[^"]*"'),
-    # BUGFIX (bugs.log #2): SY type literals are written with single quotes,
-    # e.g. `let varable_name: SY = 'New varable'`. Previously unsupported —
-    # a bare `'` fell through to "Unexpected character".
+    # SY string (single-quoted)
     ("SYSTRING", r"'[^']*'"),
-    ("BOOL",     r"True|False|Null|None"),
-
+    # Bool/Null
+    ("BOOL",     r"True|False|Null"),
+    
+    # Keywords
     ("LET",      r"let\b"),
     ("MUT",      r"mut\b"),
     ("FN",       r"fn\b"),
+    ("CALLBACK", r"callback\b"),
     ("CLASS",    r"class\b"),
+    ("STRUCT",   r"struct\b"),
+    ("IMPL",     r"impl\b"),
+    ("PUB",      r"pub\b"),
     ("IF",       r"if\b"),
     ("ELSE",     r"else\b"),
     ("WHILE",    r"while\b"),
@@ -33,35 +29,31 @@ TOKEN_SPEC = [
     ("BREAK",    r"break\b"),
     ("CONTINUE", r"continue\b"),
     ("RETURN",   r"return\b"),
-    ("PRINTLN",  r"println\b"),
     ("PRINT",    r"print\b"),
+    ("PRINTLN",  r"println\b"),
     ("RANGE",    r"range\b"),
     ("TRY",      r"try\b"),
+    ("ERROR",    r"error\b"),
     ("RAISE",    r"raise\b"),
-    ("ON_ERROR", r"on_error\b"),
     ("IMPORT",   r"import\b"),
     ("XEON",     r"xeon\b"),
     ("USE",      r"use\b"),
     ("FILE",     r"\bfile\b"),
-
     ("AS",       r"as\b"),
     ("AND",      r"and\b"),
     ("OR",       r"or\b"),
     ("NOT",      r"not\b"),
-
-    ("TYPE",     r"\bstr\+|\bdict\+|\bSY\b|\b(?:i32|i64|i128|i256|i512|i1024|i2048|f32|f64|f128|str|bool|list|index|dict|Any|void)\b"),
+    ("TYPE",     r"\b(?:i32|i64|i128|i256|i512|i1024|i2048|f32|f64|f128|str|bool|list|index|Any|void|Clist|SY)\b"),
     ("LOCAL",    r"\blocal\b"),
     ("OPEN",     r"\bopen\b"),
-    # syntax: FFI CALLBACKS — `fn callback name(...) { ... }`, a soft
-    # keyword the same way local/open/file are (its own token type, matched
-    # before the generic IDENT catch-all, so it can't double as a variable
-    # or function name — but only meaningful right after `fn`, everywhere
-    # else it's simply unavailable as an identifier).
-    ("CALLBACK", r"\bcallback\b"),
-
+    ("LINK",     r"link\b"),
+    ("CAST",     r"\bcast\b"),
+    ("PULL",     r"\bpull\b"),
+    
+    # Identifier
     ("IDENT",    r"[a-zA-Z_][a-zA-Z0-9_]*"),
-
-    ("OP",       r"==|!=|<=|>=|->|=|\+|-|\*\*|\*/|\*|/|%|<|>"),
+    
+    # Punctuation
     ("LPAREN",   r"\("),
     ("RPAREN",   r"\)"),
     ("LBRACE",   r"\{"),
@@ -69,23 +61,33 @@ TOKEN_SPEC = [
     ("LBRACKET", r"\["),
     ("RBRACKET", r"\]"),
     ("COMMA",    r","),
+    ("DBL_COLON", r"::"),
     ("COLON",    r":"),
+    ("SEMICOLON", r";"),
     ("DOT",      r"\."),
-
-    ("COMMENT",  r"#[^\n]*"),
+    
+    # Comments (// to end of line) - MUST come before OP to avoid matching // as two / operators
+    ("COMMENT",  r"//[^\n]*"),
+    
+    # Operators (multi-char first)
+    ("OP",       r"==|!=|<=|>=|->|\+=|-=|\*=|/=|%=|\*\*|\*/|\+|-|\*|/|%|<|>|="),
+    
+    # Whitespace
     ("SKIP",     r"[ \t]+"),
     ("NEWLINE",  r"\n"),
+    
+    # Mismatch
     ("MISMATCH", r"."),
 ]
 
-token_regex = "|".join(f"(?P<{n}>{r})" for n, n_r in TOKEN_SPEC for n, r in [(n, n_r)] if n != "ISTRING_PLACEHOLDER")
-# Re-build without the placeholder (it was never in TOKEN_SPEC under that name)
-_REAL_SPEC = [(n, r) for n, r in TOKEN_SPEC if n != "ISTRING_PLACEHOLDER"]
+_REAL_SPEC = [(n, r) for n, r in TOKEN_SPEC]
 token_regex = "|".join(f"(?P<{n}>{r})" for n, r in _REAL_SPEC)
+
+_token_re = re.compile(token_regex)
 
 
 def _scan_istring(code, start):
-    """Scan a brace-aware i\"...\" token starting at position start (the 'i').
+    """Scan a brace-aware i"..." token starting at position start (the 'i').
     Returns (full_token_text, end_pos) or raises SyntaxError."""
     assert code[start] == 'i' and code[start+1] == '"', "Not an ISTRING"
     i = start + 2  # skip i"
@@ -117,8 +119,6 @@ def _scan_istring(code, start):
         i += 1
     raise SyntaxError("Unterminated interpolated string")
 
-
-_token_re = re.compile(token_regex)
 
 def tokenize(code):
     tokens = []
@@ -153,19 +153,10 @@ def tokenize(code):
         # BUGFIX (bugs.log OPEN-8 follow-up): 'self' inside a class method must
         # refer to the same instance-parameter name codegen registers
         # (method params are prepended with ("__self", class_name), and
-        # _emit_class_method registers self.instances["__self"] = class_name).
-        # The parser has no special-casing for the word "self" at all — it's
-        # just tokenized as an ordinary IDENT — so every Var/FieldAccess/
-        # FieldAssign/MethodCall built from a literal "self" reference never
-        # matched "__self" in codegen's instance-name lookups: reads raised
-        # "'self' is not an instance" and writes (self.field = value) were
-        # silently dropped as a no-op. Canonicalizing at the token level fixes
-        # every one of those call sites at once, instead of patching each
-        # spot in the parser/codegen individually.
-        if kind == "IDENT" and value == "self":
-            value = "__self"
+        if kind == "IDENT":
+            tokens.append((kind, value, line_no))
+        else:
+            tokens.append((kind, value, line_no))
 
-        tokens.append((kind, value, line_no))
-        if kind == "STRING3":
-            line_no += value.count("\n")
+    tokens.append(("EOF", "", line_no))
     return tokens

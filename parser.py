@@ -29,8 +29,9 @@ class Parser:
         # everything else in sy_names goes through the new dynamic path.
         self.sy_fn_names = set()
 
-    def peek(self):
-        return self.tokens[self.pos] if self.pos < len(self.tokens) else None
+    def peek(self, offset=0):
+        idx = self.pos + offset
+        return self.tokens[idx] if idx < len(self.tokens) else None
 
     def advance(self):
         if self.pos < len(self.tokens):
@@ -156,14 +157,22 @@ class Parser:
 
     def parse(self):
         stmts = []
-        while self.peek():
+        while self.peek() and self.peek()[0] != "EOF":
             t = self.peek()
-            if   t[0] == "IMPORT": stmts.append(self.import_stmt())
-            elif t[0] == "XEON":   stmts.append(self.import_stmt(is_xeon_pkg=True))
-            elif t[0] == "USE":    stmts.append(self.use_stmt())
-            elif t[0] == "CLASS":  stmts.append(self.class_def())
-            elif t[0] == "FN":     stmts.append(self.fn_def())
-            else:                  stmts += self.stmt_list_item()
+            stmt = None
+            if   t[0] == "IMPORT": stmt = self.import_stmt()
+            elif t[0] == "XEON":   stmt = self.import_stmt(is_xeon_pkg=True)
+            elif t[0] == "USE":    stmt = self.use_stmt()
+            elif t[0] == "CLASS":  stmt = self.class_def()
+            elif t[0] == "FN":     stmt = self.fn_def()
+            else:
+                stmt = self.stmt_list_item()
+            
+            if stmt:
+                stmts += stmt if isinstance(stmt, list) else [stmt]
+            # Consume optional semicolon after statement
+            if self.peek() and self.peek()[0] == "SEMICOLON":
+                self.match("SEMICOLON")
         return stmts
 
     # --- Unified Identifier Logic ---
@@ -186,6 +195,36 @@ class Parser:
                 else:
                     # Field access: DOT IDENT
                     res = FieldAccess(res, attr)
+            elif self.peek()[0] == "LBRACKET":
+                # Collection READ access: my_list[0], my_index["key"], my_nested[1]["test"]
+                index_path = self._parse_index_path()
+                # Check for .set()/.add()/.drop() after the [ ] path for WRITE
+                if self.peek() and self.peek()[0] == "DOT":
+                    self.match("DOT")
+                    method = self.match_attr()
+                    if method == "set" and self.peek() and self.peek()[0] == "LPAREN":
+                        self.match("LPAREN")
+                        value = self.expr()
+                        self.match("RPAREN")
+                        res = IndexSet(res, index_path, value)
+                    elif method == "add" and self.peek() and self.peek()[0] == "LPAREN":
+                        self.match("LPAREN")
+                        args = []
+                        while self.peek() and self.peek()[0] != "RPAREN":
+                            args.append(self._call_arg())
+                            if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
+                        self.match("RPAREN")
+                        res = IndexAdd(res, index_path, args)
+                    elif method == "drop" and self.peek() and self.peek()[0] == "LPAREN":
+                        self.match("LPAREN")
+                        self.match("RPAREN")
+                        res = IndexDrop(res, index_path)
+                    else:
+                        raise SyntaxError(f"Unknown collection method after [ ]: {method}")
+                else:
+                    # Just READ access - build nested IndexAccess for chained [ ]
+                    for idx in index_path:
+                        res = IndexAccess(res, idx)
             elif self.peek()[0] == "LPAREN":
                 # Call: LPAREN args RPAREN
                 self.match("LPAREN")
@@ -223,9 +262,9 @@ class Parser:
         if not is_xeon_pkg and self.peek() and self.peek()[0] == "LOCAL":
             self.match("LOCAL")
             is_local = True
-        # For xeon packages, allow hyphens in package names (e.g. config-wiz)
+        
+        # For xeon packages, allow hyphens in package names
         if is_xeon_pkg:
-            # Build package name allowing hyphens
             parts = [self.match("IDENT")]
             while self.peek() and self.peek()[0] in ("DOT", "OP"):
                 op = self.match(self.peek()[0])
@@ -235,14 +274,41 @@ class Parser:
                     parts.append(op + self.match("IDENT"))
             name = "".join(parts)
         else:
-            name = self.match("IDENT")
-            while self.peek() and self.peek()[0] == "DOT":
-                self.match("DOT")
-                name += "." + self.match("IDENT")
+            # Check for path imports: import folder::file or import folder::file::symbol
+            path_segments = [self.match("IDENT") or self.match("FILE")]
+            specific_symbol = None
+            while self.peek() and self.peek()[0] == "DBL_COLON":
+                self.match("DBL_COLON")
+                seg = self.match("IDENT") or self.match("FILE")
+                if seg is None:
+                    raise SyntaxError(f"Line {self.line_no}: expected identifier after '::'")
+                path_segments.append(seg)
+            
+            # If there's a trailing ::symbol, it's a specific symbol import
+            if self.peek() and self.peek()[0] == "DBL_COLON":
+                self.match("DBL_COLON")
+                specific_symbol = self.match("IDENT")
+            
+            # Build namespace name (just the filename, not the full path)
+            namespace = path_segments[-1] if path_segments else ""
+            full_path = "::".join(path_segments)
+            
+            # For now, keep using the full path as module_name, codegen will handle
+            name = full_path
+        
         alias = None
         if self.peek() and self.peek()[0] == "AS":
             self.match("AS")
             alias = self.match("IDENT")
+        
+        # Check if this is a path import with specific symbol
+        if "::" in name and not is_xeon_pkg:
+            return ImportPath(
+                path_segments=path_segments if not is_xeon_pkg else [name],
+                alias=alias,
+                is_local=is_local,
+                specific_symbol=specific_symbol
+            )
         return Import(name, alias=alias, is_xeon_pkg=is_xeon_pkg, is_local=is_local)
 
     def use_stmt(self):
@@ -294,6 +360,63 @@ class Parser:
             else: self.advance()
         self.match("RBRACE")
         return ClassDef(name, fields, methods)
+
+    def struct_def(self):
+        """Parse: struct Name { field: type; ... }"""
+        self.match("STRUCT")
+        name = self.match("IDENT")
+        self.match("LBRACE")
+        fields = []
+        while self.peek() and self.peek()[0] != "RBRACE":
+            if self.peek()[0] == "IDENT":
+                fname = self.match("IDENT")
+                self.match("COLON")
+                ftype = self.match("TYPE") or self.match("IDENT")
+                self.match("SEMICOLON")
+                fields.append(StructField(fname, ftype))
+            else:
+                self.advance()  # skip unknown
+        self.match("RBRACE")
+        return StructDef(name, fields)
+
+    def impl_block(self):
+        """Parse: impl StructName { fn method() { ... } }"""
+        self.match("IMPL")
+        struct_name = self.match("IDENT")
+        self.match("LBRACE")
+        methods = []
+        while self.peek() and self.peek()[0] != "RBRACE":
+            if self.peek()[0] == "FN":
+                methods.append(self.fn_def())
+            else:
+                self.advance()
+        self.match("RBRACE")
+        return ImplBlock(struct_name, methods)
+
+    def pub_decl(self):
+        """Parse: pub fn/class/struct/let ..."""
+        self.match("PUB")
+        t = self.peek()
+        if t[0] == "FN":
+            decl = self.fn_def()
+        elif t[0] == "CLASS":
+            decl = self.class_def()
+        elif t[0] == "STRUCT":
+            decl = self.struct_def()
+        elif t[0] == "LET":
+            decl = self.var_decl()
+        else:
+            raise SyntaxError(f"Line {self.line_no}: 'pub' must be followed by fn, class, struct, or let")
+        return PubDecl(decl)
+
+    def bare_block(self):
+        """Parse: { statements } — bare block creates scope, last expr without ; is value"""
+        self.match("LBRACE")
+        body = []
+        while self.peek() and self.peek()[0] != "RBRACE":
+            body += self.stmt_list_item()
+        self.match("RBRACE")
+        return BareBlock(body)
 
     def fn_def(self):
         self.match("FN")
@@ -479,7 +602,12 @@ class Parser:
     def block(self):
         stmts = []
         while self.peek() and self.peek()[0] != "RBRACE":
-            stmts += self.stmt_list_item()
+            stmt = self.stmt_list_item()
+            if stmt:
+                stmts += stmt if isinstance(stmt, list) else [stmt]
+            # Consume optional semicolon after statement
+            if self.peek() and self.peek()[0] == "SEMICOLON":
+                self.match("SEMICOLON")
         return stmts
 
     def stmt_list_item(self):
@@ -490,6 +618,9 @@ class Parser:
         elif t[0] == "XEON":    return [self.import_stmt(is_xeon_pkg=True)]
         elif t[0] == "USE":     return [self.use_stmt()]
         elif t[0] == "LET":     return [self.var_decl()]
+        elif t[0] == "STRUCT":  return [self.struct_def()]
+        elif t[0] == "IMPL":    return [self.impl_block()]
+        elif t[0] == "PUB":     return [self.pub_decl()]
         elif t[0] == "PRINT":   return [self.print_stmt()]
         elif t[0] == "PRINTLN": return [self.println_stmt()]
         elif t[0] == "IF":      return [self.if_stmt()]
@@ -523,6 +654,9 @@ class Parser:
             # token, skip one and continue" branch below, one token at a time
             # — the call was never actually parsed or emitted.
             return [self.expr()]
+        elif t[0] == "LBRACE":
+            # Bare block { } - creates a scope, last expr without ; becomes block value
+            return [self.bare_block()]
         else:
             # BUGFIX: this used to silently `self.advance(); return []` for
             # any token that doesn't start a known statement — meaning a
@@ -735,7 +869,18 @@ class Parser:
         self.expect("LBRACE", "'{' to open the try body"); try_body = self.block(); self.expect("RBRACE", "'}' to close the try body")
         # Accept both `error` (as IDENT) and `on_error` as the catch keyword
         tok = self.peek()
-        if tok and tok[0] == "ON_ERROR":
+        # Accept `error` (its own lexer token kind — see lexer.py's
+        # `("ERROR", r"error\b")`), `on_error`, and (defensively) an IDENT
+        # literally named "error" as the catch keyword.
+        # BUGFIX: `error` is tokenized as a dedicated ERROR token, never an
+        # IDENT whose value happens to be "error" — the old check here only
+        # accepted ON_ERROR or IDENT-valued-"error", so a real ERROR token
+        # (i.e. every actual `try { } error { }` in the language, exactly
+        # as shown in `syntax`) fell through to the final `else` and raised
+        # "expected 'error' block after 'try'" on every single use.
+        if tok and tok[0] == "ERROR":
+            self.match("ERROR")
+        elif tok and tok[0] == "ON_ERROR":
             self.match("ON_ERROR")
         elif tok and tok[0] == "IDENT" and tok[1] == "error":
             self.advance()  # consume `error`
@@ -1050,12 +1195,36 @@ class Parser:
         if tok is None:
             raise SyntaxError(f"Line {self.line_no}: expected an expression, got end of input")
 
+        # BUGFIX: `error` (the implicit variable holding the caught error
+        # message inside a `try { } error { }` block — see codegen.py's
+        # `self.declare_global("error", "i8*")`) is tokenized as its own
+        # dedicated ERROR token (lexer.py's `("ERROR", r"error\b")`), never
+        # as an IDENT whose value happens to be "error". Every existing
+        # identifier-handling path below keys off `tok[0] == "IDENT"`, so
+        # referencing `error` as an expression (`print("caught: " + error)`
+        # — the exact pattern `syntax`'s own ERROR HANDLING example uses)
+        # always failed with "expected an expression, got ERROR 'error'".
+        # Rewriting the token to a plain IDENT here lets it fall straight
+        # into the normal Var/method-call/field-access machinery below,
+        # rather than duplicating that logic for one special-cased name.
+        if tok[0] == "ERROR":
+            tok = ("IDENT", "error") + tuple(tok[2:])
+            self.tokens[self.pos] = tok
+
         # The Link Rule: `link expr` — pass-by-reference marker, valid
         # anywhere an expression is (in practice, only meaningful as a
         # function-call argument). Handled here (not in every individual
         # call-argument loop) since "link" isn't otherwise a valid term.
-        if tok[0] == "IDENT" and tok[1] == "link":
-            self.match("IDENT")
+        #
+        # BUGFIX: the lexer tokenizes `link` as a dedicated LINK token kind
+        # (see lexer.py's `("LINK", r"link\b")`), never as an IDENT whose
+        # value happens to be "link" — so the old check here
+        # (`tok[0] == "IDENT" and tok[1] == "link"`) could never match,
+        # making this branch permanently dead code. Every documented use of
+        # `link` as a call argument (`stuff(link large_list)`) failed to
+        # parse at all ("expected an expression, got LINK 'link'").
+        if tok[0] == "LINK":
+            self.match("LINK")
             return LinkArg(self.factor())
 
         # Handle square root operator (unary) - must be checked BEFORE general OP handling
@@ -1098,22 +1267,54 @@ class Parser:
             if self.peek() and self.peek()[0] == "RBRACE":
                 self.advance()
                 return DictExpr([])
-            pairs = []
-            while self.peek() and self.peek()[0] != "RBRACE":
-                k = self.expr()
-                # Match either OP (=) or COLON (:) as key-value separator
-                if self.peek() and self.peek()[0] in ("OP", "COLON"):
-                    self.advance()
-                else:
-                    raise SyntaxError("Expected '=' or ':' in dict literal")
+            # Try to parse as index literal first: { key: value, ... }
+            # Peek at the first expression and check if it's followed by COLON
+            saved_pos = self.pos
+            first_expr = self.expr()
+            if self.peek() and self.peek()[0] == "COLON":
+                # It's an index literal: { key: value, ... }
+                self.match("COLON")
                 v = self.expr()
-                pairs.append((k, v))
-                if self.peek() and self.peek()[0] == "COMMA":
+                pairs = [(first_expr, v)]
+                while self.peek() and self.peek()[0] == "COMMA":
                     self.match("COMMA")
-            self.match("RBRACE")
-            return DictExpr(pairs)
-
+                    if self.peek() and self.peek()[0] == "RBRACE": break
+                    k = self.expr()
+                    if self.peek() and self.peek()[0] == "COLON":
+                        self.match("COLON")
+                    else:
+                        raise SyntaxError("Expected ':' in index literal (syntax: { key: value })")
+                    v = self.expr()
+                    pairs.append((k, v))
+                self.match("RBRACE")
+                return DictExpr(pairs, is_index=True)
+            else:
+                # Bare block: { expr } or { stmt; ... expr }
+                # The first expression we parsed is the block's value (for simple case)
+                # Expect closing brace
+                self.match("RBRACE")
+                return BareBlock([first_expr])
+        
+# Fixed-size collections: N[]
         if tok[0] == "NUMBER":
+            # Look ahead to see if next token is LBRACKET (N[] syntax)
+            next_tok = self.tokens[self.pos + 1] if self.pos + 1 < len(self.tokens) else None
+            if next_tok and next_tok[0] == "LBRACKET":
+                # Check if it's N[] (fixed-size)
+                saved = self.pos
+                size_val = tok[1]
+                self.advance()
+                if self.peek() and self.peek()[0] == "LBRACKET":
+                    self.match("LBRACKET")
+                    if self.peek() and self.peek()[0] == "RBRACKET":
+                        self.match("RBRACKET")
+                        # Determine if it's list or index based on context/type annotation
+                        # For now, default to list; type checking will handle it
+                        return FixedSizeList(Number(int(size_val)))
+                # Not N[], restore position
+                self.pos = saved
+            
+            # Regular number literal
             self.advance()
             # OPEN-5: preserve the raw literal text for floats so codegen can
             # emit it directly at fp128 precision when it has more
@@ -1262,19 +1463,26 @@ class Parser:
             self.advance()
             var_name = tok[1]
             res = Var(var_name, line=self.line_no)
-            while self.peek() and self.peek()[0] == "DOT":
-                self.match("DOT")
-                attr = self.match_attr()
-                if self.peek() and self.peek()[0] == "LPAREN":
-                    self.match("LPAREN")
-                    args = []
-                    while self.peek() and self.peek()[0] != "RPAREN":
-                        args.append(self._call_arg())
-                        if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
-                    self.match("RPAREN")
-                    res = MethodCall(res, attr, args)
+            while self.peek():
+                if self.peek()[0] == "DOT":
+                    self.match("DOT")
+                    attr = self.match_attr()
+                    if self.peek() and self.peek()[0] == "LPAREN":
+                        self.match("LPAREN")
+                        args = []
+                        while self.peek() and self.peek()[0] != "RPAREN":
+                            args.append(self._call_arg())
+                            if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
+                        self.match("RPAREN")
+                        res = MethodCall(res, attr, args)
+                    else:
+                        res = FieldAccess(res, attr)
+                elif self.peek()[0] == "LBRACKET":
+                    index_path = self._parse_index_path()
+                    for idx in index_path:
+                        res = IndexAccess(res, idx)
                 else:
-                    res = FieldAccess(res, attr)
+                    break
             return res
         # FILE token used as file utility in expression context (e.g. let x = file.exists("f"))
         if tok[0] == "FILE":
@@ -1300,6 +1508,10 @@ class Parser:
                         res = MethodCall(res, attr, args)
                     else:
                         res = FieldAccess(res, attr)
+                elif self.peek()[0] == "LBRACKET":
+                    index_path = self._parse_index_path()
+                    for idx in index_path:
+                        res = IndexAccess(res, idx)
                 elif self.peek()[0] == "LPAREN":
                     self.match("LPAREN")
                     args = []
@@ -1335,6 +1547,10 @@ class Parser:
                         res = MethodCall(res, attr, args)
                     else:
                         res = FieldAccess(res, attr)
+                elif self.peek()[0] == "LBRACKET":
+                    index_path = self._parse_index_path()
+                    for idx in index_path:
+                        res = IndexAccess(res, idx)
                 elif self.peek()[0] == "LPAREN":
                     # TYPE as variable name followed by call - treat as FnCall for collection access
                     self.match("LPAREN")
@@ -1352,6 +1568,7 @@ class Parser:
                     break
             return res
 
+        # IDENT tokens (variable names, function names, struct names, etc.)
         if tok[0] == "IDENT":
             self.advance()
             name = tok[1]
@@ -1405,6 +1622,68 @@ class Parser:
                         res = MethodCall(res, attr, args)
                     else:
                         res = FieldAccess(res, attr)
+                elif self.peek()[0] == "LBRACKET":
+                    # Collection READ access: my_list[0], my_index["key"], my_nested[1]["test"]
+                    index_path = self._parse_index_path()
+                    # Check for .set()/.add()/.drop() after the [ ] path for WRITE
+                    if self.peek() and self.peek()[0] == "DOT":
+                        self.match("DOT")
+                        method = self.match_attr()
+                        if method == "set" and self.peek() and self.peek()[0] == "LPAREN":
+                            self.match("LPAREN")
+                            value = self.expr()
+                            self.match("RPAREN")
+                            res = IndexSet(res, index_path, value)
+                        elif method == "add" and self.peek() and self.peek()[0] == "LPAREN":
+                            self.match("LPAREN")
+                            args = []
+                            while self.peek() and self.peek()[0] != "RPAREN":
+                                args.append(self._call_arg())
+                                if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
+                            self.match("RPAREN")
+                            res = IndexAdd(res, index_path, args)
+                        elif method == "drop" and self.peek() and self.peek()[0] == "LPAREN":
+                            self.match("LPAREN")
+                            self.match("RPAREN")
+                            res = IndexDrop(res, index_path)
+                        else:
+                            raise SyntaxError(f"Unknown collection method after [ ]: {method}")
+                    else:
+                        # Just READ access - build nested IndexAccess for chained [ ]
+                        for idx in index_path:
+                            res = IndexAccess(res, idx)
+                elif self.peek()[0] == "LBRACE":
+                    # Struct literal: Point { x: 1, y: 2 }
+                    # Only if res is a bare Var (type name) AND the brace is
+                    # actually followed by a `field:` pattern — otherwise this
+                    # LBRACE belongs to the caller (e.g. `if flag { ... }`,
+                    # `while running { ... }`, `for x in items { ... }` all
+                    # have a bare Var immediately followed by a block '{',
+                    # which used to be swallowed here as a bogus struct
+                    # literal attempt, breaking every such statement whenever
+                    # the condition/iterable was a plain variable).
+                    is_struct_literal = (
+                        isinstance(res, Var)
+                        and self.peek(1) is not None
+                        and self.peek(1)[0] == "IDENT"
+                        and self.peek(2) is not None
+                        and self.peek(2)[0] == "COLON"
+                    )
+                    if is_struct_literal:
+                        struct_name = res.name
+                        self.match("LBRACE")
+                        fields = []
+                        while self.peek() and self.peek()[0] != "RBRACE":
+                            fname = self.match("IDENT")
+                            self.match("COLON")
+                            fvalue = self.expr()
+                            fields.append((fname, fvalue))
+                            if self.peek() and self.peek()[0] == "COMMA":
+                                self.match("COMMA")
+                        self.match("RBRACE")
+                        res = StructInstantiate(struct_name, fields)
+                    else:
+                        break
                 elif self.peek()[0] == "LPAREN":
                     self.match("LPAREN")
                     args = []
@@ -1422,12 +1701,17 @@ class Parser:
                             # `(tmp)` parens on this later access — the
                             # pattern real code actually uses) must also
                             # route through the dynamic runtime lookup, not
-                            # be treated as calling a literal function/
-                            # collection named "tmp" (which doesn't exist).
+                            # the static symbol table. Matches `fn tmp()` /
+                            # `(tmp)()` duality where the parens distinguish
+                            # declaration from use.
                             res = FnCall(DynResolve(res.name), args)
                         else: res = FnCall(res.name, args)
                     else:
                         res = FnCall(res, args)
+                    # Continue loop to allow method chaining on collection access
+                    if self.peek() and self.peek()[0] == "DOT":
+                        continue
+                    break
                 else:
                     break
             return res
@@ -1444,6 +1728,17 @@ class Parser:
         # `input(0)` instead of erroring on the bare `/`.
         bad = self.peek()
         raise SyntaxError(f"Line {self.line_no}: expected an expression, got {bad[0]} {bad[1]!r}")
+
+    def _parse_index_path(self):
+        """Parse chained [ ] access: my_list[0], my_index["key"], my_nested[1]["test"]
+        Returns a list of index expressions for the full path."""
+        path = []
+        while self.peek() and self.peek()[0] == "LBRACKET":
+            self.match("LBRACKET")
+            idx = self.expr()
+            self.match("RBRACKET")
+            path.append(idx)
+        return path
 
     def _parse_istring_parts(self, raw):
         """Parse an i"..." string body into an InterpolatedStr node.

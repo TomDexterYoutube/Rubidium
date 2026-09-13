@@ -39,6 +39,8 @@ declare void @list_append_raw(%Box*, %Box*)
 declare void @list_swap(%Box*, i32, i32)
 declare %Box* @make_dict()
 declare %Box* @make_dictplus()
+declare %Box* @make_fixed_list(i64)
+declare %Box* @make_fixed_index(i64)
 declare void @dict_set(%Box*, %Box*, %Box*)
 declare i32 @dict_has_key(%Box*, %Box*)
 declare %Box* @collection_get(%Box*, %Box*)
@@ -219,6 +221,7 @@ class CodeGen:
         self.class_defs   = {}
         self.class_ids    = {}  # bugs.log OPEN-9: class_name -> stable int id for runtime dispatch
         self.instances    = {}
+        self.struct_instances = {}  # NEW SYNTAX: track struct instances for field access
         # bugs.log #12: see _gather_vardecl_types — pre-scan-only instance
         # tracking, kept separate from self.instances (see that comment).
         self._prescan_instances = {}
@@ -589,6 +592,9 @@ class CodeGen:
         if t == "str+":  return "i8*"  # bugs.log #3: str+ (big/multi-line string) uses the same representation as str
         if t in self._INT_IR:  return self._INT_IR[t]
         if t in self._FLT_IR:  return self._FLT_IR[t]
+        # NEW SYNTAX: Struct types
+        if hasattr(self, 'struct_defs') and t in self.struct_defs:
+            return f"%struct_{t}*"
         # Fallback: already an IR type (e.g. "i64" from internal use)
         if t in self._TYPE_RANK: return t
         return "i64"
@@ -878,6 +884,9 @@ class CodeGen:
         NAME to check."""
         if isinstance(value_node, ClassInstantiate):
             return value_node.class_name
+        # NEW SYNTAX: Struct literal
+        if isinstance(value_node, StructInstantiate):
+            return value_node.struct_name
         if isinstance(value_node, FnCall) and isinstance(value_node.name, str):
             return value_node.name
         if isinstance(value_node, MethodCall) and isinstance(value_node.obj, Var):
@@ -899,6 +908,32 @@ class CodeGen:
         if not field_types_str: field_types_str = "i8"
         self.global_decls.append(f"%class_{cls.name} = type {{ {field_types_str} }}")
 
+    # NEW SYNTAX: Emit struct type definition
+    def emit_struct_type(self, struct_def):
+        field_types = []
+        for f in struct_def.fields:
+            ir_t = self.rubi_type_to_ir(f.vtype) if f.vtype else self._infer_type(Str(f.vtype))
+            field_types.append(ir_t)
+        field_types_str = ", ".join(field_types)
+        if not field_types_str: field_types_str = "i8"
+        self.global_decls.append(f"%struct_{struct_def.name} = type {{ {field_types_str} }}")
+        
+        # Collect struct constructor definition for later emission
+        # NOTE: Do NOT emit a 'declare' - in LLVM IR, a function defined in this module
+        # should only have 'define', not 'declare'. 'declare' is for external functions.
+        if not hasattr(self, 'struct_constructors'):
+            self.struct_constructors = []
+        struct_t = self.struct_ir_type(struct_def.name)
+        self.struct_constructors.append((
+            f"define {struct_t}* @_{struct_def.name}_new() {{",
+            f"  %size = getelementptr {struct_t}, {struct_t}* null, i64 1",
+            f"  %size_i = ptrtoint {struct_t}* %size to i64",
+            f"  %raw = call i8* @malloc(i64 %size_i)",
+            f"  %ptr = bitcast i8* %raw to {struct_t}*",
+            f"  ret {struct_t}* %ptr",
+            "}"
+        ))
+
     def field_index(self, class_name, field_name):
         cls = self.class_defs[class_name]
         for i, f in enumerate(cls.fields):
@@ -906,6 +941,25 @@ class CodeGen:
                 ir_t = self.rubi_type_to_ir(f.vtype) if f.vtype else self._infer_type(f.value)
                 return i, ir_t
         raise RubidiumNameError(f"Class '{class_name}' has no field '{field_name}'")
+
+    # NEW SYNTAX: Struct type helpers
+    def struct_ir_type(self, struct_name):
+        return f"%struct_{struct_name}"
+    
+    def struct_field_index(self, struct_name, field_name):
+        # StructDef should be in class_defs or we need a separate struct_defs
+        # For now, check class_defs as structs might be registered there
+        if struct_name in self.class_defs:
+            cls = self.class_defs[struct_name]
+        elif hasattr(self, 'struct_defs') and struct_name in self.struct_defs:
+            cls = self.struct_defs[struct_name]
+        else:
+            raise RubidiumNameError(f"Struct '{struct_name}' not found")
+        for i, f in enumerate(cls.fields):
+            if f.name == field_name:
+                ir_t = self.rubi_type_to_ir(f.vtype) if f.vtype else self._infer_type(f.value)
+                return i, ir_t
+        raise RubidiumNameError(f"Struct '{struct_name}' has no field '{field_name}'")
 
     def method_ir_name(self, class_name, method_name):
         return f"{class_name}__{method_name}"
@@ -1005,6 +1059,19 @@ class CodeGen:
                     self._fn_symbol_override[original_name] = safe_name
                     s.name = safe_name
                 self.functions[original_name] = s
+            elif isinstance(s, PubDecl):
+                # PubDecl wraps a declaration (FnDef, ClassDef, StructDef, VarDecl)
+                # For functions, register the inner function as public
+                if isinstance(s.decl, FnDef):
+                    original_name = s.decl.name
+                    if original_name in self.functions:
+                        raise RubidiumNameError(f"Duplicate function definition: '{original_name}'")
+                    safe_name = self._safe_fn_symbol(original_name)
+                    if safe_name != original_name:
+                        self._fn_symbol_override[original_name] = safe_name
+                        s.decl.name = safe_name
+                    self.functions[original_name] = s.decl
+                # For other declarations, they'll be handled in emit_stmt
 
         self._register_implicit_class_fields()
         # Initialize local_vars_stack for _collect_global which uses it for global vars
@@ -1039,6 +1106,8 @@ class CodeGen:
             "declare i8* @strndup(i8*, i64)", "declare i32 @fclose(i8*)",
             "declare i8* @list_combine(%Box*)",
             "declare %Box* @box_deep_copy(%Box*)",
+            "declare i64 @list_to_clist(%Box*)",
+            "declare %Box* @clist_to_list(i64)",
             "declare i8* @fopen(i8*, i8*)", "declare i64 @fread(i8*, i64, i64, i8*)",
             "declare i64 @fwrite(i8*, i64, i64, i8*)", "declare i64 @fseek(i8*, i64, i32)",
             "declare i64 @ftell(i8*)", "declare void @rewind(i8*)",
@@ -1067,7 +1136,7 @@ class CodeGen:
             "  ret void", "}", ""
         ]
         
-        top_init = [s for s in stmts if not isinstance(s, (FnDef, ClassDef, Import, Use, FFIBind))]
+        top_init = [s for s in stmts if not isinstance(s, (FnDef, ClassDef, Import, Use, FFIBind, ImplBlock))]
         self.cur_fn = None
         self.local_vars_stack = [{}]  # Stack of scopes, each scope is a dict of variable names to types
         self.emit_fn(FnDef("_rubidium_init", [], None, top_init))
@@ -1087,6 +1156,11 @@ class CodeGen:
             self._emit_global_ctor_init()
         else:
             self._inject_init_call()
+
+        # Emit struct constructors
+        if hasattr(self, 'struct_constructors'):
+            for constructor in self.struct_constructors:
+                self.fn_lines += list(constructor) + [""]
 
         out = ["; Rubidium compiled output", 'source_filename = "rubidium"', ""]
         out += self.global_decls + [""] + self.fn_lines
@@ -1519,6 +1593,17 @@ class CodeGen:
         if isinstance(node, InterpolatedStr): return "i8*"
         if isinstance(node, (ListExpr, DictExpr)): return "%Box*"
         if isinstance(node, Input): return "i8*"
+        if isinstance(node, ClassInstantiate):
+            return f"{self.class_ir_type(node.class_name)}*"
+        # NEW SYNTAX: Struct literal — must be handled before the MethodCall
+        # branch below, which unconditionally assumes `node.obj` exists.
+        # StructInstantiate has no `.obj` (it has `.struct_name`/`.fields`),
+        # so without this early case a `let` with no explicit type whose
+        # value is a struct literal (`let pt = Point { x: 1, y: 2 };`) fell
+        # through into the MethodCall tail logic and crashed with
+        # "'StructInstantiate' object has no attribute 'obj'".
+        if isinstance(node, StructInstantiate):
+            return f"{self.struct_ir_type(node.struct_name)}*"
         if isinstance(node, FileHandleStmt):
             if node.method in ("read", "readln"): return "i8*"
             return "i64"
@@ -1637,6 +1722,36 @@ class CodeGen:
             if self._ns_global_name(node) is not None:
                 return "%Box*"
 
+            # NEW SYNTAX: .cast() and .pull() for Clist FFI
+            if node.method == "cast" and isinstance(node.obj, Var):
+                # list.cast() -> Clist (i64 handle)
+                return "i64"
+            if node.method == "pull" and isinstance(node.obj, Var):
+                # clist.pull() -> list (%Box*)
+                return "%Box*"
+
+            # BUGFIX: this struct-instance-method-call check used to be a
+            # SEPARATE, unguarded `if` sitting AFTER this function's
+            # `isinstance(node, MethodCall)` block ended (not nested inside
+            # it) — so it ran unconditionally for every node type reaching
+            # this point in the function, blindly reading `node.obj`/
+            # `obj_name` (only defined above, inside the MethodCall branch).
+            # Any node without an `.obj` attribute (Var, StructInstantiate,
+            # ClassInstantiate, ...) crashed with a raw Python
+            # AttributeError instead of being handled by ITS OWN case
+            # further down this function (e.g. the plain `Var` case that
+            # already existed near the bottom). Moved inside the MethodCall
+            # branch, before the final "cannot infer" raise, where
+            # obj_name/node.obj are actually valid.
+            # NEW SYNTAX: Struct instance method calls (impl blocks)
+            if isinstance(node.obj, Var) and obj_name in self.struct_instances:
+                struct_name = self.struct_instances[obj_name]
+                if hasattr(self, 'impl_methods') and struct_name in self.impl_methods:
+                    impl_methods = self.impl_methods[struct_name]
+                    if node.method in impl_methods:
+                        fn_obj = self.impl_methods[struct_name][node.method]
+                        return self.rubi_type_to_ir(fn_obj.ret_type) if fn_obj.ret_type else "i64"
+
             raise RubidiumNameError(f"Cannot infer type for method call '{node.method}' on object '{obj_name}'")
 
         if isinstance(node, OsRun):
@@ -1697,6 +1812,9 @@ class CodeGen:
             return self._infer_type(node.value)
         if isinstance(node, TypeCast): return self.rubi_type_to_ir(node.target_type)
         if isinstance(node, MathBlock): return self.rubi_type_to_ir(node.vtype)
+        # NEW SYNTAX: Fixed-size collections N[]
+        if isinstance(node, (FixedSizeList, FixedSizeIndex)):
+            return "%Box*"
         if isinstance(node, Var):
             # Look for variable in the innermost scope first
             for scope in reversed(self.local_vars_stack):
@@ -1812,6 +1930,7 @@ class CodeGen:
             if node.is_local:
                 return
             cn = None
+            sn = None  # struct name
             if isinstance(node.value, ClassInstantiate):
                 cn = node.value.class_name
             elif isinstance(node.value, FnCall) and node.value.name in self.class_defs:
@@ -1822,6 +1941,9 @@ class CodeGen:
                 candidate = self._class_instantiate_candidate(node.value)
                 if candidate and candidate in self.class_defs:
                     cn = candidate
+            # NEW SYNTAX: Struct literal
+            elif isinstance(node.value, StructInstantiate):
+                sn = node.value.struct_name
             
             if cn:
                 ir_t = f"{self.class_ir_type(cn)}*"
@@ -1830,6 +1952,12 @@ class CodeGen:
                     ir_t = "%Box*"
                 self.declare_global(node.name, ir_t)
                 self.instances[node.name] = cn
+            elif sn:
+                ir_t = f"{self.struct_ir_type(sn)}*"
+                if node.name in getattr(self, "_polymorphic_globals", ()):
+                    ir_t = "%Box*"
+                self.declare_global(node.name, ir_t)
+                self.struct_instances[node.name] = sn
             else:
                 ir_t = self.rubi_type_to_ir(node.vtype) if node.vtype else self._infer_type(node.value)
                 # BUGFIX (bugs.log OPEN-10): this branch handles GLOBAL-pool
@@ -2768,7 +2896,7 @@ class CodeGen:
             # unconditional `return False` below, so the statement was
             # SILENTLY DROPPED — not "read and discard the result", the
             # actual @_rubidium_input_line() call never happened AT ALL.
-            # Confirmed: a real game's `input("Enter to finish Turn")` /
+            # Confirmed: a real game's `input("Press Enter to finish Turn")` /
             # input("Enter to start turn") calls between turns never
             # printed their prompt and never blocked — the program just
             # silently sailed straight through to the next turn's logic
@@ -2776,6 +2904,48 @@ class CodeGen:
             # like "extra things happening from a single keypress" even
             # though nothing was actually reading input there at all.
             self.emit_expr(node)
+        # NEW SYNTAX: Struct definition
+        elif isinstance(node, StructDef):
+            # Register struct definition for type checking and codegen
+            if not hasattr(self, 'struct_defs'):
+                self.struct_defs = {}
+            self.struct_defs[node.name] = node
+            # Emit struct type definition (similar to class)
+            self.emit_struct_type(node)
+        # NEW SYNTAX: Impl block
+        elif isinstance(node, ImplBlock):
+            # Register impl methods for struct method call dispatch
+            if not hasattr(self, 'impl_methods'):
+                self.impl_methods = {}
+            if node.struct_name not in self.impl_methods:
+                self.impl_methods[node.struct_name] = {}
+            for method in node.methods:
+                # Register the method for dispatch
+                self.impl_methods[node.struct_name][method.name] = method
+                # Emit the method as a function with mangled name (StructName__MethodName)
+                mangled_name = self.method_ir_name(node.struct_name, method.name)
+                original_name = method.name
+                method.name = self.method_ir_name(node.struct_name, method.name)
+                # Register in functions dict for call sites
+                self.functions[method.name] = method
+                # Fix the first parameter (self) to be the struct pointer type
+                if method.params and method.params[0][0] == "self":
+                    method.params[0] = ("self", node.struct_name)
+                # Emit the function directly (bypass emit_stmt which only does collect pass)
+                self.emit_fn(method)
+                # Restore original name
+                method.name = original_name
+        # NEW SYNTAX: Pub declaration
+        elif isinstance(node, PubDecl):
+            # Just emit the inner declaration
+            self.emit_stmt(node.decl)
+        # NEW SYNTAX: Bare block
+        elif isinstance(node, BareBlock):
+            self.emit_bare_block(node)
+        # NEW SYNTAX: Import path
+        elif isinstance(node, ImportPath):
+            # ImportPath handled by import logic
+            self.emit_import_path(node)
         return False
 
     def emit_element_drop(self, node):
@@ -4765,6 +4935,22 @@ class CodeGen:
             tmp = self.new_tmp()
             self.emit(f"  {tmp} = call {struct_t}* @_{node.class_name}_new()")
             return tmp, f"{struct_t}*"
+        # NEW SYNTAX: Struct literal
+        if isinstance(node, StructInstantiate):
+            struct_t = self.struct_ir_type(node.struct_name)
+            tmp = self.new_tmp()
+            # Call struct constructor - for now just allocate and zero-init
+            self.emit(f"  {tmp} = call {struct_t}* @_{node.struct_name}_new()")
+            # Initialize fields
+            for field_name, field_expr in node.fields:
+                field_val, field_val_t = self.emit_expr(field_expr)
+                # Store field value
+                field_idx, field_ir_t = self.struct_field_index(node.struct_name, field_name)
+                field_ptr = self.new_tmp()
+                self.emit(f"  {field_ptr} = getelementptr {struct_t}, {struct_t}* {tmp}, i32 0, i32 {field_idx}")
+                field_val = self.coerce(field_val, field_val_t, field_ir_t)
+                self.emit(f"  store {field_ir_t} {field_val}, {field_ir_t}* {field_ptr}")
+            return tmp, f"{struct_t}*"
         if isinstance(node, MethodCall):
             if node.method == "set" and isinstance(node.obj, FnCall):
                 self.emit_collection_set(node)
@@ -4782,6 +4968,34 @@ class CodeGen:
             return tmp, "i64"
         if isinstance(node, OsRun):
             return self.emit_os_run_expr(node)
+        # NEW SYNTAX: Index access [ ] for collections
+        if isinstance(node, IndexAccess):
+            return self.emit_index_access(node)
+        if isinstance(node, IndexSet):
+            return self.emit_index_set(node)
+        if isinstance(node, IndexAdd):
+            return self.emit_index_add(node)
+        if isinstance(node, IndexDrop):
+            return self.emit_index_drop(node)
+        # NEW SYNTAX: Struct field access
+        if isinstance(node, StructAccess):
+            return self.emit_struct_access(node)
+        # NEW SYNTAX: Fixed-size collections N[]
+        if isinstance(node, FixedSizeList):
+            return self.emit_fixed_size_list(node)
+        if isinstance(node, FixedSizeIndex):
+            return self.emit_fixed_size_index(node)
+        # NEW SYNTAX: Clist .cast() / .pull()
+        if isinstance(node, ClistCast):
+            return self.emit_clist_cast(node)
+        if isinstance(node, ClistPull):
+            return self.emit_clist_pull(node)
+        # NEW SYNTAX: Bare block { }
+        if isinstance(node, BareBlock):
+            return self.emit_bare_block(node)
+        # NEW SYNTAX: SY dynamic resolve
+        if isinstance(node, DynResolve):
+            return self.emit_dyn_resolve(node)
         return "0", "i64"
 
     def emit_field_access(self, obj, field_name):
@@ -4799,6 +5013,51 @@ class CodeGen:
             self.emit(f"  {tmp} = load {ir_t}, {ir_t}* @{mangled_var}")
             return tmp, ir_t
 
+        # Check struct instances first (NEW SYNTAX)
+        if obj_name in self.struct_instances:
+            struct_name = self.struct_instances[obj_name]
+            idx, ir_t = self.struct_field_index(struct_name, field_name)
+            struct_t = self.struct_ir_type(struct_name)
+            
+            ptr_str, _ = self.get_var_ptr(obj_name)
+            inst_ptr = self.new_tmp(); fptr = self.new_tmp(); val = self.new_tmp()
+            self.emit(f"  {inst_ptr} = load {struct_t}*, {struct_t}** {ptr_str}")
+            self.emit(f"  {fptr} = getelementptr {struct_t}, {struct_t}* {inst_ptr}, i32 0, i32 {idx}")
+            self.emit(f"  {val} = load {ir_t}, {ir_t}* {fptr}")
+            return val, ir_t
+
+        # Check local variable stack for struct pointer types (struct method parameters)
+        for scope in reversed(self.local_vars_stack):
+            if obj_name in scope:
+                ir_t = scope[obj_name]
+                # Check if it's a struct pointer type (%struct_* *)
+                if ir_t.startswith("%struct_") and ir_t.endswith("*"):
+                    struct_name = ir_t[8:-1]  # Remove %struct_ and *
+                    idx, field_ir_t = self.struct_field_index(struct_name, field_name)
+                    struct_t = self.struct_ir_type(struct_name)
+                    
+                    ptr_str, _ = self.get_var_ptr(obj_name)
+                    inst_ptr = self.new_tmp(); fptr = self.new_tmp(); val = self.new_tmp()
+                    self.emit(f"  {inst_ptr} = load {struct_t}*, {struct_t}** {ptr_str}")
+                    self.emit(f"  {fptr} = getelementptr {struct_t}, {struct_t}* {inst_ptr}, i32 0, i32 {idx}")
+                    self.emit(f"  {val} = load {field_ir_t}, {field_ir_t}* {fptr}")
+                    return val, field_ir_t
+                break  # Found in scope but not a struct pointer
+
+        # Check struct instances first (NEW SYNTAX)
+        if obj_name in self.struct_instances:
+            struct_name = self.struct_instances[obj_name]
+            idx, ir_t = self.struct_field_index(struct_name, field_name)
+            struct_t = self.struct_ir_type(struct_name)
+            
+            ptr_str, _ = self.get_var_ptr(obj_name)
+            inst_ptr = self.new_tmp(); fptr = self.new_tmp(); val = self.new_tmp()
+            self.emit(f"  {inst_ptr} = load {struct_t}*, {struct_t}** {ptr_str}")
+            self.emit(f"  {fptr} = getelementptr {struct_t}, {struct_t}* {inst_ptr}, i32 0, i32 {idx}")
+            self.emit(f"  {val} = load {ir_t}, {ir_t}* {fptr}")
+            return val, ir_t
+
+        # Check class instances
         if obj_name not in self.instances: 
             raise RubidiumNameError(f"'{obj_name}' is not an instance")
             
@@ -5467,7 +5726,63 @@ class CodeGen:
         if obj_name in self._file_handle_vars:
             return self.emit_file_handle_method(obj_name, node.method, node.args)
 
-        # `use net as n` — only affects builtin-module dispatch below (never
+        # NEW SYNTAX: .cast() and .pull() for Clist FFI
+        if node.method == "cast" and len(node.args) == 0:
+            # list.cast() -> Clist (i64 handle)
+            obj_v, obj_t = self.emit_expr(node.obj)
+            obj_box = self.coerce_to_box(obj_v, obj_t)
+            tmp = self.new_tmp()
+            self.emit(f"  {tmp} = call i64 @list_to_clist(%Box* {obj_box})")
+            return tmp, "i64"
+        if node.method == "pull" and len(node.args) == 0:
+            # clist.pull() -> list (%Box*)
+            obj_v, obj_t = self.emit_expr(node.obj)
+            obj_i = self.coerce(obj_v, obj_t, "i64")
+            tmp = self.new_tmp()
+            self.emit(f"  {tmp} = call %Box* @clist_to_list(i64 {obj_i})")
+            return tmp, "%Box*"
+
+        # NEW SYNTAX: .cast() and .pull() for Clist FFI
+        if node.method == "cast" and len(node.args) == 0:
+            # list.cast() -> Clist (i64 handle)
+            obj_v, obj_t = self.emit_expr(node.obj)
+            obj_box = self.coerce_to_box(obj_v, obj_t)
+            tmp = self.new_tmp()
+            self.emit(f"  {tmp} = call i64 @list_to_clist(%Box* {obj_box})")
+            return tmp, "i64"
+        if node.method == "pull" and len(node.args) == 0:
+            # clist.pull() -> list (%Box*)
+            obj_v, obj_t = self.emit_expr(node.obj)
+            obj_i = self.coerce(obj_v, obj_t, "i64")
+            tmp = self.new_tmp()
+            self.emit(f"  {tmp} = call %Box* @clist_to_list(i64 {obj_i})")
+            return tmp, "%Box*"
+
+        # NEW SYNTAX: Struct instance method calls (impl blocks)
+        if isinstance(node.obj, Var) and obj_name in self.struct_instances:
+            struct_name = self.struct_instances[obj_name]
+            # Check if the method exists in the impl block for this struct
+            if hasattr(self, 'impl_methods') and struct_name in self.impl_methods:
+                impl_methods = self.impl_methods[struct_name]
+                if node.method in impl_methods:
+                    fn_obj = self.impl_methods[struct_name][node.method]
+                    # Emit struct instance as first argument
+                    obj_v, obj_t = self.emit_expr(node.obj)
+                    # obj_v should be a pointer to the struct
+                    args_ir = [f"{self.struct_ir_type(struct_name)}* {obj_v}"]
+                    for arg in node.args:
+                        arg_v, arg_t = self.emit_expr(arg)
+                        args_ir.append(f"{arg_t} {arg_v}")
+                    
+                    # Call the impl method (mangled as StructName__MethodName)
+                    tmp = self.new_tmp()
+                    fn_ret = fn_obj.ret_type
+                    ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else "i64"
+                    # Use the same mangling as class methods: StructName__MethodName
+                    fn_name = self.method_ir_name(struct_name, node.method)
+                    self.emit(f"  {tmp} = call {ret_ir} @{fn_name}({', '.join(args_ir)})")
+                    self._emit_error_propagation_check()
+                    return tmp, ret_ir
         # file handles/class instances/plain vars, so a real variable that
         # happens to share a name with someone's alias is unaffected).
         obj_name = self.use_aliases.get(obj_name, obj_name)
@@ -6537,6 +6852,211 @@ class CodeGen:
             result = self._track_temp(result, "%Box*")
             return result, "%Box*"
         return "0", "i64"
+
+    # NEW SYNTAX: Index access [ ] for collections (READ)
+    def emit_index_access(self, node):
+        """Emit collection read: my_list[0], my_index["key"], my_nested[1]["test"]"""
+        obj_v, obj_t = self.emit_expr(node.obj)
+        obj_box = self.coerce_to_box(obj_v, obj_t)
+        
+        # Handle chained index access: if index is a list of indices
+        if hasattr(node.index_expr, '__iter__') and not isinstance(node.index_expr, (Var, Str, Number, Bool, None_)):
+            # Chained access - navigate through each level
+            current_box = obj_box
+            # This is simplified - full chaining needs the actual index path
+            # For now, handle single index
+            pass
+        
+        idx_v, idx_t = self.emit_expr(node.index_expr)
+        idx_box = self.coerce_to_box(idx_v, idx_t)
+        
+        # Use collection_get_copy for deep copy semantics (spec: reads return independent copy)
+        elem = self.new_tmp()
+        self.emit(f"  {elem} = call %Box* @collection_get_copy(%Box* {obj_box}, %Box* {idx_box})")
+        return elem, "%Box*"
+
+    # NEW SYNTAX: Index write .set() after [ ] path
+    def emit_index_set(self, node):
+        """Emit my_list[0].set(val), my_nested[1]["test"].set(val)"""
+        obj_v, obj_t = self.emit_expr(node.obj)
+        obj_box = self.coerce_to_box(obj_v, obj_t)
+        
+        # Emit the full index path
+        index_boxes = []
+        for idx_expr in node.index_path:
+            idx_v, idx_t = self.emit_expr(idx_expr)
+            idx_box = self.coerce_to_box(idx_v, idx_t)
+            index_boxes.append(idx_box)
+        
+        # Navigate to the target collection
+        current_box = obj_box
+        for i, idx_box in enumerate(index_boxes[:-1]):
+            next_box = self.new_tmp()
+            self.emit(f"  {next_box} = call %Box* @collection_get(%Box* {current_box}, %Box* {idx_box})")
+            current_box = next_box
+        
+        # Emit value and deep copy it
+        val_v, val_t = self.emit_expr(node.value)
+        val_box = self.coerce_to_box(val_v, val_t)
+        val_copy = self.new_tmp()
+        self.emit(f"  {val_copy} = call %Box* @box_deep_copy(%Box* {val_box})")
+        
+        # Set the element
+        last_idx = index_boxes[-1]
+        self.emit(f"  call void @collection_set(%Box* {current_box}, %Box* {last_idx}, %Box* {val_copy})")
+        return "0", "i64"
+
+    # NEW SYNTAX: Index write .add() after [ ] path
+    def emit_index_add(self, node):
+        """Emit my_list.add(val), my_index.add("key", val), my_nested[0].add(val)"""
+        obj_v, obj_t = self.emit_expr(node.obj)
+        obj_box = self.coerce_to_box(obj_v, obj_t)
+        
+        # Emit the full index path
+        index_boxes = []
+        for idx_expr in node.index_path:
+            idx_v, idx_t = self.emit_expr(idx_expr)
+            idx_box = self.coerce_to_box(idx_v, idx_t)
+            index_boxes.append(idx_box)
+        
+        # Navigate to the target collection
+        current_box = obj_box
+        for idx_box in index_boxes:
+            next_box = self.new_tmp()
+            self.emit(f"  {next_box} = call %Box* @collection_get(%Box* {current_box}, %Box* {idx_box})")
+            current_box = next_box
+        
+        # Emit args and add
+        if len(node.args) == 1:
+            # list.add(val) or index.add(key, val) where key is in index_path
+            val_v, val_t = self.emit_expr(node.args[0])
+            val_box = self.coerce_to_box(val_v, val_t)
+            val_copy = self.new_tmp()
+            self.emit(f"  {val_copy} = call %Box* @box_deep_copy(%Box* {val_box})")
+            self.emit(f"  call void @collection_add1(%Box* {current_box}, %Box* {val_copy})")
+        else:
+            # index.add("key", val) - key is already in index_path, val is in args[0]
+            val_v, val_t = self.emit_expr(node.args[0])
+            val_box = self.coerce_to_box(val_v, val_t)
+            val_copy = self.new_tmp()
+            self.emit(f"  {val_copy} = call %Box* @box_deep_copy(%Box* {val_box})")
+            # For index, the key was in index_path, so we need to use collection_set
+            if index_boxes:
+                self.emit(f"  call void @collection_set(%Box* {current_box}, %Box* {index_boxes[-1]}, %Box* {val_copy})")
+            else:
+                self.emit(f"  call void @collection_add1(%Box* {current_box}, %Box* {val_copy})")
+        return "0", "i64"
+
+    # NEW SYNTAX: Index write .drop() after [ ] path
+    def emit_index_drop(self, node):
+        """Emit my_list[1].drop(), my_nested[1]["k"].drop()"""
+        obj_v, obj_t = self.emit_expr(node.obj)
+        obj_box = self.coerce_to_box(obj_v, obj_t)
+        
+        # Emit the full index path
+        index_boxes = []
+        for idx_expr in node.index_path:
+            idx_v, idx_t = self.emit_expr(idx_expr)
+            idx_box = self.coerce_to_box(idx_v, idx_t)
+            index_boxes.append(idx_box)
+        
+        # Navigate to the target collection
+        current_box = obj_box
+        for idx_box in index_boxes[:-1]:
+            next_box = self.new_tmp()
+            self.emit(f"  {next_box} = call %Box* @collection_get(%Box* {current_box}, %Box* {idx_box})")
+            current_box = next_box
+        
+        # Drop the element
+        last_idx = index_boxes[-1]
+        self.emit(f"  call void @collection_drop(%Box* {current_box}, %Box* {last_idx})")
+        return "0", "i64"
+
+    # NEW SYNTAX: Struct field access
+    def emit_struct_access(self, node):
+        """Emit p.x for struct instance p"""
+        obj_v, obj_t = self.emit_expr(node.obj)
+        # Struct instances are pointers to struct
+        struct_ptr = self.coerce(obj_v, obj_t, f"%{node.obj_type}*") if hasattr(node, 'obj_type') else obj_v
+        # Get field index from struct definition
+        field_idx = self.get_struct_field_index(node.struct_name, node.field)
+        field_ptr = self.new_tmp()
+        self.emit(f"  {field_ptr} = getelementptr %{node.struct_name}, %{node.struct_name}* {struct_ptr}, i32 0, i32 {field_idx}")
+        field_type = self.get_struct_field_type(node.struct_name, node.field)
+        tmp = self.new_tmp()
+        self.emit(f"  {tmp} = load {field_type}, {field_type}* {field_ptr}")
+        return tmp, field_type
+
+    # NEW SYNTAX: Fixed-size list N[]
+    def emit_fixed_size_list(self, node):
+        """Emit N[] - fixed-size list of N Nulls"""
+        size_v, size_t = self.emit_expr(node.size_expr)
+        size_i = self.coerce(size_v, size_t, "i64")
+        # Call runtime function to create fixed-size list
+        tmp = self.new_tmp()
+        self.emit(f"  {tmp} = call %Box* @make_fixed_list(i64 {size_i})")
+        return tmp, "%Box*"
+
+    # NEW SYNTAX: Fixed-size index N[]
+    def emit_fixed_size_index(self, node):
+        """Emit N[] - fixed-size index with keys 0..N-1, values Null"""
+        size_v, size_t = self.emit_expr(node.size_expr)
+        size_i = self.coerce(size_v, size_t, "i64")
+        tmp = self.new_tmp()
+        self.emit(f"  {tmp} = call %Box* @make_fixed_index(i64 {size_i})")
+        return tmp, "%Box*"
+
+    # NEW SYNTAX: Clist .cast() - list to Clist for FFI
+    def emit_clist_cast(self, node):
+        """Emit my_list.cast() -> Clist"""
+        list_v, list_t = self.emit_expr(node.list_expr)
+        list_box = self.coerce_to_box(list_v, list_t)
+        tmp = self.new_tmp()
+        self.emit(f"  {tmp} = call i64 @list_to_clist(%Box* {list_box})")
+        return tmp, "i64"
+
+    # NEW SYNTAX: Clist .pull() - Clist to list from FFI
+    def emit_clist_pull(self, node):
+        """Emit clist.pull() -> list"""
+        clist_v, clist_t = self.emit_expr(node.clist_expr)
+        clist_i = self.coerce(clist_v, clist_t, "i64")
+        tmp = self.new_tmp()
+        self.emit(f"  {tmp} = call %Box* @clist_to_list(i64 {clist_i})")
+        return tmp, "%Box*"
+
+    # NEW SYNTAX: Bare block { } - creates scope, last expr without ; is value
+    def emit_bare_block(self, node):
+        """Emit bare block - creates scope, last expr without ; is block value"""
+        # Track temp arena mark for scope
+        mark = self.new_tmp()
+        self.emit(f"  {mark} = call i64 @rub_temp_mark()")
+        
+        last_val = "0"
+        last_type = "i64"
+        
+        for i, stmt in enumerate(node.body):
+            if i == len(node.body) - 1 and not isinstance(stmt, (Return, Break, Continue)):
+                # Last statement - check if it's an expression without semicolon
+                val, val_t = self.emit_expr(stmt) if hasattr(stmt, '__class__') else (None, None)
+                if val is not None:
+                    last_val = val
+                    last_type = val_t
+            else:
+                self.emit_stmt(stmt)
+        
+        # Release temp arena
+        self.emit(f"  call void @rub_temp_release_to(i64 {mark})")
+        return last_val, last_type
+
+    # NEW SYNTAX: SY dynamic resolve (name) at runtime
+    def emit_dyn_resolve(self, node):
+        """Emit runtime SY variable lookup"""
+        holder_name = node.holder_name
+        key_v, key_t = self.emit_expr(Var(holder_name))
+        key_s = self.coerce(key_v, key_t, "i8*")
+        tmp = self.new_tmp()
+        self.emit(f"  {tmp} = call %Box* @rub_dynvar_get(i8* {key_s})")
+        return tmp, "%Box*"
 
     def emit_type_cast(self, node):
         # bugs.log OPEN-H / OPEN-J: `Null as str` on a runtime-tagged scalar

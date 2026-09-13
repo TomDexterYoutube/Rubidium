@@ -1,2174 +1,2985 @@
-# =========================================
-# =========================================
-# Rubidium Programming Language Reference
-# File extension: .rub
-# Designed for beginners. Built to scale into real systems programming.
-# =========================================
-# =========================================
+// =========================================
+// =========================================
+// Rubidium Programming Language Reference
+// File extension: .rub
+// Designed for beginners. Built to scale into real systems programming.
+// =========================================
+// =========================================
 
 
 
-# =========================================
-# EXECUTION MODEL
-# =========================================
+// =========================================
+// EXECUTION MODEL
+// =========================================
 
-# Rubidium runs in two phases:
+// Rubidium runs in two phases:
 
-# PHASE 1 — TOP LEVEL
-#   Runs top to bottom before main().
-#   Creates variables in the global pool.
-#   Executes any function calls written at the top level immediately.
-#   Defines functions and classes but does NOT run them.
+// PHASE 1 — TOP LEVEL
+//   Runs top to bottom before main().
+//   Creates variables in the global pool.
+//   Executes any function calls written at the top level immediately.
+//   Defines functions and classes but does NOT run them.
 
-# PHASE 2 — MAIN
-#   After top level finishes, the compiler automatically runs fn main().
+// PHASE 2 — MAIN
+//   After top level finishes, the compiler automatically runs fn main().
 
-print("This runs first — top level")
+print("This runs first — top level");
 
 fn main() {
-    print("This runs second — main")
+    print("This runs second — main");
 }
 
-# =========================================
-# MEMORY MODEL
-# =========================================
+// =========================================
+// MEMORY MODEL
+// =========================================
 
-# All variables live in a SHARED GLOBAL POOL.
-#
-# Rules:
-# - Variables are visible everywhere once created.
-# - There is no automatic memory management.
-# - Memory must be freed manually using .drop().
-# - The only exceptions are open() file blocks and loop variables,
-#   which are freed automatically at the end of their block.
-#
-# Think of memory as a shared whiteboard —
-# everyone can see and modify it.
+// All variables live in a SHARED GLOBAL POOL.
+//
+// Rules:
+// - Variables are visible everywhere once created.
+// - There is no automatic memory management.
+// - Memory must be freed manually using .drop().
+// - The only exceptions are open() file blocks and loop variables,
+//   which are freed automatically at the end of their block.
+//
+// Think of memory as a shared whiteboard —
+// everyone can see and modify it.
 
-# =========================================
-# LANGUAGE PHILOSOPHY
-# =========================================
+// =========================================
+// LANGUAGE PHILOSOPHY
+// =========================================
 
-# Rubidium is designed around simplicity,
-# predictability, and explicit behavior.
-# Many modern languages use garbage collection,
-# ownership systems, reference counting,
-# borrow checking, or other hidden mechanisms.
-# Rubidium instead favors rules that are
-# visible and easy to reason about.
+// Rubidium is designed around simplicity,
+// predictability, and explicit behavior.
+// Many modern languages use garbage collection,
+// ownership systems, reference counting,
+// borrow checking, or other hidden mechanisms.
+// Rubidium instead favors rules that are
+// visible and easy to reason about.
 
-# Rubidium favors behavior that is easy to
-# understand over behavior that is heavily optimized.
-# The language intentionally prioritizes
-# clarity and consistency over maximum performance.
+// Rubidium favors behavior that is easy to
+// understand over behavior that is heavily optimized.
+// The language intentionally prioritizes
+// clarity and consistency over maximum performance.
 
-# =========================================
-# DATA TYPES
-# =========================================
+// =========================================
+// DATA TYPES
+// =========================================
 
-# Integers (signed):
-#   i32, i64, i128, i256, i512, i1024, i2048
+// Integers (signed):
+//   i32, i64, i128, i256, i512, i1024, i2048
 
-# Floats:
-#   f32, f64, f128
+// Floats:
+//   f32, f64, f128
 
-# Other:
-#   str   — text string
-#   str+  — a string but uses 3 " on each side
-#   bool  — True or False
-#   Null  — valid for all types, means "exists but empty"
-#   Any   — can hold a value of any type
-#   SY    — Holds a string that can be used in code
+// Other:
+//   str   — text string
+//   str+  — a string but uses 3 " on each side
+//   bool  — True or False
+//   Null  — valid for all types, means "exists but empty"
+//   Any   — can hold a value of any type
+//   SY    — Holds a string that can be used in code
 
-# Collections:
-#   list
-#   index
-#   dict
-#   dict+  — like dict, but values are nested dicts instead of lists (unlimited depth)
+// Collections:
+//   list
+//   index  — key-value map; a value may be any type, INCLUDING another index
 
-let a: i32  = 100
-let b: f64  = 3.14
-let c: str  = "hello"
-let d: bool = True
-let e: i32  = Null
-let f: Any  = "I can be anything!"
+let a: i32  = 100;
+let b: f64  = 3.14;
+let c: str  = "hello";
+let d: bool = True;
+let e: i32  = Null;
+let f: Any  = "I can be anything!";
 
-# Any can be used when you don't know the type in advance, for functions, return types and such
+// Any can be used when you don't know the type in advance, for functions, return types and such
 
-# =========================================
-# GLOBAL BY DEFAULT
-# =========================================
+// =========================================
+// GLOBAL BY DEFAULT
+// =========================================
 
-# Variables created normally are placed into the global memory pool.
+// Variables created normally are placed into the global memory pool.
 
-let score = 100
+let score = 100;
 
-# Global variables can be accessed anywhere.
-# Local variables must be declared explicitly.
-# Full syntax (mut is optional, only needed if reassigning later):
-#   let mut local name: type = value
+// Global variables can be accessed anywhere.
+// Local variables must be declared explicitly.
+// Full syntax (mut is optional, only needed if reassigning later):
+//   let mut local name: type = value;
 
-let local temp = 100
+let local temp = 100;
 
-# Local variables never enter the global pool
-# and are automatically dropped when their scope ends.
+// Local variables never enter the global pool
+// and are automatically dropped when their scope ends.
 
-# =========================================
-# THE DEEP COPY RULE
-# =========================================
+// =========================================
+// THE DEEP COPY RULE
+// =========================================
 
-# Assigning one value to another creates a complete deep copy.
+// Assigning one value to another creates a complete deep copy.
 
-let mut a = [1, 2, 3]
-let mut b = a
+let mut a = [1, 2, 3];
+let mut b = a;
 
-# a and b are completely independent.
-# Rubidium does not use references,
-# borrowing, or shared ownership.
+// a and b are completely independent.
+// Rubidium does not use references,
+// borrowing, or shared ownership.
 
-# =========================================
-# NULL BEHAVIOR
-# =========================================
+// =========================================
+// NULL BEHAVIOR
+// =========================================
 
-# Null is a valid value for every type.
+// Null is a valid value for every type.
 
-let value: i32 = Null
+let value: i32 = Null;
 
-# Null is considered smaller than every non-null value.
-# Conceptually, Null behaves like negative infinity.
+// Null is considered smaller than every non-null value.
+// Conceptually, Null behaves like negative infinity.
 
-Null < 0         # True
-Null < -999999   # True
-Null == Null     # True
+Null < 0;         // True
+Null < -999999;   // True
+Null == Null;     // True
 
-# =========================================
-# VARIABLES
-# =========================================
+// =========================================
+// VARIABLES
+// =========================================
 
-# Declare with 'let'. Type is optional — Rubidium infers it.
+// Declare with 'let'. Type is optional — Rubidium infers it.
 
-let x = 10
-let name = "Rubidium"
-let flag = True
+let x = 10;
+let name = "Rubidium";
+let flag = True;
 
-# Use 'mut' if you need to reassign the variable later.
+// Use 'mut' if you need to reassign the variable later.
 
-let mut counter = 0
-counter = 5
+let mut counter = 0;
+counter = 5;
 
-# Trying to reassign a non-mut variable is a compile error.
+// Trying to reassign a non-mut variable is a compile error.
 
-let a = 10
-a = 20   # ERROR: a is not mutable
+let a = 10;
+a = 20;   // ERROR: a is not mutable
 
-# =========================================
-# THE VARIABLE OVERWRITE RULE
-# =========================================
+// =========================================
+// THE VARIABLE OVERWRITE RULE
+// =========================================
 
-# If you declare a variable
-let mut x: i32 = 10
+// If you declare a variable
+let mut x: i32 = 10;
 
-# Then you can edit it since its mut
+// Then you can edit it since its mut
 
-x = 15
+x = 15;
 
-# But you don't use let to change it
-# IF you use let
+// But you don't use let to change it
+// IF you use let
 
-let x = "Hi"
+let x = "Hi";
 
-# And a variable with that name already exits then it drops it
-# Then recreates it as a new variable
+// And a variable with that name already exits then it drops it
+// Then recreates it as a new variable
 
-# =========================================
-# SCOPE
-# =========================================
+// =========================================
+// SCOPE
+// =========================================
 
-# The different scopes can have slightly different rules
+// The different scopes can have slightly different rules
 
 while True {
-    let local num = 10
-    break
+    let local num = 10;
+    break;
 }
 
-# When the loop ends the local is dropped that is True for
-# For loops
-# Functions
-# While loop
-# And if loops
+// When the loop ends the local is dropped that is True for
+// For loops
+// Functions
+// While loop
+// If loops
+// And bare { } blocks (see BLOCK SCOPES, under FUNCTIONS)
 
-# =========================================
-# TYPE CASTING
-# =========================================
+// =========================================
+// TYPE CASTING
+// =========================================
 
-# Use 'as' to cast between types.
+// Use 'as' to cast between types.
 
-let y: i32 = 5
-let large: i64 = y as i64
-let f: f64 = 100 as f64
+let y: i32 = 5;
+let large: i64 = y as i64;
+let f: f64 = 100 as f64;
 
-# =========================================
-# TYPE CHECKING
-# =========================================
+// =========================================
+// TYPE CHECKING
+// =========================================
 
-# Rubidium checks types at compile time.
-# Assigning the wrong type raises a compiler error.
+// Rubidium checks types at compile time.
+// Assigning the wrong type raises a compiler error.
 
-# Example (will NOT compile):
-# let val: i32 = 5
-# val = "hello"   # ERROR: wrong type
+// Example (will NOT compile):
+// let val: i32 = 5;
+// val = "hello";   // ERROR: wrong type
 
-# =========================================
-# MATH
-# =========================================
+// =========================================
+// MATH
+// =========================================
 
-# Standard operators:
-#   +   addition
-#   -   subtraction
-#   *   multiplication
-#   /   division
-#   **  power
-#   */  root
-#   %   remainder
+// Standard operators:
+//   +   addition
+//   -   subtraction
+//   *   multiplication
+//   /   division
+//   **  power
+//   */  root
+//   %   remainder
 
-let a = 10 + 5       # 15
-let b = 10 - 5       # 5
-let c = 10 * 5       # 50
-let d = 10 / 5       # 2
-let e = 2 ** 3       # 8
-let f = 2 */ 16      # 4
-let g = 2 % 10       # 2
+let a = 10 + 5;       // 15
+let b = 10 - 5;       // 5
+let c = 10 * 5;       // 50
+let d = 10 / 5;       // 2
+let e = 2 ** 3;       // 8
+let f = 2 */ 16;      // 4
+let g = 2 % 10;       // 2
 
-# Standard BODMAS precedence applies.
+// Standard BODMAS precedence applies.
 
-let g = 1 + 2 * 3    # 7
-let h = (1 + 2) * 3  # 9
+let g = 1 + 2 * 3;    // 7
+let h = (1 + 2) * 3;  // 9
 
-# Negate a value with a leading minus.
+// Negate a value with a leading minus.
 
-let x = 10
-let y = -x           # -10
+let x = 10;
+let y = -x;           // -10
 
-# -------------------------------
-# TYPED MATH BLOCKS
-# -------------------------------
+// -------------------------------
+// TYPED MATH BLOCKS
+// -------------------------------
 
-# A parenthesised math expression can be given a result type with `: TYPE`
-# right after the closing bracket. The WHOLE expression inside is then
-# computed at that type's precision — not just the final value cast.
+// A parenthesised math expression can be given a result type with `: TYPE`
+// right after the closing bracket. The WHOLE expression inside is then
+// computed at that type's precision — not just the final value cast.
 
-let r = (10 / 3): f64        # 3.3333...  (division done as f64, not int)
+let r = (10 / 3): f64;        // 3.3333...  (division done as f64, not int)
 
-# This is the difference from a plain group: `(10 / 3)` alone divides two
-# integers and gives 3; `(10 / 3): f64` computes the division at f64.
+// This is the difference from a plain group: `(10 / 3)` alone divides two
+// integers and gives 3; `(10 / 3): f64` computes the division at f64.
 
-# Per-operand `as` casts still apply — they convert each operand first,
-# then the block type governs every operation's result:
+// Per-operand `as` casts still apply — they convert each operand first,
+// then the block type governs every operation's result:
 
-let s = (10 as i32 / 3 as i32): f128   # operands are i32 (10, 3), but the
-                                        # division runs at f128 -> 3.3333...
+let s = (10 as i32 / 3 as i32): f128;   // operands are i32 (10, 3), but the
+                                         // division runs at f128 -> 3.3333...
 
-# Use the widest float type for higher-precision math:
+// Use the widest float type for higher-precision math:
 
-let big = (22 / 7): f128    # pi approximation computed at f128 precision
+let big = (22 / 7): f128;    // pi approximation computed at f128 precision
 
-# An integer block type keeps integer arithmetic:
+// An integer block type keeps integer arithmetic:
 
-let d = (10 / 3): i32        # 3
+let d = (10 / 3): i32;        // 3
 
-# Normal BODMAS precedence still applies inside the block:
+// Normal BODMAS precedence still applies inside the block:
 
-let e = (1 + 2 * 3): f64     # 7.0
+let e = (1 + 2 * 3): f64;     // 7.0
 
-# Blocks can nest; each block's type governs its own operations:
+// Blocks can nest; each block's type governs its own operations:
 
-let n = ((10 / 3): f64 + 1): f128   # 4.3333...
+let n = ((10 / 3): f64 + 1): f128;   // 4.3333...
 
-# =========================================
-# COMPARISON & LOGIC
-# =========================================
+// =========================================
+// COMPARISON & LOGIC
+// =========================================
 
-# Comparison operators:
-#   ==  equal
-#   !=  not equal
-#   >   greater than
-#   <   less than
-#   >=  greater than or equal
-#   <=  less than or equal
+// Comparison operators:
+//   ==  equal
+//   !=  not equal
+//   >   greater than
+//   <   less than
+//   >=  greater than or equal
+//   <=  less than or equal
 
-let check: bool = 10 > 5   # True
+let check: bool = 10 > 5;   // True
 
-# Logical operators:
-#   and
-#   or
-#   not
+// Logical operators:
+//   and
+//   or
+//   not
 
-let result: bool = True and not False   # True
+let result: bool = True and not False;   // True
 
-# =========================================
-# STRINGS
-# =========================================
+// =========================================
+// STRINGS
+// =========================================
 
-# Strings store text.
+// Strings store text.
 
-let text = "Hello World"
+let text = "Hello World";
 
-print(text)
+print(text);
 
-# Output:
-# Hello World
+// Output:
+// Hello World
 
 
-# Strings use double quotes.
+// Strings use double quotes.
 
-let name = "Max"
-let message = "Welcome to Rubidium"
+let name = "Max";
+let message = "Welcome to Rubidium";
 
 
-# Empty string
+// Empty string
 
-let empty = ""
+let empty = "";
 
 
-# Strings can contain numbers and symbols.
+// Strings can contain numbers and symbols.
 
-let text = "abc123!@#"
+let text = "abc123!@#";
 
 
-# -------------------------------
-# STRING METHODS
-# -------------------------------
+// -------------------------------
+// STRING METHODS
+// -------------------------------
 
-# Get a character at an index.
+// Get a character at an index.
 
-text.char(index)
+text.char(idx);
 
-let text = "Hello"
+let text = "Hello";
 
-print(text.char(0))
+print(text.char(0));
 
-# Output:
-# H
+// Output:
+// H
 
-print(text.char(4))
+print(text.char(4));
 
-# Output:
-# o
+// Output:
+// o
 
-# Replace a character at an index.
+// Replace a character at an index.
 
-text.set(index, value)
+text.set(idx, value);
 
-let mut text = "Hello"
+let mut text = "Hello";
 
-text.set(0, "J")
+text.set(0, "J");
 
-print(text)
+print(text);
 
-# Output:
-# Jello
+// Output:
+// Jello
 
-# value must be a single character string.
+// value must be a single character string.
 
-text.set(4, "!")
+text.set(4, "!");
 
-print(text)
+print(text);
 
-# Output:
-# Hell!
+// Output:
+// Hell!
 
-# Insert text before an index.
+// Insert text before an index.
 
-text.insert(index, value)
+text.insert(idx, value);
 
-let mut text = "Hello"
+let mut text = "Hello";
 
-text.insert(5, "!")
+text.insert(5, "!");
 
-print(text)
+print(text);
 
-# Output:
-# Hello!
+// Output:
+// Hello!
 
 
-let text = "World"
+let text = "World";
 
-text.insert(0, "Hello ")
+text.insert(0, "Hello ");
 
-print(text)
+print(text);
 
-# Output:
-# Hello World
+// Output:
+// Hello World
 
 
-# Replace every matching character or string.
+// Replace every matching character or string.
 
-text.replace(old, new)
+text.replace(old, new);
 
-let mut text = "banana"
+let mut text = "banana";
 
-text.replace("a", "_")
+text.replace("a", "_");
 
-print(text)
+print(text);
 
-# Output:
-# b_n_n_
+// Output:
+// b_n_n_
 
 
-let text = "Hello World"
+let text = "Hello World";
 
-text.replace("World", "Rubidium")
+text.replace("World", "Rubidium");
 
-print(text)
+print(text);
 
-# Output:
-# Hello Rubidium
+// Output:
+// Hello Rubidium
 
 
-# Convert a string into a list of characters.
+// Convert a string into a list of characters.
 
-text.slice()
+text.slice();
 
-let text = "Hello"
+let text = "Hello";
 
-print(text.slice())
+print(text.slice());
 
-# Output:
-# ["H", "e", "l", "l", "o"]
+// Output:
+// ["H", "e", "l", "l", "o"]
 
-let text = "Hello"
+let text = "Hello";
 
-print(text.len())
+print(text.len());
 
-# Output:
-# 5
+// Output:
+// 5
 
-# =========================================
-# SY
-# =========================================
+// =========================================
+// SY
+// =========================================
 
-# SY type is like a string but can be used in code
+// SY type is like a string but can be used in code
 
-let variable_name: SY = 'New variable'
-let (variable_name): str = "Hello I'm a variable"
+let variable_name: SY = 'New variable';
+let (variable_name): str = "Hello I'm a variable";
 
-let function_name: SY = 'New function'
+let function_name: SY = 'New function';
 
 fn (function_name)() {
-    print("I'm a new Function")
+    print("I'm a new Function");
 }
 
-# You put () around the SY when its used and ' when its made
+// You put () around the SY when its used and ' when its made
 
-# =========================================
-# STR+
-# =========================================
+// -----------------------------------------
+// SY ANYWHERE CODE WOULD GO
+// -----------------------------------------
 
-# str+ is the same as str but it uses 3 " and can use more then 1 line
+// SY is not limited to variable/function names — a SY can be substituted
+// anywhere in code, including as a TYPE:
+
+let type_name: SY = 'i32';
+let val: (type_name) = 42;
+
+// ...as a class name:
+
+let class_name: SY = 'player';
+let p = (class_name)();
+
+// ...or as a plain value/expression, such as the length in a fixed-size
+// collection literal (see FIXED-SIZE COLLECTIONS below):
+
+let size_code: SY = '5';
+let mut fixed: list = (size_code)[];
+
+// The rule is always the same: `(name)` drops in whatever code the SY
+// holds, exactly as if you had typed that code directly at that spot.
+
+// =========================================
+// STR+
+// =========================================
+
+// str+ is the same as str but it uses 3 " and can use more then 1 line
 
 let my_str_plus: str+ = """
 Hello
 I'm a big string!
-"""
+""";
 
-# =========================================
-# COLLECTIONS
-# =========================================
+// =========================================
+// COLLECTIONS
+// =========================================
 
-# All three collection types (list, index, dict)
-# require 'mut' if you want to modify them.
+// Both collection types (list, index)
+// require 'mut' if you want to modify them.
 
-# -----------------------------------------
-# LIST
-# -----------------------------------------
+// -----------------------------------------
+// LIST
+// -----------------------------------------
 
-# An ordered sequence. Zero-indexed.
+// An ordered sequence. Zero-indexed.
 
-let mut my_list: list = ["hello", 2.5, True]
+let mut my_list: list = ["hello", 2.5, True];
 
-# Access by index:
+// Access by index using [ ]:
 
-print(my_list(0))   # hello
+print(my_list[0]);   // hello
 
-# Mutate an item using .set():
+// Mutate an item using .set():
 
-my_list(0).set("changed")
+my_list[0].set("changed");
 
-# Append a new item using .add():
+// Append a new item using .add() — no parens needed for a bare collection:
 
-my_list().add("new_item")
+my_list.add("new_item");
 
-# when a list is printed it shows text in "" and everything else as is
-let my_list = "Hello".slice() + [1, 2, 3]
-print(my_list) # ["H", "e", "l", "l", "o", 1, 2, 3]
+// when a list is printed it shows text in "" and everything else as is
+let my_list = "Hello".slice() + [1, 2, 3];
+print(my_list); // ["H", "e", "l", "l", "o", 1, 2, 3]
 
-# -----------------------------------------
-# LIST UTILITIES
-# -----------------------------------------
+// -----------------------------------------
+// LIST UTILITIES
+// -----------------------------------------
 
-# .combine() joins all values together.
+// .combine() joins all values together.
 
-let words = ["Hello", " ", "World"]
+let words = ["Hello", " ", "World"];
 
-print(words.combine())
+print(words.combine());
 
-# Output:
-# Hello World
+// Output:
+// Hello World
 
-# -----------------------------------------
-# INDEX
-# -----------------------------------------
+// -----------------------------------------
+// INDEX
+// -----------------------------------------
 
-# A flat key-value map.
-# Keys can be any type. Values must be a single SCALAR (i32/f64/str/bool/
-# Null/etc) — never a list, index, dict, or dict+. Use `dict` instead if a
-# key needs to hold a collection of values.
+// A key-value map.
+// Keys can be any type. Values can be ANY type — a scalar (i32/f64/str/
+// bool/Null/etc), a list, or ANOTHER index. This is how you get nested
+// key-value structures: just put an index as the value of a key, as deep
+// as you like.
 
 let mut my_index: index = [
     "name": "Rubidium",
     1: "one",
     2.5: "float key"
-]
+];
 
-# Access by key:
+// Access by key using [ ]:
 
-print(my_index("name"))   # Rubidium
+print(my_index["name"]);   // Rubidium
 
-# Mutate a value using .set():
+// Mutate a value using .set():
 
-my_index("name").set("updated")
+my_index["name"].set("updated");
 
-# Add a new key-value pair using .add():
-# If the key already exists, this will error.
+// Add a new key-value pair using .add() — no parens needed on a bare index:
+// If the key already exists, this will error.
 
-my_index().add("new_key", 99)
+my_index.add("new_key", 99);
 
-# -----------------------------------------
-# DICT
-# -----------------------------------------
+// -----------------------------------------
+// NESTED INDEX
+// -----------------------------------------
 
-# A key-value map where each key holds
-# a collection of multiple values.
+// Because a value can be another index, you can nest indexes to any depth
+// by putting an index literal as a value:
 
-let mut my_dict: dict = {
-    "scores" = [10, 20, 30],
-    "names"  = ["alice", "bob"]
-}
+let mut my_nested: index = [
+    1: [
+        "test": [1, 2, 3, 4]
+    ]
+];
 
-# Access a specific value inside a key:
-# dict(key, index)
+// Access by chaining [ ] through each level:
 
-print(my_dict("scores", 1))   # 20
+print(my_nested[1]["test"]);          // [1, 2, 3, 4]
+print(my_nested[1]["test"][0]);       // 1
 
-# Mutate a value using .set():
+// Add a value to the list at the end of the path:
 
-my_dict("scores", 1).set(999)
+my_nested[1]["test"].add("ten");
 
-# Add a value to an existing key's collection:
+// Add a new key at any level.
+// Give it a scalar, a list, or an index literal to nest further:
 
-my_dict("scores").add(40)
+my_nested[1].add("other", [5, 6, 7]);
+my_nested[1].add("deeper", { "layer2": [8, 9] });
 
-# Add a new top-level key:
-# The new key is created with value Null.
+// Add a new top-level key — again, no parens needed:
+// The new key is created with value Null.
 
-my_dict().add("new_key")
+my_nested.add(2);
 
-# -----------------------------------------
-# DICT+
-# -----------------------------------------
+// -----------------------------------------
+// NAMING NOTE
+// -----------------------------------------
 
-# dict+ is like dict, but a key's value can be
-# either a list (a leaf, same as normal dict)
-# or another dict+ (a further level of nesting).
-# There is no limit on how many levels deep this can go.
+// Keys follow the same rules everywhere —
+// strings need quotes ("test"), numbers and other
+// types do not.
 
-let mut my_dictplus: dict+ = {
-    1 = {
-        "test" = [1, 2, 3, 4]
-    }
-}
+// =========================================
+// FIXED-SIZE COLLECTIONS
+// =========================================
 
-# Access a value by chaining keys down through each level:
-# dictplus(key1, key2, ...) — keeps drilling down until
-# it reaches a list, then behaves like a normal dict from there.
+// N[] creates a FIXED-SIZE list of length N, every slot starting as Null.
 
-print(my_dictplus(1, "test"))          # [1, 2, 3, 4]
-print(my_dictplus(1, "test", 0))       # 1
+let mut fixed: list = 5[];    // [Null, Null, Null, Null, Null]
 
-# Add a value to the list at the end of the path:
+// Fixed size means fixed: .add() and .drop() on the collection itself are
+// runtime errors, since the length can never change. Individual slots can
+// still be updated with .set() — that just replaces a value, it doesn't
+// resize anything:
 
-my_dictplus(1, "test").add("ten")
+fixed[0].set(10);   // OK — [10, Null, Null, Null, Null]
+fixed.add(1);        // ERROR: fixed-size list cannot grow
+fixed[0].drop();      // ERROR: fixed-size list cannot shrink
 
-# Add a new key at any level.
-# Give it a list to make it a leaf, or a { } block to nest further:
+// N[] also works for index. It creates a FIXED-SIZE index of length N,
+// keyed 0..N-1, every value starting as Null:
 
-my_dictplus(1).add("other", [5, 6, 7])
-my_dictplus(1).add("deeper", { "layer2" = [8, 9] })
+let mut fixed_idx: index = 5[];   // 0: Null, 1: Null, 2: Null, 3: Null, 4: Null
 
-# Add a new top-level key:
-# The new key is created as an empty dict+.
+fixed_idx[0].set("hi");   // OK
+fixed_idx.add(5, "x");    // ERROR: fixed-size index cannot grow
+fixed_idx[0].drop();      // ERROR: fixed-size index cannot shrink
 
-my_dictplus().add(2)
+// N does not need to be a literal — any expression that evaluates to an
+// i32 works, including a variable, or a SY holding the code for one
+// (see SY ANYWHERE CODE WOULD GO above):
 
-# -----------------------------------------
-# NAMING NOTE
-# -----------------------------------------
+let count = 5;
+let mut fixed2: list = count[];
 
-# Keys still follow the same rules as index/dict —
-# strings need quotes ("test"), numbers and other
-# types do not.
+let size_code: SY = '5';
+let mut fixed3: list = (size_code)[];
 
-# =========================================
-# PRINT & INPUT
-# =========================================
+// N[] is only valid where a list or index type is expected — it's a
+// collection constructor, not a general-purpose value. .len() on the
+// result always returns N, and stays N for the collection's lifetime
+// since it can never grow or shrink:
 
-# print() — outputs text and moves to a new line.
+print(fixed.len());   // 5
 
-print("Hello, Rubidium!")
-print(x)
-print(i"Value is {x}")
-print("Count: " + x)
+// =========================================
+// PRINT & INPUT
+// =========================================
 
-# println() — overwrites the current console line.
-# Calling it again replaces the previous output.
+// print() — outputs text and moves to a new line.
 
-println("Loading...")
-println("Done!")
-# The console shows: Done!
+print("Hello, Rubidium!");
+print(x);
+print(i"Value is {x}");
+print("Count: " + x);
 
-# input() — reads a line of text from the user.
+// println() — overwrites the current console line.
+// Calling it again replaces the previous output.
 
-let user: str = input("Enter your name: ")
+println("Loading...");
+println("Done!");
+// The console shows: Done!
 
-# clear() — wipes the WHOLE terminal screen, not just the current line
-# (that's println()'s job). Takes no arguments.
+// input() — reads a line of text from the user.
 
-print("Hello!")
-clear()
-print("You won't see 'Hello!' anymore — the screen is blank now.")
+let user: str = input("Enter your name: ");
 
-# exit([code]) — terminates the running binary immediately and
-# unconditionally, from anywhere in the program (not just main()).
-# No cleanup, no unwinding, no drop()s run — the process just ends,
-# the same as an ordinary process exit with that status code.
-# code is optional and defaults to 0.
+// clear() — wipes the WHOLE terminal screen, not just the current line
+// (that's println()'s job). Takes no arguments.
+
+print("Hello!");
+clear();
+print("You won't see 'Hello!' anymore — the screen is blank now.");
+
+// exit([code]) — terminates the running binary immediately and
+// unconditionally, from anywhere in the program (not just main()).
+// No cleanup, no unwinding, no drop()s run — the process just ends,
+// the same as an ordinary process exit with that status code.
+// code is optional and defaults to 0.
 
 fn check(n: i32) {
     if n < 0 {
-        print("negative — stopping")
-        exit(1)
+        print("negative — stopping");
+        exit(1);
     }
-    print("still running")
+    print("still running");
 }
 
-check(-1)
-print("this line never runs")
+check(-1);
+print("this line never runs");
 
-# exit() with no arguments exits with status 0:
+// exit() with no arguments exits with status 0:
 
-exit()
+exit();
 
-# arg() — returns the program's command-line arguments (everything after
-# the binary name) as a single space-joined str. Takes no arguments.
-# Callable from anywhere (not just main()), same as exit().
+// arg() — returns the program's command-line arguments (everything after
+// the binary name) as a single space-joined str. Takes no arguments.
+// Callable from anywhere (not just main()), same as exit().
 
-# ./Rub_program            -> arg() returns ""
-# ./Rub_program --help     -> arg() returns "--help"
-# ./Rub_program --mode speed -> arg() returns "--mode speed"
+// ./Rub_program            -> arg() returns ""
+// ./Rub_program --help     -> arg() returns "--help"
+// ./Rub_program --mode speed -> arg() returns "--mode speed"
 
-let cmdline: str = arg()
+let cmdline: str = arg();
 if cmdline.has("--help") {
-    print("usage: Rub_program [--mode speed]")
-    exit(0)
+    print("usage: Rub_program [--mode speed]");
+    exit(0);
 }
 
-# =========================================
-# FILES
-# =========================================
+// =========================================
+// FILES
+// =========================================
 
-# Open a file using 'open() as'.
-# The file automatically closes at the end of the block.
-# Any variables created inside the block persist,
-# but the file handle is gone after the closing brace.
+// Open a file using 'open() as'.
+// The file automatically closes at the end of the block.
+// Any variables created inside the block persist,
+// but the file handle is gone after the closing brace.
 
 open("data.txt") as file {
 
-    file.write("Hello")        # overwrite entire file
-    file.add(" World")         # add to end of file
+    file.write("Hello");        // overwrite entire file
+    file.add(" World");         // add to end of file
 
-    let data = file.read()     # read entire file (would be the str+ type)
-    print(data)
+    let data = file.read();     // read entire file (would be the str+ type)
+    print(data);
 
-    let line = file.readln(3)  # read a specific line
-    print(line)
+    let line = file.readln(3);  // read a specific line
+    print(line);
 
-    file.writeln(2, "Updated") # overwrite a specific line
+    file.writeln(2, "Updated"); // overwrite a specific line
 }
 
-# Line indexing starts at 0
-# Iterate over a file line by line:
+// Line indexing starts at 0
+// Iterate over a file line by line:
 
 open("data.txt") as file {
     for line in file {
-        print(line)
+        print(line);
     }
 }
 
-# If the file does not exist, open() creates it, raises a
-# (non-fatal, catchable) error, and then continues.
+// If the file does not exist, open() creates it, raises a
+// (non-fatal, catchable) error, and then continues.
 
-# File utility functions (used outside of open blocks):
+// File utility functions (used outside of open blocks):
 
-file.exists("data.txt")              # returns bool
-file.new("data.txt")                 # create a new file
-file.delete("old.txt")               # delete a file
-file.rename("old.txt", "new.txt")    # rename a file
-file.copy("save.txt", "backup.txt")  # copy a file
-file.list("data/")                   # used like linux ls command
+file.exists("data.txt");              // returns bool
+file.new("data.txt");                 // create a new file
+file.delete("old.txt");               // delete a file
+file.rename("old.txt", "new.txt");    // rename a file
+file.copy("save.txt", "backup.txt");  // copy a file
+file.list("data/");                   // used like linux ls command
 
-# File errors can be caught with try/error:
+// File errors can be caught with try/error:
 
 try {
     open("missing.txt") as file {
-        print(file.read())
+        print(file.read());
     }
 } error {
-    print("File error: " + error)
+    print("File error: " + error);
 }
 
-# missing.txt is created either way — the try/error block
-# just lets you catch and handle the "file did not exist" error.
+// missing.txt is created either way — the try/error block
+// just lets you catch and handle the "file did not exist" error.
 
-# =========================================
-# MEMORY — DROPPING VARIABLES
-# =========================================
+// =========================================
+// MEMORY — DROPPING VARIABLES
+// =========================================
 
-# .drop() frees a variable's memory immediately.
-# The variable no longer exists after being dropped.
-# Collections recursively free all nested data.
+// .drop() frees a variable's memory immediately.
+// The variable no longer exists after being dropped.
+// Collections recursively free all nested data.
 
-let val = 42
-val.drop()
+let val = 42;
+val.drop();
 
-let mut items: list = [1, 2, 3]
-items.drop()
+let mut items: list = [1, 2, 3];
+items.drop();
 
-# You can remove a specific variable in a collection
-# It removes it and shifts the structure it DOES NOT replace it with Null
+// You can remove a specific variable in a collection
+// It removes it and shifts the structure it DOES NOT replace it with Null
 
-items(1).drop()
+items[1].drop();
 
-# =========================================
-# CONDITIONALS
-# =========================================
+// =========================================
+// CONDITIONALS
+// =========================================
 
-let x = 7
+let x = 7;
 
 if x == 7 {
-    print("lucky seven")
+    print("lucky seven");
 } else if x > 10 {
-    print("big number")
+    print("big number");
 } else {
-    print("something else")
+    print("something else");
 }
 
-# The else must be on the } end of the if or other else
+// The else must be on the } end of the if or other else
 
-# =========================================
-# LOOPS
-# =========================================
+// =========================================
+// LOOPS
+// =========================================
 
-# While loop:
+// While loop:
 
-let mut count = 0
+let mut count = 0;
 
 while count < 5 {
-    print(count)
-    count = count + 1
+    print(count);
+    count = count + 1;
 }
 
-# =========================================
-# RANGE LOOP
-# =========================================
+// =========================================
+// RANGE LOOP
+// =========================================
 
-# range(start, end) — end is exclusive.
+// range(start, end) — end is exclusive.
 
-# The loop variable is local to the loop only.
-# It can be named anything and is automatically
-# dropped when the loop ends.
+// The loop variable is local to the loop only.
+// It can be named anything and is automatically
+// dropped when the loop ends.
 
 for i in range(1, 10) {
 
     if i == 5 {
-        break
+        break;
     }
 
-    print(i)
+    print(i);
 }
 
-# The loop variable name is not special.
+// The loop variable name is not special.
 
 for value in range(1, 10) {
-    print(value)
+    print(value);
 }
 
 for banana in range(1, 10) {
-    print(banana)
+    print(banana);
 }
 
-# Loop indexing starts at 0
+// Loop indexing starts at 0
 
-# =========================================
-# COLLECTION ITERATION
-# =========================================
+// =========================================
+// COLLECTION ITERATION
+// =========================================
 
-# Lists, indexes, dicts, and files can be
-# used directly in for loops.
+// Lists, indexes, and files can be
+// used directly in for loops.
 
-# Loop variables are always local to the loop
-# and are automatically dropped after execution.
+// Loop variables are always local to the loop
+// and are automatically dropped after execution.
 
-let items: list = [10, 20, 30]
+let items: list = [10, 20, 30];
 
 for item in items {
-    print(item)
+    print(item);
 }
 
 for number in items {
-    print(number)
+    print(number);
 }
 
-# -----------------------------------------
-# INDEX ITERATION
-# -----------------------------------------
+// -----------------------------------------
+// INDEX ITERATION
+// -----------------------------------------
 
-# Iterating an index yields keys.
+// Iterating an index yields keys.
 
 let table: index = [
     "name": "Rubidium",
     "lang": "Programming"
-]
+];
 
 for key in table {
-    print(key)
-    print(table(key))
+    print(key);
+    print(table[key]);
 }
 
-# -----------------------------------------
-# DICT ITERATION
-# -----------------------------------------
+// -----------------------------------------
+// FILE ITERATION
+// -----------------------------------------
 
-# Iterating a dict yields keys.
-
-let scores: dict = {
-    "players" = ["Alice", "Bob"],
-    "points" = [10, 20]
-}
-
-for key in scores {
-    print(key)
-    print(scores(key, 0))
-}
-
-# -----------------------------------------
-# FILE ITERATION
-# -----------------------------------------
-
-# Iterating a file yields lines.
-# The file handle remains valid only inside
-# the open block scope.
+// Iterating a file yields lines.
+// The file handle remains valid only inside
+// the open block scope.
 
 open("data.txt") as file {
 
     for line in file {
-        print(line)
+        print(line);
     }
 }
 
-# =========================================
-# BREAK & CONTINUE
-# =========================================
+// =========================================
+// BREAK & CONTINUE
+// =========================================
 
-# break exits the loop immediately.
-
-for i in range(1, 10) {
-    if i == 5 {break}
-    print(i)
-}
-
-# continue skips the current iteration.
+// break exits the loop immediately.
 
 for i in range(1, 10) {
-    if i == 5 {continue}
-    print(i)
+    if i == 5 {break;}
+    print(i);
 }
 
-# =========================================
-# FUNCTIONS
-# =========================================
+// continue skips the current iteration.
 
-# Functions share the global memory pool.
+for i in range(1, 10) {
+    if i == 5 {continue;}
+    print(i);
+}
 
-# Function parameters are local to the function
-# and are automatically dropped when the function returns.
+// =========================================
+// FUNCTIONS
+// =========================================
 
-# Basic function:
+// Functions share the global memory pool.
+
+// Function parameters are local to the function
+// and are automatically dropped when the function returns.
+
+// Basic function:
 
 fn greet() {
-    print("Hello!")
+    print("Hello!");
 }
 
-# With parameters:
+// With parameters:
 
 fn add(a: i32, b: i32) -> i32 {
-    return a + b
+    return a + b;
 }
 
-let result = add(2, 3)   # 5
+let result = add(2, 3);   // 5
 
-# Return type is optional.
-# A function with no return type returns nothing.
+// Return type is optional.
+// A function with no return type returns nothing.
 
 fn log(msg: str) {
-    print(i"[LOG] {msg}")
+    print(i"[LOG] {msg}");
 }
 
-# -----------------------------------------
-# DEFAULT PARAMETER VALUES
-# -----------------------------------------
+// -----------------------------------------
+// IMPLICIT RETURN
+// -----------------------------------------
 
-# A parameter can declare a default with `= value` right after its type.
-# A call that omits it uses the default instead.
+// A function's LAST line, if it has NO trailing semicolon, is returned
+// automatically — the same idea as Rust. This works instead of an
+// explicit 'return', or alongside it in other branches.
+
+fn add(a: i32, b: i32) -> i32 {
+    a + b   // no semicolon -> this value is returned
+}
+
+// Equivalent to:
+
+fn add(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+// Only the FINAL line of the block gets this treatment. Every earlier
+// line still needs its semicolon as normal; a missing semicolon on any
+// line that isn't last is a compile error, not an implicit return.
+
+// fn broken() -> i32 {
+//     let x = 5    // ERROR: missing semicolon, and not the last line
+//     x
+// }
+
+// The same rule applies inside a bare { } block (see BLOCK SCOPES below).
+
+// -----------------------------------------
+// BLOCK SCOPES
+// -----------------------------------------
+
+// A bare { } on its own — not attached to an if/while/for/fn — creates a
+// new scope, the same way Rust does. Anything declared 'local' inside is
+// dropped when the block ends, exactly like a loop or function body.
+
+// This is unambiguous with a struct literal: a struct literal is always a
+// TYPE NAME immediately followed by { }, e.g. Point { x: 1, y: 2 } — a
+// bare block has no preceding name at all, it's just { } on its own.
+
+{
+    let local temp = 42;
+    print(temp);
+}
+// temp no longer exists here
+
+// A bare block's last line, if it has no trailing semicolon, becomes the
+// VALUE of the whole block — the same implicit-return rule used in
+// functions. This lets you assign the result of a scoped block straight
+// to a variable:
+
+let result = {
+    let local a = 5;
+    let local b = 10;
+    a + b          // no semicolon -> this becomes the block's value
+};
+
+print(result);   // 15
+// a and b are gone once the block ends; only result survives.
+
+// -----------------------------------------
+// DEFAULT PARAMETER VALUES
+// -----------------------------------------
+
+// A parameter can declare a default with `= value` right after its type.
+// A call that omits it uses the default instead.
 
 fn test(x: i32 = 10, y: i32 = 20, b: i32 = 1) {
-    print(x)
-    print(y)
-    print(b)
+    print(x);
+    print(y);
+    print(b);
 }
 
-test()   # 10, 20, 1 — every default used
+test();   // 10, 20, 1 — every default used
 
-# Parameters WITHOUT a default must all come before the ones that have one
-# — same rule as most languages, so trailing arguments can still be left
-# out and filled positionally without naming them:
+// Parameters WITHOUT a default must all come before the ones that have one
+// — same rule as most languages, so trailing arguments can still be left
+// out and filled positionally without naming them:
 
 fn add(a: i32, b: i32 = 5) -> i32 {
-    return a + b
+    return a + b;
 }
 
-add(7)      # 12 — b uses its default
-add(7, 3)   # 10 — b explicit
+add(7);      // 12 — b uses its default
+add(7, 3);   // 10 — b explicit
 
-# fn add(a: i32 = 1, b: i32) { ... }   # ERROR: 'b' has no default but
-#                                      # follows one that does
+// fn add(a: i32 = 1, b: i32) { ... }   // ERROR: 'b' has no default but
+//                                      // follows one that does
 
-# -----------------------------------------
-# NAMED ARGUMENTS
-# -----------------------------------------
+// -----------------------------------------
+// NAMED ARGUMENTS
+// -----------------------------------------
 
-# A call can bind arguments by parameter name instead of position, in any
-# order — not just for skipping defaults, works for required parameters too:
+// A call can bind arguments by parameter name instead of position, in any
+// order — not just for skipping defaults, works for required parameters too:
 
-test(x = 100, y = 4, b = 9)
-test(b = 9, x = 100, y = 4)   # same call, any order
+test(x = 100, y = 4, b = 9);
+test(b = 9, x = 100, y = 4);   // same call, any order
 
-# Positional and named arguments can mix, but every positional argument
-# must come BEFORE any named one (it fills the next unbound parameter in
-# declaration order; a named one after that could bind the same slot twice
-# with no clear rule for which wins):
+// Positional and named arguments can mix, but every positional argument
+// must come BEFORE any named one (it fills the next unbound parameter in
+// declaration order; a named one after that could bind the same slot twice
+// with no clear rule for which wins):
 
-add(7, b = 3)      # OK — 7 positional for 'a', 3 named for 'b'
-# add(a = 7, 3)    # ERROR: positional argument follows a named one
+add(7, b = 3);      // OK — 7 positional for 'a', 3 named for 'b'
+// add(a = 7, 3);   // ERROR: positional argument follows a named one
 
-# Naming a parameter that doesn't exist, naming the same parameter twice
-# (once positionally and once by name, or twice by name), or leaving a
-# parameter with no default unfilled are all compile errors:
+// Naming a parameter that doesn't exist, naming the same parameter twice
+// (once positionally and once by name, or twice by name), or leaving a
+// parameter with no default unfilled are all compile errors:
 
-# add(c = 1)         # ERROR: no parameter named 'c'
-# add(1, a = 2)      # ERROR: multiple values for parameter 'a'
-# fn needs_two(a: i32, b: i32) {}
-# needs_two(a = 1)   # ERROR: missing required argument 'b'
+// add(c = 1);         // ERROR: no parameter named 'c'
+// add(1, a = 2);      // ERROR: multiple values for parameter 'a'
+// fn needs_two(a: i32, b: i32) {}
+// needs_two(a = 1);   // ERROR: missing required argument 'b'
 
-# Default values and named arguments work the same way for class methods
-# (see CLASSES below) — declared on the method's own parameter list, bound
-# the same way at the call site (p.method(x = 1)).
+// Default values and named arguments work the same way for class methods
+// (see CLASSES below) — declared on the method's own parameter list, bound
+// the same way at the call site (p.method(x = 1)).
 
-# =========================================
-# The Link Rule
-# =========================================
+// =========================================
+// The Link Rule
+// =========================================
 
-# Say you have a variable that is a local val and it is large
-# And you want another function to use it but you don't want to deep copy the large value
-# Then use link
+// Say you have a variable that is a local val and it is large
+// And you want another function to use it but you don't want to deep copy the large value
+// Then use link
 
 fn stuff(val: Any) -> Any {
-    val.add(7)
+    val.add(7);
 }
 
 fn main() {
-    let local large_list: list = ["Lots of Data"]
-    stuff(link large_list)
+    let local large_list: list = ["Lots of Data"];
+    stuff(link large_list);
 }
 
-# This would let the function stuff access the local variable without a deep copy
-# Both functions are now using the same variable both have full access if it is mut both can edit it
+// This would let the function stuff access the local variable without a deep copy
+// Both functions are now using the same variable both have full access if it is mut both can edit it
 
-# If you love pain (rust) then you can use link for variables
+// -----------------------------------------
+// LINK — VARIABLE TO VARIABLE
+// -----------------------------------------
+//
+// link creates a one-way tracking link from the new variable to the source.
+// - If the SOURCE changes, the LINKED variable sees the change
+// - If the LINKED variable is reassigned, the link BREAKS — they become
+//   independent variables in memory (deep copy semantics resume)
+// - Works for scalars, lists, indexes, and individual elements
 
-let a = 10
+let a = 10;
 
-let b = link a
+let b = link a;
 
-# Now if a changes then b will change but if b changes without a then they become unlinked
-# then become there own variable in memory this also works for lists
+// Now if a changes then b will change but if b changes without a then they become unlinked
+// then become their own variable in memory this also works for lists
 
-let x = [1, 2, 3]
-let y = link x(2)
+let x = [1, 2, 3];
+let y = link x[2];    // links to element at index 2
 
-# or
+// or link the whole collection
 
-let x = [1, 2, 3]
-let y = link x
+let x = [1, 2, 3];
+let y = link x;       // y tracks x
 
-# -----------------------------------------
-# LINK ACROSS FILES
-# -----------------------------------------
+// Works the same for index:
 
-# link works through a namespace exactly as it does inside one file.
-# It links to whichever INSTANCE that namespace refers to, so a plain
-# import links to the shared one and an 'import local' links to that
-# file's private one (see SHARED VS LOCAL IMPORTS).
+let idx = ["a": 1, "b": 2];
+let linked_idx = link idx;
 
-import helper
+// -----------------------------------------
+// UNLINK — BREAK A LINK
+// -----------------------------------------
+//
+// Use unlink to explicitly break a link early. After unlink, the variable
+// becomes a standalone deep copy of the current value.
 
-let mut view = link helper.shared_list   # link a module's collection
-let s        = link helper.shared_num    # link a module's scalar
-let el       = link helper.shared_list(2)  # link one element of it
+let a = 10;
+let b = link a;
+a = 20;
+print(b);      // 20 — still linked
 
-# All three track the module's later changes:
+unlink b;
+a = 30;
+print(b);      // 20 — link broken, b is now independent
 
-helper.shared_num = 42
-print(s)                 # 42
+// unlink works on scalars, lists, indexes, and linked elements:
+// unlink y;       // breaks link to list or element
+// unlink linked_idx;
 
-# A module's variable can also be passed by link into another module:
+// -----------------------------------------
+// LINK ACROSS FILES
+// -----------------------------------------
+//
+// link works through a namespace exactly as it does inside one file.
+// It links to whichever INSTANCE that namespace refers to, so a plain
+// import links to the shared one and an 'import local' links to that
+// file's private one (see SHARED VS LOCAL IMPORTS).
 
-helper.append_to(link my_list)
+import helper;
 
-# Editing a linked collection still needs 'mut' on the linked name,
-# the same rule as any other collection:
+let mut view = link helper.shared_list;   // link a module's collection
+let s        = link helper.shared_num;    // link a module's scalar
+let el       = link helper.shared_list[2];  // link one element of it
 
-let mut editable = link helper.shared_list
-editable().add(9)
+// All three track the module's later changes:
 
-# =========================================
-# ERROR HANDLING
-# =========================================
+helper.shared_num = 42;
+print(s);                 // 42
 
-# Use try/error to catch runtime errors.
-# The error variable holds the error message as a str+.
+// A module's variable can also be passed by link into another module:
+
+helper.append_to(link my_list);
+
+// Editing a linked collection still needs 'mut' on the linked name,
+// the same rule as any other collection:
+
+let mut editable = link helper.shared_list;
+editable.add(9);
+
+// -----------------------------------------
+// BIND (&) — PERMANENT TWO-WAY MIRROR
+// -----------------------------------------
+//
+// Use '&' to create a permanent two-way bind. Unlike 'link', which breaks
+// if the target is reassigned, '&' keeps both sides forever attached:
+// - Changes to EITHER side immediately affect the other
+// - Reassignment on either side propagates to the other
+// - They share the exact same memory — no copy ever happens
+// - Works for scalars, lists, indexes, individual elements, and function parameters
+
+// Variable-to-variable bind:
+
+let a = 10;
+let b = &a;          // permanent bind
+
+a = 20;
+print(b);      // 20
+
+b = 30;
+print(a);      // 30 — both ways!
+
+// Works for collections too — mutation AND reassignment propagate:
+
+let mut x = [1, 2, 3];
+let y = &x;          // bind whole list
+
+x.add(4);
+print(y);      // [1, 2, 3, 4]
+
+y = [9, 9];    // reassignment propagates back
+print(x);      // [9, 9]
+
+// Bind individual elements:
+
+let mut arr = [10, 20, 30];
+let elem = &arr[1];   // bind to element at index 1
+
+arr[1] = 99;
+print(elem);    // 99
+
+elem = 77;
+print(arr[1]);  // 77
+
+// Bind index:
+
+let mut idx = ["a": 1];
+let bound_idx = &idx;
+
+idx["b"] = 2;
+print(bound_idx["b"]);   // 2
+
+// -----------------------------------------
+// BIND (&) IN FUNCTIONS
+// -----------------------------------------
+//
+// Use '&' in the parameter declaration and at the call site:
+
+fn modify(&val: Any) {
+    val = 20;        // changes the outer variable too
+    val.add(99);     // mutates the same collection
+}
+
+fn main() {
+    let mut outer = [1, 2, 3];
+    modify(&outer);
+    print(outer);    // [1, 2, 3, 99] — outer was mutated
+}
+
+// For scalars, reassignment also propagates back:
+
+fn set_val(&n: i32) {
+    n = 42;
+}
+
+fn main() {
+    let mut x = 10;
+    set_val(&x);
+    print(x);        // 42
+}
+
+// -----------------------------------------
+// $ — BREAK A BIND
+// -----------------------------------------
+//
+// Use '$' to explicitly break a bind. After $, the variable becomes a
+// standalone deep copy of the current value. The other side is unaffected.
+
+let a = 10;
+let b = &a;
+
+a = 20;
+print(b);      // 20
+
+$ b;           // break the bind
+
+a = 30;
+print(b);      // 20 — b is now independent
+
+// $ works on scalars, lists, indexes, bound elements, and bound function parameters:
+// $ y;            // breaks bind on list
+// $ elem;         // breaks bind on element
+// $ bound_idx;    // breaks bind on index
+
+// Inside a function, $ on a & parameter breaks the bind for that call only:
+// fn demo(&x: i32) {
+//     $ x;        // x is now a local copy, outer unaffected
+//     x = 99;
+// }
+
+// -----------------------------------------
+// DROP BEHAVIOR WITH LINKS AND BINDS
+// -----------------------------------------
+//
+// .drop() on linked/bound variables has special semantics:
+//
+// link:
+//   - Dropping the HEAD (source) drops the CHILD (linked variable) too
+//   - Dropping the CHILD only drops the child — head gets unlinked (survives)
+//
+// & (bind):
+//   - Dropping EITHER side drops BOTH — they share the same memory
+//
+// Examples:
+//
+// let a = [1, 2, 3];
+// let b = link a;       // b tracks a
+// a.drop();             // drops a AND b (both gone)
+//
+// let a = [1, 2, 3];
+// let b = link a;
+// b.drop();             // drops b only, a survives (unlinked)
+//
+// let a = [1, 2, 3];
+// let b = &a;           // permanent bind
+// a.drop();             // drops BOTH a and b
+//
+// let a = [1, 2, 3];
+// let b = &a;
+// b.drop();             // drops BOTH a and b
+//
+// For linked/bound elements:
+//
+// let arr = [1, 2, 3];
+// let elem = link arr[1];
+// arr.drop();           // drops arr AND elem
+//
+// let arr = [1, 2, 3];
+// let elem = &arr[1];
+// elem.drop();          // drops elem AND arr (bind is two-way)
+//
+// -----------------------------------------
+// CLASSES AND STRUCTS WITH LINK/BIND
+// -----------------------------------------
+//
+// link and & work on class fields and struct fields the same as normal variables:
+//
+// class Player() {
+//     let mut health: i32 = 100;
+//     let mut items: list = [];
+// }
+//
+// let mut p = Player();
+// let h = link p.health;      // links to the field
+// let items = &p.items;       // binds to the field
+//
+// Structs:
+//
+// struct Point { x: i32; y: i32; }
+// let mut pt = Point { x: 1, y: 2 };
+// let px = &pt.x;             // bind to struct field
+//
+// When the class/struct instance is dropped, all its fields are dropped.
+// Linked children of those fields are dropped with the head.
+// Bound partners are dropped together (shared memory).
+//
+// -----------------------------------------
+// FUNCTION RETURNS WITH LINK/BIND
+// -----------------------------------------
+//
+// Returning a linked or bound variable returns the VALUE it holds (deep copy
+// semantics for the return), NOT the link/bind itself.
+//
+// If the link/bind originates from a local variable that is the HEAD (source):
+// - The local head goes out of scope and is dropped
+// - The link child dies with the head
+// - The bind partner survives (shared memory) but becomes a standalone copy
+//
+// fn get_link() -> list {
+//     let local head = [1, 2, 3];
+//     let child = link head;
+//     return child;   // returns [1, 2, 3], child dies with head
+// }
+//
+// fn get_bind() -> list {
+//     let local head = [1, 2, 3];
+//     let partner = &head;
+//     return partner; // returns [1, 2, 3], partner survives as independent
+// }
+//
+// To preserve a link/bind across a return, the source must be global or
+// passed in from the caller:
+//
+// fn process(&data: list) -> list {
+//     data.add(99);
+//     return data;    // returns the same bound collection
+// }
+//
+// -----------------------------------------
+// NESTED/CHAINED LINKS AND BINDS
+// -----------------------------------------
+//
+// Chained links:
+//
+// let a = 10;
+// let b = link a;   // b -> a
+// let c = link b;   // c -> b -> a
+//
+// - a changes -> b sees it -> c sees it
+// - b reassigned -> link b->a breaks, c still links to b (now independent)
+// - c reassigned -> link c->b breaks, a and b unaffected
+//
+// Chained binds:
+//
+// let a = 10;
+// let b = &a;       // a <-> b
+// let c = &b;       // a <-> b <-> c (all three share same memory)
+//
+// All three are permanently bound together. Any change propagates to all.
+// $ on any breaks that specific bind; the others remain bound.
+//
+// Mixed chains follow the weakest link: a bind in the chain makes everything
+// from that point onward share memory.
+//
+// -----------------------------------------
+// FIXED-SIZE COLLECTIONS WITH LINK/BIND
+// -----------------------------------------
+//
+// Fixed-size collections (N[]) support link and & on the collection variable
+// and on individual slots:
+//
+// let mut fixed: list = 5[];      // [Null, Null, Null, Null, Null]
+// let slot = &fixed[2];           // bind to slot 2
+// slot = 42;
+// print(fixed[2]);   // 42
+//
+// .drop() on a slot in a fixed-size collection sets that slot to Null
+// (does NOT remove the key — fixed-size length is constant):
+//
+// fixed[2].drop();
+// print(fixed[2]);   // Null
+// print(fixed.len()); // 5
+//
+// You CANNOT drop keys of a fixed-size index (keys 0..N-1 are permanent):
+//
+// let mut fixed_idx: index = 5[];   // 0:Null, 1:Null, 2:Null, 3:Null, 4:Null
+// fixed_idx[2].drop();   // OK — sets value to Null
+// fixed_idx.drop(2);     // ERROR — cannot remove key from fixed-size index
+//
+// -----------------------------------------
+// CLASS METHODS WITH LINK/BIND
+// -----------------------------------------
+//
+// Class methods can use link and & on fields, provided the calling scope
+// has access to the variable being linked/bound:
+//
+// class Container() {
+//     let mut data: list = [];
+//     
+//     fn add_linked(&src: list) {
+//         src.add(99);        // mutates caller's list
+//         data = link src;    // data now tracks caller's list
+//     }
+// }
+//
+// let mut external = [1, 2];
+// let c = Container();
+// c.add_linked(&external);
+// print(external);  // [1, 2, 99]
+// print(c.data);    // [1, 2, 99] (linked)
+//
+// The link/bind follows normal scope rules — the method can only link/bind
+// to variables visible in the caller's scope.
+//
+// -----------------------------------------
+// FFI — NO LINK OR BIND
+// -----------------------------------------
+//
+// link and & are NOT supported across FFI boundaries. You cannot:
+//
+// - Pass a linked variable to an FFI function
+// - Pass a bound variable to an FFI function  
+// - Return a link/bind from an FFI function
+// - Use link/bind on Clist
+//
+// FFI only works with owned values (deep copy semantics). Convert to Clist
+// for lists; index is not supported at all.
+//
+// -----------------------------------------
+// CIRCULAR BINDS
+// -----------------------------------------
+//
+// Circular binds are a compile-time error:
+//
+// let a = 10;
+// let b = &a;
+// let a = &b;   // ERROR: circular bind detected
+//
+// The compiler refuses to compile circular bind chains. The debugger will
+// also warn if a potential circular bind is detected at runtime.
+//
+// -----------------------------------------
+// RECURSION WITH BIND
+// -----------------------------------------
+//
+// Recursive functions with & parameters share the SAME bound variable across
+// all recursive calls (since the outer variable is the same):
+//
+// fn recurse(&n: i32, depth: i32) {
+//     if depth == 0 { return; }
+//     n = n + 1;
+//     recurse(&n, depth - 1);
+// }
+//
+// fn main() {
+//     let mut x = 0;
+//     recurse(&x, 5);
+//     print(x);   // 5 — all calls modified the same x
+// }
+//
+// This is intentional: & creates a permanent bind to the caller's variable,
+// and recursion doesn't create new stack-local copies of bound parameters.
+//
+// -----------------------------------------
+// SY TYPE WITH LINK/BIND
+// -----------------------------------------
+//
+// SY variables support link and & the same as any other type:
+//
+// let name: SY = 'variable';
+// let linked = link name;
+// let bound = &name;
+//
+// -----------------------------------------
+// DEFAULT/NAMED PARAMETERS WITH LINK/BIND
+// -----------------------------------------
+//
+// Default values with & are NOT allowed — a bind must have a concrete
+// caller-provided variable to bind to:
+//
+// fn bad(&x: i32 = 5) { }   // COMPILE ERROR: & parameter cannot have default
+//
+// Named arguments work normally with &:
+//
+// fn set(&n: i32) { n = 42; }
+// fn main() {
+//     let mut x = 0;
+//     set(&n = x);   // OK
+// }
+//
+// -----------------------------------------
+// INDEX ELEMENT DROP
+// -----------------------------------------
+//
+// For non-fixed-size indexes, .drop() on an element REMOVES the key entirely:
+//
+// let mut idx = ["a": 1, "b": 2];
+// idx["a"].drop();
+// print(idx);   // ["b": 2] — key "a" is gone
+//
+// For fixed-size indexes, .drop() on an element sets the value to Null
+// (key cannot be removed):
+//
+// let mut fixed_idx: index = 3[];   // 0:Null, 1:Null, 2:Null
+// fixed_idx[1].drop();   // 1:Null (key remains)
+//
+// -----------------------------------------
+// STRUCT IMPL METHODS WITH LINK/BIND
+// -----------------------------------------
+//
+// impl blocks for structs can use link and & in methods, following the
+// same scope rules as class methods:
+//
+// struct Data { values: list; }
+//
+// impl Data {
+//     fn link_external(&src: list) {
+//         values = link src;
+//     }
+// }
+//
+// -----------------------------------------
+// THREADING WITH LINK/BIND
+// -----------------------------------------
+//
+// link and & create shared memory. Since threads already share the global
+// pool, using link/& on globals across threads works but introduces race
+// conditions — Rubidium provides NO automatic synchronization.
+//
+// The DEBUGGER will warn when a link or bind is created on a global variable
+// that is accessed from multiple threads:
+//
+// let counter = 0;
+// let bound = &counter;   // DEBUGGER WARNING: global bind across threads
+//
+// Thread-local variables (parameters, locals, loop vars) cannot be linked
+// or bound across threads — they don't exist in other threads.
+//
+// -----------------------------------------
+// RULES SUMMARY
+// -----------------------------------------
+//
+// link:
+//   - One-way: source -> target
+//   - Breaks on target reassignment
+//   - Works: variables, lists, indexes, elements, function params
+//   - Break with: unlink
+//
+// & (bind):
+//   - Two-way permanent mirror
+//   - Never breaks automatically
+//   - Works: variables, lists, indexes, elements, function params
+//   - Break with: $
+//
+// Function parameters:
+//   - link param: one-way, breaks if function reassigns param
+//   - & param: two-way, never breaks (unless $ used inside)
+//
+// Both require 'mut' on the source/outer if mutation or reassignment occurs.
+
+// =========================================
+// ERROR HANDLING
+// =========================================
+// ERROR HANDLING
+// =========================================
+
+// Use try/error to catch runtime errors.
+// The error variable holds the error message as a str+.
 
 try {
-    let bad: i32 = 10 / 0
+    let bad: i32 = 10 / 0;
 } error {
-    print("Error: " + error)
+    print("Error: " + error);
 }
 
-# try/error works with file operations too (see FILES section).
+// try/error works with file operations too (see FILES section).
 
-# Use raise to manually trigger a runtime error with a custom message.
-# If raise runs inside a try block — directly, or inside a function called
-# from within that try — the nearest enclosing try's error handler catches
-# it (the message becomes the `error` variable). Outside of any try, raise
-# halts the program with the message.
+// Use raise to manually trigger a runtime error with a custom message.
+// If raise runs inside a try block — directly, or inside a function called
+// from within that try — the nearest enclosing try's error handler catches
+// it (the message becomes the `error` variable). Outside of any try, raise
+// halts the program with the message.
 
 fn check(n: i32) {
     if n < 0 {
-        raise "n must not be negative"
+        raise "n must not be negative";
     }
 }
 
 try {
-    check(-1)
+    check(-1);
 } error {
-    print("Error: " + error)   # Error: n must not be negative
+    print("Error: " + error);   // Error: n must not be negative
 }
 
-# =========================================
-# CLASSES
-# =========================================
+// =========================================
+// CLASSES
+// =========================================
 
-# A class is a self-contained object template.
-# There is no 'self' keyword — class variables are
-# accessed directly from inside the class.
+// A class is a self-contained object template.
+// There is no 'self' keyword — class variables are
+// accessed directly from inside the class.
 
 class player() {
 
-    let mut health: i32  = 100
-    let mut name: str    = "unnamed"
-    let mut scores: list = [0, 0, 0]
+    let mut health: i32  = 100;
+    let mut name: str    = "unnamed";
+    let mut scores: list = [0, 0, 0];
 
     fn greet() {
-        print(i"Hi, I am {name}")
+        print(i"Hi, I am {name}");
     }
 
     fn take_damage(amount: i32) {
-        health = health - amount
+        health = health - amount;
     }
 
     fn reset_scores() {
-        # Inside the class, collection fields are accessed directly
-        # without the instance name — just like non-collection fields.
-        scores(0).set(0)
-        scores(1).set(0)
-        scores(2).set(0)
-        scores().add(0)
+        // Inside the class, collection fields are accessed directly
+        // without the instance name — just like non-collection fields.
+        scores[0].set(0);
+        scores[1].set(0);
+        scores[2].set(0);
+        scores.add(0);
     }
 }
 
-# Create an instance:
+// Create an instance:
 
-let mut p = player()
+let mut p = player();
 
-# Read class fields:
+// Read class fields:
 
-print(p.health)   # 100
+print(p.health);   // 100
 
-# Mutate a non-collection field using =:
-# The instance must be declared with mut.
+// Mutate a non-collection field using =:
+// The instance must be declared with mut.
 
-p.health = 80
-p.name   = "Alice"
+p.health = 80;
+p.name   = "Alice";
 
-# Mutate a collection field using .set():
-# From outside the class, prefix with the instance name.
+// Mutate a collection field using .set():
+// From outside the class, prefix with the instance name.
 
-p.scores(0).set(99)
+p.scores[0].set(99);
 
-# From inside a class method, access directly without the instance name.
-# See reset_scores() in the class definition above.
+// From inside a class method, access directly without the instance name.
+// See reset_scores() in the class definition above.
 
-# Append to a collection field using .add():
+// Append to a collection field using .add():
 
-p.scores().add(50)
+p.scores.add(50);
 
-# Call a class method:
+// Call a class method:
 
-p.greet()
-p.take_damage(10)
+p.greet();
+p.take_damage(10);
 
-# Mutation rules:
-# - If the instance is immutable (no mut), nothing can be changed.
-# - If the instance is mutable (mut), only fields declared
-#   with 'mut' inside the class can be changed.
+// Mutation rules:
+// - If the instance is immutable (no mut), nothing can be changed.
+// - If the instance is mutable (mut), only fields declared
+//   with 'mut' inside the class can be changed.
 
 class locked() {
-    let value: i32 = 42     # can never be changed from outside
+    let value: i32 = 42;     // can never be changed from outside
 }
 
-let mut obj = locked()
-obj.value = 99   # ERROR: value is not declared mut
+let mut obj = locked();
+obj.value = 99;   // ERROR: value is not declared mut
 
-# -----------------------------------------
-# CLASS MEMORY MODEL
-# -----------------------------------------
+// -----------------------------------------
+// CLASS MEMORY MODEL
+// -----------------------------------------
 
-# Class instances do not store their fields
-# in the global memory pool.
-# Each instance owns its own data.
+// Class instances do not store their fields
+// in the global memory pool.
+// Each instance owns its own data.
 
-let mut a = player()
-let mut b = player()
+let mut a = player();
+let mut b = player();
 
-a.health = 50
+a.health = 50;
 
-print(b.health) # 100
+print(b.health); // 100
 
-# Assigning one instance to another creates
-# a complete deep copy.
+// Assigning one instance to another creates
+// a complete deep copy.
 
-let mut a = player()
-let mut b = a
+let mut a = player();
+let mut b = a;
 
-b.health = 10
+b.health = 10;
 
-print(a.health) # 100
-print(b.health) # 10
+print(a.health); // 100
+print(b.health); // 10
 
-# Classes can not access global memory unless link is used or passed through
+// Classes can not access global memory unless link is used or passed through
 
-# =========================================
-# THREADING
-# =========================================
+// =========================================
+// STRUCTS
+// =========================================
 
-# Rubidium supports real POSIX hardware threads.
+// A struct is a plain data type — same idea as Rust: just a named group of
+// fields with types, no default values, and no built-in methods of its
+// own. Compare with CLASSES above: a class carries default field values
+// AND methods together in one block; a struct separates the two — its
+// fields describe shape, and methods (if any) are added afterward with a
+// separate 'impl' block (see IMPL — METHODS FOR STRUCTS below).
 
-use thread
+struct Point {
+    x: i32;
+    y: i32;
+}
+
+// Fields do NOT get a default value — every field must be supplied when
+// creating the struct, using a struct literal:
+
+let p = Point { x: 1, y: 2 };
+
+// Read a field like any other:
+
+print(p.x);   // 1
+
+// -----------------------------------------
+// STRUCT MUTABILITY
+// -----------------------------------------
+
+// Mutability is whole-instance, exactly like Rust — there is no per-field
+// 'mut' the way class fields have one each. If the struct variable itself
+// is declared mut, every field can be reassigned; if not, none can:
+
+let mut q = Point { x: 0, y: 0 };
+q.x = 5;      // OK — q is mut
+q.y = 9;      // OK
+
+let r = Point { x: 0, y: 0 };
+r.x = 1;      // ERROR: r is not mut
+
+// -----------------------------------------
+// STRUCTS AS TYPES
+// -----------------------------------------
+
+// A struct name is a real type — use it anywhere a type goes: variable
+// annotations, function parameters, return types, list/index element
+// types, and class or struct fields.
+
+fn midpoint(a: Point, b: Point) -> Point {
+    Point { x: (a.x + b.x): i32, y: (a.y + b.y): i32 }   // implicit return
+}
+
+let mut points: list = [Point { x: 0, y: 0 }, Point { x: 3, y: 4 }];
+
+class Player() {
+    let mut pos: Point = Point { x: 0, y: 0 };
+}
+
+// Structs can nest other structs as field types, the same way a class can
+// hold another class instance:
+
+struct Line {
+    start: Point;
+    end: Point;
+}
+
+let l = Line { start: Point { x: 0, y: 0 }, end: Point { x: 10, y: 10 } };
+print(l.start.x);   // 0
+
+// -----------------------------------------
+// IMPL — METHODS FOR STRUCTS
+// -----------------------------------------
+
+// A struct's fields are just data, but you can attach behavior to it with
+// a separate 'impl' block. Just like classes, there is no 'self' — a
+// method reads and writes the instance's fields directly by name.
+
+struct NN {
+    val: i32;
+}
+
+impl NN {
+    fn test() {
+        val = val + val;
+    }
+}
+
+// Call it like any other method:
+
+let mut n = NN { val: 5 };
+n.test();
+print(n.val);   // 10
+
+// A method follows the exact same rules as a normal fn — parameters,
+// return types, default/named arguments, and implicit return (no trailing
+// semicolon on the last line) all work the same way:
+
+impl Point {
+    fn length() -> f64 {
+        ((x ** 2 + y ** 2): f64) */ 2   // implicit return
+    }
+}
+
+// You can split a struct's methods across more than one impl block if
+// you want — they all attach to the same struct:
+
+impl Point {
+    fn reset() {
+        x = 0;
+        y = 0;
+    }
+}
+
+// -----------------------------------------
+// IMPL VISIBILITY FOLLOWS THE STRUCT
+// -----------------------------------------
+
+// An impl block's visibility is tied to the struct it belongs to — you
+// never mark individual methods 'pub'. If the struct is declared 'pub',
+// every method in every impl block for it is automatically reachable from
+// other files, with nothing extra needed:
+
+// mathtools.rub
+
+pub struct Vec2 {
+    x: f64;
+    y: f64;
+}
+
+impl Vec2 {
+    fn add(other: Vec2) -> Vec2 {
+        Vec2 { x: (x + other.x): f64, y: (y + other.y): f64 }
+    }
+}
+
+// another_file.rub
+
+import mathtools;
+
+let v = mathtools.Vec2 { x: 1, y: 2 };
+let w = v.add(mathtools.Vec2 { x: 3, y: 4 });   // OK — Vec2 is pub, so is add()
+
+// If the struct is NOT pub, no other file can even construct or name it,
+// so its methods aren't reachable either — writing 'pub fn' inside the
+// impl block has no effect and isn't needed:
+
+struct Internal {
+    id: i32;
+}
+
+impl Internal {
+    fn get_id() -> i32 {
+        id
+    }
+}
+
+// another_file.rub
+// let x = mathtools.Internal { id: 1 };   // ERROR: Internal is not pub
+// x.get_id();                             // unreachable — Internal was never reachable
+
+// -----------------------------------------
+// STRUCT MEMORY MODEL
+// -----------------------------------------
+
+// Structs follow the same deep-copy rule as everything else — assigning
+// one struct to another copies its fields completely, they never share
+// memory:
+
+let mut a = Point { x: 1, y: 1 };
+let mut b = a;
+
+b.x = 99;
+
+print(a.x);   // 1
+print(b.x);   // 99
+
+// Rules:
+// - Struct field declarations use 'name: type;' — no 'let', no default
+//   value, no per-field 'mut'.
+// - Every field must be given a value in the struct literal; missing a
+//   field is a compile error.
+// - Mutability applies to the whole instance — declare the variable with
+//   'mut' to allow reassigning any of its fields.
+// - Structs have no 'self'; an 'impl' block adds methods that access
+//   fields directly by name, exactly like a class method does.
+// - An impl block's visibility always matches its struct's — 'pub' is
+//   declared once, on the struct, never on individual methods.
+// - A struct can have more than one impl block; all of them attach to the
+//   same struct and its fields.
+// - Struct names must be unique within a scope, same as classes and
+//   functions.
+// - Assigning one struct instance to another creates a full deep copy.
+
+// =========================================
+// THREADING
+// =========================================
+
+// Rubidium supports real POSIX hardware threads.
+
+use thread;
 
 fn task_one() {
-    print("Task one done")
+    print("Task one done");
 }
 
 fn task_two() {
-    print("Task two done")
+    print("Task two done");
 }
 
 fn run() {
 
-    # thread(function(), id) — runs function asynchronously.
-    # Thread IDs are integers, like timer IDs.
-    # A thread ID can only be reused after that thread has finished.
+    // thread(function(), id) — runs function asynchronously.
+    // Thread IDs are integers, like timer IDs.
+    // A thread ID can only be reused after that thread has finished.
 
-    thread(task_one(), 1)
-    thread(task_two(), 2)
+    thread(task_one(), 1);
+    thread(task_two(), 2);
 
-    # thread.wait(id, ...) — blocks until all listed threads finish.
+    // thread.wait(id, ...) — blocks until all listed threads finish.
 
-    thread.wait(1, 2)
+    thread.wait(1, 2);
 
-    # thread.running(id) — returns True if the thread is still running.
+    // thread.running(id) — returns True if the thread is still running.
 
-    let still_going: bool = thread.running(1)
+    let still_going: bool = thread.running(1);
 }
 
-# Threading creates a scope with special rules.
+// Threading creates a scope with special rules.
 
 fn task_worker(x) {
-    let local y = 10
-    print("done")
+    let local y = 10;
+    print("done");
 }
 
-let z = 10
+let z = 10;
 
 fn main() {
-    thread(task_worker(1), 1)
-    thread(task_worker(1), 2)
+    thread(task_worker(1), 1);
+    thread(task_worker(1), 2);
 }
 
-# y is local, so each thread shares z but
-# has its own x and y.
+// y is local, so each thread shares z but
+// has its own x and y.
 
-# when you need to stop something
+// when you need to stop something
 
-thread.kill(1)
+thread.kill(1);
 
-# thread.kill(id) stops that thread immediately — even mid-loop with no
-# other work in it (meant for loops, but can be used anywhere). Killing an
-# id with no thread running on it is a harmless no-op. Once killed, the id
-# is free to reuse with a new thread(...) call, same as a thread that
-# finished on its own.
+// thread.kill(id) stops that thread immediately — even mid-loop with no
+// other work in it (meant for loops, but can be used anywhere). Killing an
+// id with no thread running on it is a harmless no-op. Once killed, the id
+// is free to reuse with a new thread(...) call, same as a thread that
+// finished on its own.
 
-# -----------------------------------------
-# THREAD SCOPE RULES
-# -----------------------------------------
+// -----------------------------------------
+// THREAD SCOPE RULES
+// -----------------------------------------
 
-# Threads share the global memory pool.
+// Threads share the global memory pool.
 
-# Any global variable can be read or modified
+// Any global variable can be read or modified
 
-# by any thread.
+// by any thread.
 
-let counter = 0
+let counter = 0;
 
-# All threads can access counter.
+// All threads can access counter.
 
-# -----------------------------------------
-# THREAD-LOCAL DATA
-# -----------------------------------------
+// -----------------------------------------
+// THREAD-LOCAL DATA
+// -----------------------------------------
 
-# Function parameters and local variables
+// Function parameters and local variables
 
-# belong only to the thread currently
+// belong only to the thread currently
 
-# executing them.
+// executing them.
 
 fn worker(id) {
-    let local temp = 10
+    let local temp = 10;
 
-    print(id)
-    print(temp)
+    print(id);
+    print(temp);
 }
 
-# Every thread receives its own copy of:
+// Every thread receives its own copy of:
 
-#
+//
 
-# - Function parameters
+// - Function parameters
 
-# - Local variables
+// - Local variables
 
-# - Loop variables
+// - Loop variables
 
-# These values are never shared between
+// These values are never shared between
 
-# threads.
+// threads.
 
-# -----------------------------------------
-# SHARED DATA
-# -----------------------------------------
+// -----------------------------------------
+// SHARED DATA
+// -----------------------------------------
 
-# Global variables are shared.
+// Global variables are shared.
 
-let total = 0
+let total = 0;
 
 fn add() {
-    total = total + 1
+    total = total + 1;
 }
 
-# If multiple threads modify the same global
+// If multiple threads modify the same global
 
-# variable at the same time, the result is
+// variable at the same time, the result is
 
-# undefined.
+// undefined.
 
-# Rubidium provides no automatic race
+// Rubidium provides no automatic race
 
-# condition protection.
+// condition protection.
 
-# -----------------------------------------
-# AUTOMATIC CLEANUP
-# -----------------------------------------
+// -----------------------------------------
+// AUTOMATIC CLEANUP
+// -----------------------------------------
 
-# When a thread finishes:
-# - Function parameters are dropped
-# - Local variables are dropped
-# - Loop variables are dropped
-# - Global variables remain alive.
+// When a thread finishes:
+// - Function parameters are dropped
+// - Local variables are dropped
+// - Loop variables are dropped
+// - Global variables remain alive.
 
-# -----------------------------------------
-# THREAD MEMORY MODEL
-# -----------------------------------------
+// -----------------------------------------
+// THREAD MEMORY MODEL
+// -----------------------------------------
 
-# Variable Type       Shared?
+// Variable Type       Shared?
 
-# Global Variable     Yes
+// Global Variable     Yes
 
-# Function Parameter  No
+// Function Parameter  No
 
-# Local Variable      No
+// Local Variable      No
 
-# Loop Variable       No
+// Loop Variable       No
 
-# File Handle         No
+// File Handle         No
 
-# Simple rule: If it is in the global pool, it is shared.
-# Otherwise it belongs only to the currently executing thread.
+// Simple rule: If it is in the global pool, it is shared.
+// Otherwise it belongs only to the currently executing thread.
 
-# =========================================
-# RANDOM
-# =========================================
+// =========================================
+// RANDOM
+// =========================================
 
-use random
+use random;
 
-# Generate a random number in a range.
-# random(min, max, type)
+// Generate a random number in a range.
+// random(min, max, type)
 
-let r_int: i32 = random(0, 10, i32)
-let r_flt: f32 = random(0, 1, f32)
+let r_int: i32 = random(0, 10, i32);
+let r_flt: f32 = random(0, 1, f32);
 
-# Shuffle a list in place:
+// Shuffle a list in place:
 
-let mut items: list = [1, 2, 3, 4, 5]
-random.shuffle(items)
+let mut items: list = [1, 2, 3, 4, 5];
+random.shuffle(items);
 
-# Pick a random value from a collection:
+// Pick a random value from a collection:
 
-random.choice(items)
-random.choice_index(items) # returns the index of the iteam isntead of th value
+random.choice(items);
+random.choice_index(items); // returns the index of the item instead of the value
 
-let mut my_index: index = ["a": 1, "b": 2]
-random.choice(my_index)
-# random.choice_index does not work on index as it has one value per key
+let mut my_index: index = ["a": 1, "b": 2];
+random.choice(my_index);
+// random.choice_index does not work on index as it has one value per key
 
-let mut my_dict: dict = { "scores" = [10, 20, 30] }
-random.choice(my_dict)
-random.choice(my_dict("scores"))
-random.choice_index(my_dict("scores")) # can not return keys, with dict+ this rule does not change
+random.seed("seed");
 
-random.seed("seed")
+// to set the starting seed
 
-# to set the starting seed
+// =========================================
+// TIME
+// =========================================
 
-# =========================================
-# TIME
-# =========================================
+use time;
 
-use time
+// Pause execution for a number of seconds.
 
-# Pause execution for a number of seconds.
+time.wait(5);
 
-time.wait(5)
+// Named timers — identified by integer IDs,
+// the same way thread IDs work.
+// Multiple timers can run simultaneously.
 
-# Named timers — identified by integer IDs,
-# the same way thread IDs work.
-# Multiple timers can run simultaneously.
+// Start a timer.
+// Optionally specify a float return type for timer_read.
+// Defaults to f32 if no type is given.
 
-# Start a timer.
-# Optionally specify a float return type for timer_read.
-# Defaults to f32 if no type is given.
+time.timer_start(1);         // returns f32 by default
+time.timer_start(2, f64);    // returns f64
 
-time.timer_start(1)         # returns f32 by default
-time.timer_start(2, f64)    # returns f64
+// Pause a running timer (keeps elapsed time):
 
-# Pause a running timer (keeps elapsed time):
+time.timer_pause(1);
 
-time.timer_pause(1)
+// Stop a timer (resets it):
 
-# Stop a timer (resets it):
+time.timer_stop(1);
 
-time.timer_stop(1)
+// Read elapsed time in seconds.fractional seconds.
+// Returns the float type specified when the timer was started.
 
-# Read elapsed time in seconds.fractional seconds.
-# Returns the float type specified when the timer was started.
+let elapsed = time.timer_read(1);
 
-let elapsed = time.timer_read(1)
+// =========================================
+// OS
+// =========================================
 
-# =========================================
-# OS
-# =========================================
+use os;
 
-use os
+// Start a hidden terminal session with an integer ID.
+// On Linux this opens a bash shell.
+// On Windows this opens cmd or powershell depending on your system.
+// The terminal is not visible — it is for Rubidium only.
 
-# Start a hidden terminal session with an integer ID.
-# On Linux this opens a bash shell.
-# On Windows this opens cmd or powershell depending on your system.
-# The terminal is not visible — it is for Rubidium only.
+os.start(1);
 
-os.start(1)
+// Run a command in a terminal session. The terminal ID is the LAST
+// argument — same convention as thread(function(), id) below, so an
+// os.run(...) call can be dropped straight into thread(...) unchanged
+// (see THREADING + OS below).
 
-# Run a command in a terminal session. The terminal ID is the LAST
-# argument — same convention as thread(function(), id) below, so an
-# os.run(...) call can be dropped straight into thread(...) unchanged
-# (see THREADING + OS below).
+os.run("ls -a", 1);
 
-os.run("ls -a", 1)
+// Capture command output:
 
-# Capture command output:
+let output = os.run("echo hello", 1);
 
-let output = os.run("echo hello", 1)
+// Pass input automatically when the command asks for it:
+// The (optional) middle argument is sent as soon as input is requested.
 
-# Pass input automatically when the command asks for it:
-# The (optional) middle argument is sent as soon as input is requested.
+let result = os.run("sudo apt update", "y", 1);
 
-let result = os.run("sudo apt update", "y", 1)
+// os.run waits for the command to actually finish before returning, so
+// slow or bursty output (e.g. a streaming download) is captured in full,
+// not truncated. There is a generous default safety limit (5 minutes) so a
+// hung command cannot block forever.
 
-# os.run waits for the command to actually finish before returning, so
-# slow or bursty output (e.g. a streaming download) is captured in full,
-# not truncated. There is a generous default safety limit (5 minutes) so a
-# hung command cannot block forever.
+// The struct form accepts an optional `timeout` (in SECONDS) to override
+// that safety limit — useful to bound a command you don't want to wait on:
 
-# The struct form accepts an optional `timeout` (in SECONDS) to override
-# that safety limit — useful to bound a command you don't want to wait on:
+let data = os.run({cmd: "curl -s https://example.com", timeout: 30});
 
-let data = os.run({cmd: "curl -s https://example.com", timeout: 30})
+// The struct form also supports `args` (a list appended to the command) and
+// `input` (sent to the command's stdin), and defaults to terminal 0:
 
-# The struct form also supports `args` (a list appended to the command) and
-# `input` (sent to the command's stdin), and defaults to terminal 0:
+let listing = os.run({cmd: "ls", args: ["-l", "/tmp"]});
 
-let listing = os.run({cmd: "ls", args: ["-l", "/tmp"]})
+// Drop a terminal session to free its resources:
 
-# Drop a terminal session to free its resources:
+os(1).drop();
 
-os(1).drop()
+// -----------------------------------------
+// RUNNING OS COMMANDS ON A THREAD
+// -----------------------------------------
 
-# -----------------------------------------
-# RUNNING OS COMMANDS ON A THREAD
-# -----------------------------------------
+// os.run(...) (normal form only — not the struct form) can be passed
+// straight to thread(...), the same way any other function call can, to
+// run a command in the background without blocking:
 
-# os.run(...) (normal form only — not the struct form) can be passed
-# straight to thread(...), the same way any other function call can, to
-# run a command in the background without blocking:
+use thread;
 
-use thread
+thread(os.run("sleep 5 && echo done", 3), 3);
 
-thread(os.run("sleep 5 && echo done", 3), 3)
+// The terminal session is started automatically if it wasn't already
+// (no need to call os.start(3) yourself first) — its output is discarded,
+// since there's no caller left waiting to receive a return value once the
+// command is running in the background. Use os.start(id) + a normal,
+// non-threaded os.run(...) instead if you need to capture the output.
 
-# The terminal session is started automatically if it wasn't already
-# (no need to call os.start(3) yourself first) — its output is discarded,
-# since there's no caller left waiting to receive a return value once the
-# command is running in the background. Use os.start(id) + a normal,
-# non-threaded os.run(...) instead if you need to capture the output.
+// =========================================
+// FFI — FOREIGN FUNCTION INTERFACE
+// =========================================
 
-# =========================================
-# FFI — FOREIGN FUNCTION INTERFACE
-# =========================================
+// FFI loads a shared library — either another RUBIDIUM-COMPILED one, or a
+// genuine foreign C library. Build a Rubidium one with `-s` (no main
+// entry, every top-level fn exported): `rubidium -s mylib.rub mylib.so`.
+//
+// When both sides are Rubidium's own output, every real Rubidium type
+// shares the exact same value layout and crosses the boundary directly,
+// the same way it would in an ordinary same-file function call.
+//
+// When calling into a genuine foreign C library, scalar types (i32, str,
+// bool, f64, a class instance, Any, ...) are already C-compatible and
+// still cross directly — no conversion step needed there either.
+//
+// Collections are the one exception, in both cases:
+// - list is NOT passed directly — it must be explicitly converted to a
+//   Clist first (see CLIST — PASSING LISTS ACROSS FFI below).
+// - index is NEVER supported across an FFI boundary, against either kind
+//   of library — there is no C-compatible layout for a key-value map.
+//   Binding a function with an index parameter or return type is a
+//   compile error, Any is also not usable on the C side, classes and structs also arent usable on the C side.
 
-# FFI loads another RUBIDIUM-COMPILED shared library — not an arbitrary C/
-# C++/Rust .so. Build one with `-s` (no main entry, every top-level fn
-# exported): `rubidium -s mylib.rub mylib.so`. Both sides of the call are
-# the same compiler's own output, so they share the exact same value
-# layout — any real Rubidium type (i32, str, list, dict+, a class instance,
-# Any, ...) just crosses the boundary directly, the same way it would in an
-# ordinary same-file function call. No conversion step, no restricted type
-# subset.
+use FFI;
 
-use FFI
+let lib = FFI("lib.so");
 
-let lib = FFI("lib.so")
+// Bind an exported function. Parameter/return types are normal Rubidium
+// types for everything except list (use Clist instead) and index (not
+// supported at all).
 
-# Bind an exported function. Parameter/return types are normal Rubidium
-# types — including collections, which a real foreign-C FFI could never
-# accept directly.
+fn lib lib_fn(var: i32, var2: str) as fnut;
 
-fn lib lib_fn(var: i32, var2: dict+) as fnut
+// Call using the Rubidium name.
 
-# Call using the Rubidium name.
+fnut(1, "hello");
 
-fnut(1, my_dictplus)
+// -----------------------------------------
+// CLIST — PASSING LISTS ACROSS FFI
+// -----------------------------------------
 
-# -----------------------------------------
-# FFI FUNCTION RENAMING
-# -----------------------------------------
+// Clist is the C-compatible counterpart of list. A foreign C library (and
+// a Rubidium-compiled one, for consistency) only ever sees Clist in a
+// binding's signature — never a plain list.
 
-# External libraries often have ugly names:
+// .cast() converts a Rubidium list INTO a Clist, ready to send across:
 
-# calculate_vector3_fast()
-# rb_internal_math_v2()
-# _ZN12SomethingFoo...
+let mut my_list: list = [1, 2, 3];
+let c_version = my_list.cast();      // list -> Clist
 
-# Rubidium can expose cleaner names.
+fn lib c_function(arr: Clist) as process_array;
 
-let math_lib = FFI("libs/math.so")
+process_array(c_version);
 
-fn math_lib rb_sin(x: f64) -> f64 as sin
+// .pull() converts a Clist coming back FROM the C side into a normal
+// Rubidium list, so the rest of your code can use it as usual:
 
-print(sin(0.5))
+fn lib get_array() -> Clist as get_array_raw;
 
-# -----------------------------------------
-# FFI WRAPPERS
-# -----------------------------------------
+let raw = get_array_raw();           // Clist
+let back: list = raw.pull();         // Clist -> list
 
-# Foreign functions can be wrapped normally.
+// Rules:
+// - A Clist can only be produced by .cast()-ing a list, or received as a
+//   return value/parameter from an FFI call — there is no Clist literal.
+// - .cast() and .pull() are the only ways to move between list and Clist;
+//   there is no implicit conversion either direction.
+// - Every element type a list already supports is preserved through
+//   .cast()/.pull() — nested lists included.
+// - index has no Clist equivalent and cannot be cast at all.
 
-fn math_lib rb_sqrt(x: f64) -> f64 as raw_sqrt
+// -----------------------------------------
+// FFI FUNCTION RENAMING
+// -----------------------------------------
+
+// External libraries often have ugly names:
+
+// calculate_vector3_fast()
+// rb_internal_math_v2()
+// _ZN12SomethingFoo...
+
+// Rubidium can expose cleaner names.
+
+let math_lib = FFI("libs/math.so");
+
+fn math_lib rb_sin(x: f64) -> f64 as sin;
+
+print(sin(0.5));
+
+// -----------------------------------------
+// FFI WRAPPERS
+// -----------------------------------------
+
+// Foreign functions can be wrapped normally.
+
+fn math_lib rb_sqrt(x: f64) -> f64 as raw_sqrt;
 
 fn sqrt(value: f64) -> f64 {
-    return math_lib.raw_sqrt(value)
+    return math_lib.raw_sqrt(value);
 }
 
-# -----------------------------------------
-# IMPORTING FFI WRAPPERS
-# -----------------------------------------
+// -----------------------------------------
+// IMPORTING FFI WRAPPERS
+// -----------------------------------------
 
-# math_tools.rub
+// math_tools.rub
 
-let native = FFI("libs/math.so")
+let native = FFI("libs/math.so");
 
-fn native native_sin(x: f64) -> f64 as sin
+fn native native_sin(x: f64) -> f64 as sin;
 
-fn native_sqrt(x: f64) -> f64 as sqrt
+fn native_sqrt(x: f64) -> f64 as sqrt;
 
-# another_file.rub
+// another_file.rub
 
-import math_tools as mt
+import math_tools as mt;
 
-mt.sin(1.0)
-mt.sqrt(25.0)
+mt.sin(1.0);
+mt.sqrt(25.0);
 
-# -----------------------------------------
-# FFI CALLBACKS
-# -----------------------------------------
+// -----------------------------------------
+// FFI CALLBACKS
+// -----------------------------------------
 
-# Everything the FFI section above does is Rubidium being the one in
-# charge — you call a C function, it runs, it hands an answer back, done.
-# A callback flips that around: you're telling a C library "here's a piece
-# of code — don't run it now, hang onto it, and call it YOURSELF later,
-# whenever something happens." GLFW doesn't know when you're going to press
-# a key. So instead, you hand GLFW the address of a function ahead of
-# time, and GLFW calls it the instant a key is pressed — possibly seconds
-# or minutes from now, from code you don't control the timing of at all.
+// Everything the FFI section above does is Rubidium being the one in
+// charge — you call a C function, it runs, it hands an answer back, done.
+// A callback flips that around: you're telling a C library "here's a piece
+// of code — don't run it now, hang onto it, and call it YOURSELF later,
+// whenever something happens." GLFW doesn't know when you're going to press
+// a key. So instead, you hand GLFW the address of a function ahead of
+// time, and GLFW calls it the instant a key is pressed — possibly seconds
+// or minutes from now, from code you don't control the timing of at all.
 
-# Why this needs its own keyword instead of just "get the address": a
-# normal Rubidium function is compiled expecting to be called BY OTHER
-# RUBIDIUM CODE, which quietly sets a few things up every time a function
-# is called — memory bookkeeping, and a way to report errors back up the
-# chain. Think of it like an employee who needs their desk, badge, and
-# tools ready before their shift starts — Rubidium sets all of that up
-# automatically every time you call a function, without you ever seeing it
-# happen. If C just called your function's raw address directly, none of
-# that setup would happen. `fn callback` exists so you never have to think
-# about this — it quietly builds a small "receptionist" in front of your
-# function that does Rubidium's setup first, then calls your real code,
-# every single time C calls in.
+// Why this needs its own keyword instead of just "get the address": a
+// normal Rubidium function is compiled expecting to be called BY OTHER
+// RUBIDIUM CODE, which quietly sets a few things up every time a function
+// is called — memory bookkeeping, and a way to report errors back up the
+// chain. Think of it like an employee who needs their desk, badge, and
+// tools ready before their shift starts — Rubidium sets all of that up
+// automatically every time you call a function, without you ever seeing it
+// happen. If C just called your function's raw address directly, none of
+// that setup would happen. `fn callback` exists so you never have to think
+// about this — it quietly builds a small "receptionist" in front of your
+// function that does Rubidium's setup first, then calls your real code,
+// every single time C calls in.
 
-# `fn callback` is just like a normal `fn`, with a body and everything —
-# the ONLY difference is the word `callback` right after `fn`. That one
-# word tells the compiler "a C library is going to call this directly, at
-# some unpredictable point in the future — build the receptionist for it."
-# Because of this, `callback` is a reserved word — it can't be used as a
-# variable or parameter name anywhere, the same as `local`/`open`/`file`.
+// `fn callback` is just like a normal `fn`, with a body and everything —
+// the ONLY difference is the word `callback` right after `fn`. That one
+// word tells the compiler "a C library is going to call this directly, at
+// some unpredictable point in the future — build the receptionist for it."
+// Because of this, `callback` is a reserved word — it can't be used as a
+// variable or parameter name anywhere, the same as `local`/`open`/`file`.
 
-# The parameter types here are NOT your choice — they have to match
-# EXACTLY what the C library's own documentation says it will pass to your
-# function. C decides the shape; Rubidium just needs to be told what it
-# is, the same way you already tell it the shape of a C function you're
-# calling INTO (fn ffi_lib my_c_function(msg: str) -> i32 as my_function).
+// The parameter types here are NOT your choice — they have to match
+// EXACTLY what the C library's own documentation says it will pass to your
+// function. C decides the shape; Rubidium just needs to be told what it
+// is, the same way you already tell it the shape of a C function you're
+// calling INTO (fn ffi_lib my_c_function(msg: str) -> i32 as my_function).
 
 fn callback my_key_handler(window: Any, key: i32, scancode: i32, action: i32, mods: i32) -> Any {
-    print(i"key pressed: {key}")
+    print(i"key pressed: {key}");
 }
 
-# Handing GLFW the callback: write the function's NAME, with no
-# parentheses and no arguments. Parentheses would CALL it right now,
-# today, once — which isn't what you want. Leaving them off means "here's
-# the function itself, hang onto it and call it yourself later." This is
-# the one new piece of syntax here: everywhere else in Rubidium, a bare
-# function name with no call is an error — but for a name declared with
-# `fn callback`, it's how you hand it off.
-
-glfw.set_key_callback(win, my_key_handler)
-
-# From this point on, you don't call my_key_handler yourself at all — GLFW
-# does, on its own schedule, every time a key event happens, for as long
-# as your program keeps polling for events (glfwPollEvents()). Nothing
-# else about writing the function's BODY is different from any other
-# Rubidium function — print(), global variables, everything works
-# normally inside it, specifically because the generated receptionist
-# already did the setup before your code runs.
-
-# Rules:
-# - Use `fn callback` instead of plain `fn` ONLY for a function you're
-#   going to hand to a C library as an event handler. Every other function
-#   stays exactly as `fn` as always.
-# - The parameter types and return type must match what the C library
-#   will actually call your function with — the compiler cannot check this
-#   for you, the same way it can't check a regular FFI binding's signature.
-# - Write the function name with NO parentheses when handing it to a C
-#   library expecting a callback. With parentheses, it's an ordinary
-#   function call, right now, once.
-# - Not yet supported: calling/passing a `fn callback` in debug mode
-#   (`xeon run --debug` / the debugger) — compile and run the real binary
-#   to test callback behavior.
-
-# =========================================
-# KEYBOARD
-# =========================================
-
-# the keyboard module is a cleaner, instant version of input() — a key is
-# read the moment it's pressed, no Enter needed.
-
-# `use X as Y` works on any module (not just imports) — Y is just a local
-# rename, X is still the real module.
-
-use keyboard as key
-
-# key.wait() blocks until a key is pressed, then returns it as a str.
-
-print(key.wait())
-
-# As soon as a key is pressed it stops and returns it.
-
-# Letters always come back lowercase, e.g. "a" — never "A". Shift+letter
-# and Ctrl+letter are reported as "shift+a" / "ctrl+a" (the letter tells you
-# which key, the prefix tells you which modifier was held). Other keys come
-# back as their own name: "space", "enter", "tab", "backspace", "esc",
-# "up", "down", "left", "right". Anything else prints as the character
-# itself (e.g. "!", "9").
-#
-# A bare Shift/Ctrl/Alt/CapsLock press with nothing else can't be reported
-# at all — no terminal program can see that, only its effect on a key
-# pressed alongside it. This module only ever tells you about a real key.
-
-# key.thread(rate) polls the keyboard in the background — pair it with
-# thread(...) so it doesn't block your main loop, and read key.last() from
-# there to pick up what it's seen.
-
-thread(key.thread(100), 1)
-
-# this must be used with the thread module — checks for a key press this
-# many times a second (default 100, can be changed).
-
-let mut pressed: str = key.last()
-
-# key.last() is non-blocking and consuming: it returns the most recent key
-# key.thread() has seen, or "" if nothing new has come in since the last
-# call — so polling it in a loop never sees the same keypress twice.
-
-# =========================================
-# NET
-# =========================================
-
-# net connects Rubidium programs to each other on a LAN — not a general
-# sockets API. Two programs speak the same built-in protocol automatically;
-# you never touch ports, addresses, or handshakes yourself.
-
-use net
-
-# net.process(rate, name) must be running (via thread) before find() /
-# requests() / accept() do anything — it's what makes YOUR program
-# discoverable to other Rubidium programs' net.find() calls, and handles
-# the protocol plumbing in the background. Runs forever, like a while loop.
-#
-#   rate — how many visibility pings per second it broadcasts so already-
-#          running programs are ambiently discoverable. Optional, defaults
-#          to 2. While it's alive it also listens for and answers incoming
-#          net.find() requests and connection requests the whole time.
-#   name — an optional display name (defaults to "" — no name set). A
-#          named peer shows up AS that name in find()/list()/requests()
-#          instead of a bare number (see DISCOVERY below).
-
-thread(net.process(2), 0)                    # no name — shows up as a number
-thread(net.process(2, "Max's Game"), 0)      # named
+// Handing GLFW the callback: write the function's NAME, with no
+// parentheses and no arguments. Parentheses would CALL it right now,
+// today, once — which isn't what you want. Leaving them off means "here's
+// the function itself, hang onto it and call it yourself later." This is
+// the one new piece of syntax here: everywhere else in Rubidium, a bare
+// function name with no call is an error — but for a name declared with
+// `fn callback`, it's how you hand it off.
 
-# -----------------------------------------
-# DISCOVERY
-# -----------------------------------------
+glfw.set_key_callback(win, my_key_handler);
 
-# find() actively sends out a discovery request and collects replies from
-# every net.process() currently running on the LAN. Returns a list ordered
-# by ping, fastest first — each entry is that peer's NAME if they set one,
-# or their id (a plain number) if they didn't.
+// From this point on, you don't call my_key_handler yourself at all — GLFW
+// does, on its own schedule, every time a key event happens, for as long
+// as your program keeps polling for events (glfwPollEvents()). Nothing
+// else about writing the function's BODY is different from any other
+// Rubidium function — print(), global variables, everything works
+// normally inside it, specifically because the generated receptionist
+// already did the setup before your code runs.
 
-let found: list = net.find()
-# e.g. ["Max's Game", 7, "Bob's Server"]
+// Rules:
+// - Use `fn callback` instead of plain `fn` ONLY for a function you're
+//   going to hand to a C library as an event handler. Every other function
+//   stays exactly as `fn` as always.
+// - The parameter types and return type must match what the C library
+//   will actually call your function with — the compiler cannot check this
+//   for you, the same way it can't check a regular FFI binding's signature.
+// - Write the function name with NO parentheses when handing it to a C
+//   library expecting a callback. With parentheses, it's an ordinary
+//   function call, right now, once.
+// - Not yet supported: calling/passing a `fn callback` in debug mode
+//   (`xeon run --debug` / the debugger) — compile and run the real binary
+//   to test callback behavior.
 
-# Currently-connected peers (already accepted/connected, not just found) —
-# same convention: name if set, id otherwise.
+// =========================================
+// MODULES & IMPORTS
+// =========================================
 
-let connected: list = net.list()
+// Imported files are isolated through namespaces.
+// 'use' enables built-in compiler-provided modules.
+// A module that is not declared with 'use' cannot be accessed.
 
-# -----------------------------------------
-# CONNECTING
-# -----------------------------------------
+use thread;
+use random;
+use time;
+use os;
+use FFI;
 
-# connect/accept/listen/data/send/close all take whatever value came out
-# of find()/list()/requests() — a name OR a plain id, either works:
+// 'import' loads an external .rub file from the same folder into your code with the name of the file as the namespace
 
-net.connect("Max's Game")   # or: net.connect(7)
+import math_tools;
 
-# Two peers CAN pick the same name — there's no uniqueness check. Connecting
-# by a duplicate name always resolves to whichever match is FIRST in ping
-# order (the closest/fastest one) — the same ordering find()/list() already
-# use, so it's a deterministic tiebreak, not a random pick.
+math_tools.sin(0.5);
 
-let pending: list = net.requests()   # ids/names currently asking to connect
-net.accept("Max's Game")
+// -----------------------------------------
+// IMPORTING FROM FOLDERS
+// -----------------------------------------
 
-# -----------------------------------------
-# RECEIVING
-# -----------------------------------------
+// Use '::' to path down through folders to a file. The namespace used to
+// access it is just the last segment (the filename), same as a plain
+// import — the folder path is only there to find the file.
 
-thread(net.listen("Max's Game"), 5)   # runs forever, receiving for that connection
+import myfolder::mathtools;
 
-# Poll from your own loop. Consuming read: once read, it's cleared for
-# that connection — the next net.data(...) call returns Null until a NEW
-# message arrives, so you never process the same message twice.
+mathtools.sin(0.5);
 
-let msg = net.data("Max's Game")
+// '::' can go through as many nested folders as needed:
 
-# -----------------------------------------
-# SENDING
-# -----------------------------------------
+import myfolder::subfolder::mathtools;
 
-# Send any Rubidium value. It goes out as a string with a small type-tag
-# header, and the receiving side's net.data() converts it back to the
-# right type automatically — you get back an i32, a str, a list, etc., not
-# raw text.
-#
-# Wire format: "TAG:value", tag is one of i/f/s/b/n/l —
-#   i:42            -> i32/i64  42
-#   f:3.14          -> float    3.14
-#   s:hello         -> str      "hello"
-#   b:True          -> bool     True
-#   n:              -> Null
-#   l:i:7,s:K,i:2   -> list     [7, "K", 2]  (elements recursively tagged)
-#
-# v1 covers scalars and FLAT lists of scalars only — nested list/index/
-# dict/dict+ aren't supported over the wire yet.
+mathtools.sin(0.5);
 
-net.send("Max's Game", "hit:0")
-net.send("Max's Game", 42)
-net.send("Max's Game", [7, "K", 2])
+// A further '::segment' after the filename names ONE specific symbol
+// (a fn, class, struct, or variable) inside that file, and imports just
+// that symbol directly — no namespace prefix needed to use it:
 
-# -----------------------------------------
-# CLOSING
-# -----------------------------------------
+import myfolder::mathtools::pi;
 
-net.close("Max's Game")
+print(pi);          // used bare, not mathtools.pi
 
-# =========================================
-# MODULES & IMPORTS
-# =========================================
+import myfolder::mathtools::sin;
 
-# Imported files are isolated through namespaces.
-# 'use' enables built-in compiler-provided modules.
-# A module that is not declared with 'use' cannot be accessed.
+sin(0.5);            // used bare, not mathtools.sin(0.5)
 
-use thread
-use random
-use time
-use os
-use FFI
+// Only symbols declared 'pub' inside that file can be reached this way —
+// see VISIBILITY below. Importing a non-pub symbol, or a symbol that
+// doesn't exist, is a compile error.
 
-# 'import' loads an external .rub file from the same folder into your code with the name of the file as the namespace
+// 'as', 'local', and combinations of both work the same after a path
+// import as they do after a plain one:
 
-import math_tools
+import myfolder::mathtools as mt;
+import myfolder::mathtools::pi as PI;
+import local myfolder::mathtools;
+import local myfolder::mathtools::pi as PI;
 
-math_tools.sin(0.5)
+// =========================================
+// IMPORT ALIASES
+// =========================================
 
-# =========================================
-# IMPORT ALIASES
-# =========================================
+// Imports can be renamed using 'as'.
+// This creates a shorter namespace alias.
 
-# Imports can be renamed using 'as'.
-# This creates a shorter namespace alias.
+import math_tools as mt;
 
-import math_tools as mt
+mt.sin(0.5);
 
-mt.sin(0.5)
+// The original namespace still exists.
 
-# The original namespace still exists.
+math_tools.sin(0.5);
 
-math_tools.sin(0.5)
+// Alias names only affect access.
+// They do not copy or duplicate the module.
 
-# Alias names only affect access.
-# They do not copy or duplicate the module.
+// =========================================
+// SHARED VS LOCAL IMPORTS
+// =========================================
 
-# =========================================
-# SHARED VS LOCAL IMPORTS
-# =========================================
+// A plain 'import' creates ONE shared instance of that module for the whole
+// program. The module's file is loaded once, and every file that imports it
+// sees the same variables — exactly like a normal global.
 
-# A plain 'import' creates ONE shared instance of that module for the whole
-# program. The module's file is loaded once, and every file that imports it
-# sees the same variables — exactly like a normal global.
+// main.rub
+import file_one;
+import file_two;
 
-# main.rub
-import file_one
-import file_two
+// file_two.rub
+import file_one;
 
-# file_two.rub
-import file_one
+// Here file_one exists once. If main.rub changes file_one's state, file_two
+// sees that change, and the other way round — they are the same variable.
 
-# Here file_one exists once. If main.rub changes file_one's state, file_two
-# sees that change, and the other way round — they are the same variable.
+file_one.bump();          // main.rub
+print(file_one.count);    // 1
+print(file_two.read());   // 1  — file_two reads the same file_one
 
-file_one.bump()          # main.rub
-print(file_one.count)    # 1
-print(file_two.read())   # 1  — file_two reads the same file_one
+// 'import local' gives the importing file its OWN private instance instead.
+// The module is loaded again under that file alone, with its own independent
+// copy of every variable. This mirrors 'let' vs 'let local': shared by
+// default, 'local' when you want your own.
+
+// file_two.rub
+import local file_one;
+
+// Now file_two has a file_one that is completely separate from main's.
 
-# 'import local' gives the importing file its OWN private instance instead.
-# The module is loaded again under that file alone, with its own independent
-# copy of every variable. This mirrors 'let' vs 'let local': shared by
-# default, 'local' when you want your own.
-
-# file_two.rub
-import local file_one
-
-# Now file_two has a file_one that is completely separate from main's.
-
-file_one.bump()          # main.rub — affects main's instance only
-print(file_one.count)    # 1
-print(file_two.read())   # 0  — file_two's own instance is untouched
-
-# Rules:
-# - 'import x'        — one instance shared by every file that imports it
-# - 'import local x'  — a private instance belonging to this file only
-# - Two different files that each use 'import local x' get two separate
-#   instances, and neither affects the shared one.
-# - A local instance runs the module's top level for itself, so it starts
-#   from the module's initial values.
-# - Aliases work the same way: 'import local file_one as fo'
-
-import local math_tools as mt
-
-# =========================================
-# MAIN ENTRY POINT
-# =========================================
-
-# The compiler always looks for fn main() as the program entry point.
-# It runs after all top-level code has finished.
+file_one.bump();          // main.rub — affects main's instance only
+print(file_one.count);    // 1
+print(file_two.read());   // 0  — file_two's own instance is untouched
+
+// Rules:
+// - 'import x'        — one instance shared by every file that imports it
+// - 'import local x'  — a private instance belonging to this file only
+// - Two different files that each use 'import local x' get two separate
+//   instances, and neither affects the shared one.
+// - A local instance runs the module's top level for itself, so it starts
+//   from the module's initial values.
+// - Aliases work the same way: 'import local file_one as fo'
+
+import local math_tools as mt;
+
+// =========================================
+// VISIBILITY — pub
+// =========================================
+
+// By default, a fn, class, struct, or top-level variable is PRIVATE to the
+// file it's declared in — other files can't reach it through a namespace,
+// and can't name it in a path import (see IMPORTING FROM FOLDERS above).
+// Add 'pub' right before the declaration to make it accessible to other
+// files that import this one.
+
+// mathtools.rub
+
+pub fn sin(x: f64) -> f64 {
+    return raw_sin(x);
+}
+
+fn raw_sin(x: f64) -> f64 {
+    // helper — not pub, so no other file can call this directly
+    return 0.0;
+}
+
+pub let pi: f64 = 3.14159;
+let internal_cache: f64 = 0.0;   // not pub — private to mathtools.rub
+
+pub class Vector() {
+    let mut x: f64 = 0;
+    let mut y: f64 = 0;
+}
+
+class InternalHelper() {
+    // not pub — invisible outside mathtools.rub
+}
+
+pub struct Point {
+    x: i32;
+    y: i32;
+}
+
+struct InternalConfig {
+    // not pub — invisible outside mathtools.rub, same rule as anything else
+    retries: i32;
+}
+
+// another_file.rub
+
+import mathtools;
+
+mathtools.sin(0.5);     // OK — sin is pub
+print(mathtools.pi);    // OK — pi is pub
+
+mathtools.raw_sin(0.5);      // ERROR: raw_sin is not pub
+print(mathtools.internal_cache);  // ERROR: internal_cache is not pub
+let v = mathtools.Vector();  // OK — Vector is pub
+let h = mathtools.InternalHelper();  // ERROR: InternalHelper is not pub
+let pt = mathtools.Point { x: 1, y: 2 };        // OK — Point is pub
+let cfg = mathtools.InternalConfig { retries: 3 };  // ERROR: InternalConfig is not pub
+
+// The same rule applies to path/specific-symbol imports:
+
+import mathtools::pi;         // OK — pi is pub
+import mathtools::raw_sin;    // ERROR: raw_sin is not pub
+
+// Rules:
+// - Declarations are private by default; 'pub' opts them into visibility
+//   from other files.
+// - 'pub' has no effect on visibility WITHIN the same file — every
+//   top-level symbol is already fully visible to the rest of its own file
+//   regardless of 'pub'.
+// - Visibility is per-symbol, not per-file: a file can freely mix pub and
+//   non-pub fns/classes/variables.
+// - Referencing a non-pub symbol from another file (via namespace access
+//   or a path import) is a compile error, the same as referencing a
+//   symbol that doesn't exist at all.
+// - 'import local' does not change visibility rules — a non-pub symbol in
+//   the target file still can't be reached, even though the importer gets
+//   its own private instance of the module.
+// - A struct's 'impl' block methods are never marked 'pub' individually —
+//   they automatically follow the struct's own visibility (see IMPL
+//   VISIBILITY FOLLOWS THE STRUCT, under STRUCTS).
+
+// =========================================
+// MAIN ENTRY POINT
+// =========================================
+
+// The compiler always looks for fn main() as the program entry point.
+// It runs after all top-level code has finished.
 
 fn main() {
-    print("Welcome to Rubidium!")
+    print("Welcome to Rubidium!");
 }
 
 
 
-# =========================================
-# XEON
-# =========================================
+// =========================================
+// XEON
+// =========================================
 
-# Xeon is the Rubidium manager and can do extra stuff
+// Xeon is the Rubidium manager and can do extra stuff
 
-# -----------------------------------------
-# XEON PACKAGES
-# -----------------------------------------
+// -----------------------------------------
+// XEON PACKAGES
+// -----------------------------------------
+//
+// If you install Rubidium from the official manager (Xeon)
+// Then you can use packages
+//
+// Packages are loaded using the standard 'use' syntax with the xeon:: prefix:
+//
+// use xeon::math_tools;
+//
+// print(math_tools.pi);
+//
+// From the caller's side, a package is used just like an import —
+// same namespace-based access. The difference is where the code
+// comes from: import loads a local .rub file, while Xeon downloads
+// and manages the package for you.
+// If you want to learn more use the command Xeon pkg help
 
-# If you install Rubidium from the official manager (Xeon)
-# Then you can use packages
+// -----------------------------------------
+// XEON LIB COMPILE
+// -----------------------------------------
 
-xeon math_tools
+// With Xeon you can compile Rubidium code without a entry and use as a lib
+// The only different rules are that there is no top level and no main()
 
-print(math_tools.pi)
+// =========================================
+// NOTES
+// =========================================
 
-# From the caller's side, a package is used just like an import —
-# same namespace-based access. The difference is where the code
-# comes from: import loads a local .rub file, while Xeon downloads
-# and manages the package for you.
-# If you want to learn more use the command Xeon pkg help
+// Syntax:
+//   - Statements end with a semicolon ;
+//   - EXCEPT: a block's (function or bare { }) final line with no
+//     semicolon is returned/becomes that block's value, implicit-return
+//     style
+//   - Blocks use braces { }
+//   - Comments use //
+//   - Strings use double quotes
+//   - String interpolation uses: i"text {variable}"
+//   - Boolean values are True and False
+//   - Logical operators are: and, or, not
+//   - Type casting uses: as
+//   - Square root uses: */value
+//   - Collection/index READ access uses [ ]: my_list[0], my_index["name"],
+//     my_index[1][2] for nested lookups
+//   - Writes chain a [ ] path (when going to a specific element), then call
+//     .set()/.add()/.drop(): my_list[0].set(value), my_nested[1]["test"].add(value)
+//   - Calling .add()/.drop() on the whole collection (no path) needs no
+//     parens: my_list.add(value), my_index.add(key, value)
 
-# -----------------------------------------
-# XEON LIB COMPILE
-# -----------------------------------------
-
-# With Xeon you can compile Rubidium code without a entry and use as a lib
-# The only different rules are that there is no top level and no main()
-
-# =========================================
-# NOTES
-# =========================================
-
-# Syntax:
-#   - Statements end with a newline
-#   - Semicolons are not required
-#   - Blocks use braces { }
-#   - Comments use #
-#   - Strings use double quotes
-#   - String interpolation uses: i"text {variable}"
-#   - Boolean values are True and False
-#   - Logical operators are: and, or, not
-#   - Type casting uses: as
-#   - Square root uses: */value
-
-# Memory:
-#   - All assignments create a full deep copy
-#   - Values are never borrowed or shared
-#   - Variables live in the global pool by default
-#   - Memory must be freed manually with .drop()
-#   - Accessing dropped memory causes a runtime error
-#   - Loop variables are automatically dropped when the loop ends
-#   - File handles are automatically dropped when an open() block ends
-#   - Global memory must be freed manually with .drop()
-#   - Temporary scoped values are dropped automatically
-#   - Null is a valid value for all types (exists but empty)
-#   - Null == Null is True
+// Memory:
+//   - All assignments create a full deep copy
+//   - Values are never borrowed or shared
+//   - Variables live in the global pool by default
+//   - Memory must be freed manually with .drop()
+//   - Accessing dropped memory causes a runtime error
+//   - Loop variables are automatically dropped when the loop ends
+//   - File handles are automatically dropped when an open() block ends
+//   - Global memory must be freed manually with .drop()
+//   - Temporary scoped values are dropped automatically
+//   - Null is a valid value for all types (exists but empty)
+//   - Null == Null is True
 
 
-# Global Variables:
-#   - Variables declared without local enter the global memory pool
-#   - Global variables remain alive until dropped
-#   - Global variables are accessible from functions and threads
-#   - Global variables may be shadowed by local variables
+// Global Variables:
+//   - Variables declared without local enter the global memory pool
+//   - Global variables remain alive until dropped
+//   - Global variables are accessible from functions and threads
+//   - Global variables may be shadowed by local variables
 
-# Assignment:
-#   - Assignment copies values
-#   - Assignment never creates references
-#   - Assignment never transfers ownership
-#   - Assignment always creates an independent value
+// Assignment:
+//   - Assignment copies values
+//   - Assignment never creates references
+//   - Assignment never transfers ownership
+//   - Assignment always creates an independent value
 
-# Scope:
-#   - Variables created at the top level are visible everywhere
-#   - Functions can access global variables
-#   - Function parameters exist only for the lifetime of the function
-#   - Classes create their own scope
-#   - Imported files create their own namespace
-#   - Symbols are resolved from the nearest scope outward
-#   - Local scope always takes priority over global scope
+// Scope:
+//   - Variables created at the top level are visible everywhere
+//   - Functions can access global variables
+//   - Function parameters exist only for the lifetime of the function
+//   - Classes create their own scope
+//   - Imported files create their own namespace
+//   - Symbols are resolved from the nearest scope outward
+//   - Local scope always takes priority over global scope
+//   - A bare { } block (not attached to if/while/for/fn) also creates its
+//     own scope; locals inside are dropped when it ends, and its
+//     no-semicolon final line becomes the block's value
 
-# Functions:
-#   - Function names must be unique within a scope
-#   - Duplicate function definitions cause compile errors
-#   - Function overloading is not supported
-#   - Functions may access global variables
-#   - Parameters follow local-variable rules
+// Functions:
+//   - Function names must be unique within a scope
+//   - Duplicate function definitions cause compile errors
+//   - Function overloading is not supported
+//   - Functions may access global variables
+//   - Parameters follow local-variable rules
+//   - A function's final line with no trailing semicolon is returned
+//     implicitly, same as an explicit 'return'
 
-# Variable Creation & Assignment:
-#   - Variables must be created using let
-#   - Assignment without let modifies an existing variable
-#   - Attempting to assign to a variable that does not exist causes a compile error
-#   - let cannot be used to modify an existing variable
+// Variable Creation & Assignment:
+//   - Variables must be created using let
+//   - Assignment without let modifies an existing variable
+//   - Attempting to assign to a variable that does not exist causes a compile error
+//   - let cannot be used to modify an existing variable
 
-# Mutability:
-#   - Variables are immutable by default
-#   - Variables must be declared with mut to allow reassignment
-#   - Attempting to modify a non-mut variable causes a compile error
-#   - Mutability rules apply equally to globals, locals, class fields, and parameters
+// Mutability:
+//   - Variables are immutable by default
+//   - Variables must be declared with mut to allow reassignment
+//   - Attempting to modify a non-mut variable causes a compile error
+//   - Mutability rules apply equally to globals, locals, class fields, and parameters
 
-# Shadowing:
-#   - Local variables may use the same name as global variables
-#   - This is called shadowing
-#   - When shadowed, the global variable becomes inaccessible
-#   - All reads and writes affect the local variable
-#   - When the local variable is dropped, access returns to the global variable
-#   - There is no syntax to access a hidden global variable while a local shadow exists
+// Shadowing:
+//   - Local variables may use the same name as global variables
+//   - This is called shadowing
+//   - When shadowed, the global variable becomes inaccessible
+//   - All reads and writes affect the local variable
+//   - When the local variable is dropped, access returns to the global variable
+//   - There is no syntax to access a hidden global variable while a local shadow exists
 
-# Function Parameters:
-#   - Function parameters behave as local variables
-#   - Parameters may shadow global variables
-#   - Parameters are automatically dropped when the function returns
-#   - Parameters follow normal mutability rules
-#   - Parameters do not enter the global memory pool
+// Function Parameters:
+//   - Function parameters behave as local variables
+//   - Parameters may shadow global variables
+//   - Parameters are automatically dropped when the function returns
+//   - Parameters follow normal mutability rules
+//   - Parameters do not enter the global memory pool
 
-# Types:
-#   - Type checking happens at compile time
-#   - Null is valid for every type
-#   - Any can store any value type
-#   - Assigning an incompatible type causes a compile error
-#   - Unknown or missing symbols raise compile errors (error if fn/class not found)
-#   - Reassignment rules depend on mut (non-mut = compile error)
-#   - Not all errors are runtime; many are compile-time by design
-#   - Variables, functions, classes, and namespaces must have unique names within a scope
-#   - Duplicate symbol definitions cause compile errors
+// Types:
+//   - Type checking happens at compile time
+//   - Null is valid for every type
+//   - Any can store any value type
+//   - Assigning an incompatible type causes a compile error
+//   - Unknown or missing symbols raise compile errors (error if fn/class not found)
+//   - Reassignment rules depend on mut (non-mut = compile error)
+//   - Not all errors are runtime; many are compile-time by design
+//   - Variables, functions, classes, and namespaces must have unique names within a scope
+//   - Duplicate symbol definitions cause compile errors
 
-# Null:
-#   - Null represents an existing value with no data
-#   - Null can be compared using == and !=
-#   - Null is considered smaller than all non-null values
-#   - Example: Null < 0 is True
-#   - Null comparisons are valid and well-defined across types
+// Null:
+//   - Null represents an existing value with no data
+//   - Null can be compared using == and !=
+//   - Null is considered smaller than all non-null values
+//   - Example: Null < 0 is True
+//   - Null comparisons are valid and well-defined across types
 
-# Collections:
-#   - Collections require mut to be modified
-#   - list   = ordered sequence of values
-#   - index  = key -> single scalar value map (never a collection)
-#   - dict   = key -> collection map
-#   - dict+  = key -> nested dict+ map (unlimited nesting depth)
-#   - .len() returns the number of items
-#   - .has() checks for keys or values
-#   - Accessing a missing key or index causes a runtime error
-#   - Iteration behavior:
-#       * list   -> values
-#       * index  -> keys
-#       * dict   -> keys
-#       * dict+  -> keys
-#       * file   -> lines
-#   - Collections use deep copy on assignment
-#   - You can force collection types: let x: list: i32 = [0, 10, 32]
-#   - .set() and .add() completely replace Null values
-#   - If a target contains Null, the Null value is destroyed
-#     and the new value takes its place
-#   - Null is never preserved after replacement
-#   - For lists and dict value collections, .add() appends normally
-#     and does not remove existing values
-#   - The exception is when a collection contains only a single Null value
-#   - In that case, .add() replaces the Null instead of appending
-#
-#     [Null].add(5)
-#     # Result: [5]
-#
-#     [1, Null].add(5)
-#     # Result: [1, Null, 5]
+// Collections:
+//   - Collections require mut to be modified
+//   - N[] creates a FIXED-SIZE collection of length N: a list of N Nulls,
+//     or (for index) keys 0..N-1 each with value Null
+//   - A fixed-size collection's .add()/.drop() are runtime errors; .set()
+//     on an existing slot still works
+//   - list   = ordered sequence of values
+//   - index  = key -> value map; a value may be a scalar, a list, or
+//              another index (nesting to any depth)
+//   - .len() returns the number of items
+//   - .has() checks for keys or values
+//   - Accessing a missing key or index causes a runtime error
+//   - Iteration behavior:
+//       * list   -> values
+//       * index  -> keys
+//       * file   -> lines
+//   - Collections use deep copy on assignment
+//   - You can force collection types: let x: list: i32 = [0, 10, 32];
+//   - Read access uses [ ]: my_list[0], my_index["key"], my_index[1][2]
+//   - .set() and .add() completely replace Null values
+//   - If a target contains Null, the Null value is destroyed
+//     and the new value takes its place
+//   - Null is never preserved after replacement
+//   - For lists and index value collections, .add() appends normally
+//     and does not remove existing values
+//   - The exception is when a collection contains only a single Null value
+//   - In that case, .add() replaces the Null instead of appending
+//
+//     [Null].add(5);
+//     // Result: [5]
+//
+//     [1, Null].add(5);
+//     // Result: [1, Null, 5]
 
-# Collection Equality:
-#   - Collection equality compares contents
-#   - Two collections with identical contents are equal
-#   - Equality is checked recursively
-#   - Null values inside collections are valid and comparable
+// Collection Equality:
+//   - Collection equality compares contents
+//   - Two collections with identical contents are equal
+//   - Equality is checked recursively
+//   - Null values inside collections are valid and comparable
 
-# Strings:
-#   - Strings are zero indexed
-#   - .len() returns number of characters
-#   - .char(index) returns character at index
-#   - .set(index, value) replaces a character
-#   - .set() requires a single-character string
-#   - .insert(index, value) inserts text before index
-#   - .replace(old, new) replaces all matches
-#   - .slice() returns list of characters
-#   - String modification requires mut
-#   - Strings are iterable in loops
+// Strings:
+//   - Strings are zero indexed
+//   - .len() returns number of characters
+//   - .char(idx) returns character at idx
+//   - .set(idx, value) replaces a character
+//   - .set() requires a single-character string
+//   - .insert(idx, value) inserts text before idx
+//   - .replace(old, new) replaces all matches
+//   - .slice() returns list of characters
+//   - String modification requires mut
+//   - Strings are iterable in loops
 
-# Loops:
-#   - Loop variable names can be anything
-#   - Loop variables are local to the loop
-#   - Loop variables are automatically dropped after the loop
-#   - Lists yield values
-#   - Indexes yield keys
-#   - Dicts yield keys
-#   - Files yield lines
-#   - User-defined classes cannot define custom iteration behavior
-#   - Loop variables are not persistent outside loop scope
+// Loops:
+//   - Loop variable names can be anything
+//   - Loop variables are local to the loop
+//   - Loop variables are automatically dropped after the loop
+//   - Lists yield values
+//   - Indexes yield keys
+//   - Files yield lines
+//   - User-defined classes cannot define custom iteration behavior
+//   - Loop variables are not persistent outside loop scope
 
-# Range:
-#   - range(start, end) excludes the end value
-#   - If start < end, counts upward
-#   - If start > end, counts downward
+// Range:
+//   - range(start, end) excludes the end value
+//   - If start < end, counts upward
+//   - If start > end, counts downward
 
-# Indexes:
-#   - Iteration preserves insertion order
-#   - Keys can be any type (not just strings)
+// Indexes:
+//   - Iteration preserves insertion order
+//   - Keys can be any type (not just strings)
+//   - Values can be any type, including another index, allowing unlimited
+//     nesting depth without a separate collection type
 
-# Classes:
-#   - Class names must be unique within a scope
-#   - Duplicate class definitions cause compile errors
-#   - Class instances follow normal deep-copy rules
-#   - Assigning one instance to another creates a full copy
-#   - Class fields marked mut may be modified
-#   - Non-mut fields cannot be modified
-#   - No "self" keyword; fields are accessed directly
-#   - Methods operate on instance state implicitly
-#   - No self parameter is required
-#   - Class fields may be accessed directly from inside class methods
-#   - Attempting to modify locked fields causes compile error
+// Classes:
+//   - Class names must be unique within a scope
+//   - Duplicate class definitions cause compile errors
+//   - Class instances follow normal deep-copy rules
+//   - Assigning one instance to another creates a full copy
+//   - Class fields marked mut may be modified
+//   - Non-mut fields cannot be modified
+//   - No "self" keyword; fields are accessed directly
+//   - Methods operate on instance state implicitly
+//   - No self parameter is required
+//   - Class fields may be accessed directly from inside class methods
+//   - Attempting to modify locked fields causes compile error
 
-# Threads:
-#   - Threads share access to global variables
-#   - Multiple threads may modify the same variable
-#   - No race-condition protection is provided
-#   - Invalid memory access causes runtime error
-#   - Thread IDs are required for control and synchronization
-#   - Global variables are shared by all threads
-#   - Function parameters are private to the executing thread
-#   - Local variables are private to the executing thread
-#   - Loop variables are private to the executing thread
-#   - Shadowing rules work the same inside threads
-#   - Accessing a global variable inside a thread accesses the shared global variable
-#   - Modifying shared globals from multiple threads may produce undefined results
+// Structs:
+//   - Struct names must be unique within a scope
+//   - Fields declare only 'name: type;' — no default value, no per-field mut
+//   - Every field must be given a value in the struct literal
+//   - Mutability is whole-instance (mut on the variable), not per-field
+//   - Structs have no "self"; methods are added via a separate 'impl'
+//     block, accessing fields directly by name like a class method
+//   - A struct can have multiple impl blocks
+//   - An impl block's visibility matches its struct's automatically —
+//     'pub' is written once on the struct, never on individual methods
+//   - A struct name is a usable type anywhere a type is expected
+//   - Struct instances follow normal deep-copy rules on assignment
 
-# Imports:
-#   - use enables built-in modules
-#   - import loads external .rub files
-#   - Imported files are accessed through their namespace
-#   - Built-in modules and imported namespaces are separate systems
-#   - Missing imports or symbols result in compile errors
+// Threads:
+//   - Threads share access to global variables
+//   - Multiple threads may modify the same variable
+//   - No race-condition protection is provided
+//   - Invalid memory access causes runtime error
+//   - Thread IDs are required for control and synchronization
+//   - Global variables are shared by all threads
+//   - Function parameters are private to the executing thread
+//   - Local variables are private to the executing thread
+//   - Loop variables are private to the executing thread
+//   - Shadowing rules work the same inside threads
+//   - Accessing a global variable inside a thread accesses the shared global variable
+//   - Modifying shared globals from multiple threads may produce undefined results
 
-# Files & Memory Notes:
-#   - open() blocks auto-close file handles
-#   - File variables persist after block ends
-#   - File operations support try/error handling
-#   - File iteration yields lines only inside open scope
+// Imports:
+//   - use enables built-in modules
+//   - import loads external .rub files
+//   - Imported files are accessed through their namespace
+//   - '::' paths down through folders to a file: import folder::file;
+//   - A trailing '::symbol' after the file imports one pub symbol
+//     directly, usable bare with no namespace prefix
+//   - The namespace for a path import is always just the filename,
+//     regardless of how many folders were traversed
+//   - Built-in modules and imported namespaces are separate systems
+//   - Missing imports or symbols result in compile errors
+//   - Importing or accessing a non-pub symbol from another file is a
+//     compile error
 
-# Errors:
-#   - Compile errors prevent the program from running
-#   - Runtime errors occur during execution
-#
-# Compile Error Examples:
-#   - Unknown variable
-#   - Unknown function
-#   - Unknown class
-#   - Unknown namespace
-#   - Type mismatch
-#   - Mutability violation
-#   - Duplicate symbol definition
-#   - Invalid assignment target
-#
-# Runtime Error Examples:
-#   - Divide by zero
-#   - Invalid index access
-#   - Missing collection key
-#   - Accessing dropped memory
-#   - Invalid file operations
-#   - Invalid FFI calls
-#
-# General Rules:
-#   - Attempting to modify a non-mut value causes a compile error
-#   - Accessing null behaves as a valid but empty state
-#   - Missing symbols are detected at compile time when possible
+// Visibility:
+//   - Top-level fn, class, and variable declarations are private to their
+//     file by default
+//   - 'pub' before a declaration makes it visible to other files
+//   - 'pub' does not affect visibility within the same file
+//   - Visibility is per-symbol; a file may mix pub and non-pub declarations
+//   - Applies the same way to plain imports and path/specific-symbol imports
 
-# Local Variables:
-#   - Declared using 'local'
-#   - Syntax: let mut local x: type = value
-#   - Exist only inside the current block or function
-#   - Automatically dropped at scope exit
-#   - Cannot be accessed outside their scope
-#   - May shadow global variables
-#   - Do not enter the global pool
-#   - Follow normal mutability rules
+// Files & Memory Notes:
+//   - open() blocks auto-close file handles
+//   - File variables persist after block ends
+//   - File operations support try/error handling
+//   - File iteration yields lines only inside open scope
 
-# Integer Overflow:
-#   - When an operation exceeds the maximum or minimum value of a
-#     type, the value stays clamped at that max/min — it does not
-#     wrap around.
-#   - A non-fatal runtime error is raised to flag this, but unlike
-#     other runtime errors, it does NOT require a try/error block —
-#     the program always keeps running with the clamped value.
-#   - Overflow errors are reported once per operation.
-#   - The clamped result is stored before execution continues.
+// Errors:
+//   - Compile errors prevent the program from running
+//   - Runtime errors occur during execution
+//
+// Compile Error Examples:
+//   - Unknown variable
+//   - Unknown function
+//   - Unknown class
+//   - Unknown namespace
+//   - Type mismatch
+//   - Mutability violation
+//   - Duplicate symbol definition
+//   - Invalid assignment target
+//
+// Runtime Error Examples:
+//   - Divide by zero
+//   - Invalid index access
+//   - Missing collection key
+//   - Accessing dropped memory
+//   - Invalid file operations
+//   - Invalid FFI calls
+//
+// FFI Rules:
+//   - FFI can bind to a Rubidium-compiled shared library or a genuine
+//     foreign C library
+//   - Scalar types cross an FFI boundary directly in both cases — no
+//     conversion needed
+//   - list must be explicitly converted with .cast() (list -> Clist)
+//     before crossing, and .pull() (Clist -> list) coming back
+//   - index is never supported across FFI; binding a function with an
+//     index parameter or return type is a compile error
+//
+// General Rules:
+//   - Attempting to modify a non-mut value causes a compile error
+//   - Accessing null behaves as a valid but empty state
+//   - Missing symbols are detected at compile time when possible
+
+// Local Variables:
+//   - Declared using 'local'
+//   - Syntax: let mut local x: type = value;
+//   - Exist only inside the current block or function
+//   - Automatically dropped at scope exit
+//   - Cannot be accessed outside their scope
+//   - May shadow global variables
+//   - Do not enter the global pool
+//   - Follow normal mutability rules
+
+// Overflow:
+//   - When an operation exceeds the maximum or minimum value of a
+//     type, the value stays clamped at that max/min — it does not
+//     wrap around.
+//   - A non-fatal runtime error is raised to flag this, but unlike
+//     other runtime errors, it does NOT require a try/error block —
+//     the program always keeps running with the clamped value.
+//   - Overflow errors are reported once per operation.
+//   - The clamped result is stored before execution continues.
+
+// MISC:
+//   - Programers Notation made be used for ints and floats eg. 1e-3 as f32
