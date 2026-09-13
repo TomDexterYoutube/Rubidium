@@ -487,11 +487,11 @@ let mut fixed: list = (size_code)[];
 // STR+
 // =========================================
 
-// str+ is the same as str but it uses 3 " and can use more then 1 line
+// str+ is the same as str but it uses 3 " and can use contiune any char but cant be a i string
 
 let my_str_plus: str+ = """
 Hello
-I'm a big string!
+I'm a big string! "what me use double qoutes", and 'singal qoutes'
 """;
 
 // =========================================
