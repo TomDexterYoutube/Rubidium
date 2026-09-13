@@ -91,11 +91,16 @@ def _scan_istring(code, start):
     i = start + 2  # skip i"
     depth = 0       # brace nesting depth
     in_str = False  # are we inside a nested " string inside {}?
+    escaped = False # was the previous char an unescaped backslash?
     while i < len(code):
         c = code[i]
-        if in_str:
-            if c == '\\':
-                i += 2; continue  # skip escaped char
+        if escaped:
+            # Current char is escaped, treat it literally
+            escaped = False
+        elif c == '\\':
+            # Backslash escapes the next character
+            escaped = True
+        elif in_str:
             if c == '"':
                 in_str = False
         else:

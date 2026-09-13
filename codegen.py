@@ -1363,6 +1363,21 @@ class CodeGen:
             # bound somewhere longer-lived (which calls _escape_temp).
             self.emit(f"  {tracked} = call %Box* @rub_temp_track(%Box* {copied})")
             return tracked
+        # BUG FIX (bugs.log #1): a collection access FnCall (e.g. dict(key))
+        # returns a deep copy, but when stored in a variable it needs an
+        # additional deep copy to ensure the stored value is fully independent
+        # and not affected by temp arena management.
+        if val_t == "%Box*" and isinstance(source_node, FnCall) and isinstance(source_node.name, str):
+            # Check if this is a collection access (name is a variable in scope)
+            name = source_node.name
+            is_collection_var = (any(name in scope for scope in self.local_vars_stack) 
+                                or name in self.global_vars)
+            if is_collection_var:
+                copied = self.new_tmp()
+                tracked = self.new_tmp()
+                self.emit(f"  {copied} = call %Box* @box_deep_copy(%Box* {val})")
+                self.emit(f"  {tracked} = call %Box* @rub_temp_track(%Box* {copied})")
+                return tracked
         # BUG (found via syntax sweep): a `str`-typed variable's slot must
         # always hold a buffer IT owns, because .drop() unconditionally
         # frees whatever is in the slot. Three ways that used to not be true:
@@ -4409,7 +4424,14 @@ class CodeGen:
         else:
             call_tmp = f"%ffi_ret_{self.new_tmp()[1:]}"
             pending.append(f"  {call_tmp} = call {ret_ir} {fp_cast}({args_str})")
-            pending.append(f"  ret {ret_ir} {call_tmp}")
+            # BUG FIX (bugs.log #3): FFI bool returns i32 from C but Rubidium
+            # expects i1. Convert C bool (0/1) to Rubidium bool (i1).
+            if ret_ir == "i32" and node.ret_type == "bool":
+                conv_tmp = f"%ffi_conv_{self.new_tmp()[1:]}"
+                pending.append(f"  {conv_tmp} = icmp ne i32 {call_tmp}, 0")
+                pending.append(f"  ret i1 {conv_tmp}")
+            else:
+                pending.append(f"  ret {ret_ir} {call_tmp}")
         pending.append("}")
 
         self._pending_trampolines += pending
@@ -5250,7 +5272,9 @@ class CodeGen:
             # emit_ffi_bind) — matches this same default there. Non-FFI
             # internal functions keep the pre-existing i64 default
             # unchanged, since that's an established, separate behavior.
-            ret_ir = self._ffi_type_to_ir(fn_ret) if fn_ret else ("void" if is_ffi else "i64")
+            # For FFI functions, the wrapper now returns Rubidium types (i1 for bool,
+            # not i32), so use rubi_type_to_ir for the return type.
+            ret_ir = self.rubi_type_to_ir(fn_ret) if fn_ret else ("void" if is_ffi else "i64")
             # BUGFIX (bugs.log #1): call fn_obj.name, the actual emitted symbol,
             # which differs from target_name only for reserved-C-symbol collisions.
             if ret_ir == "void":

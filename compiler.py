@@ -23,7 +23,8 @@ RUNTIME_C = r"""
 // which class it was, since the compiler's normal method-call resolution
 // is static/name-based and a %Box* alone has no such information. (Tag 4
 // is already used for bool — see box_b below.)
-typedef struct { int type; long long i; double f; char* s; void* p; long long class_id; } Box;
+typedef union { long long i; double f; char* s; void* p; } BoxPayload;
+typedef struct { int type; BoxPayload payload; long long class_id; } Box;
 typedef struct { int magic; Box** items; int count; int cap; } RList;
 typedef struct { int magic; Box** keys; Box** vals; int count; int cap; } RDict;
 // FEATURE: dict+ reuses the exact same RDict layout as dict — the only
@@ -154,38 +155,38 @@ void _thread_kill(long long tid) {
 
 void box_drop(Box* b) {
     if (!b) return;
-    if (b->type == 2 && b->s) free(b->s);
-    if (b->type == 3 && b->p) {
-        int* magic = (int*)b->p;
+    if (b->type == 2 && b->payload.s) free(b->payload.s);
+    if (b->type == 3 && b->payload.p) {
+        int* magic = (int*)b->payload.p;
         if (magic && *magic == 1) {
-            RList* l = (RList*)b->p;
+            RList* l = (RList*)b->payload.p;
             for(int i=0; i<l->count; i++) box_drop(l->items[i]);
             free(l->items); free(l);
         } else if (magic && IS_DICT_MAGIC(*magic)) {
-            RDict* d = (RDict*)b->p;
+            RDict* d = (RDict*)b->payload.p;
             for(int i=0; i<d->count; i++) { box_drop(d->keys[i]); box_drop(d->vals[i]); }
             free(d->keys); free(d->vals); free(d);
         } else {
-            free(b->p);
+            free(b->payload.p);
         }
     }
     free(b);
 }
 
-Box* box_i(long long i) { Box* b=malloc(sizeof(Box)); b->type=0; b->i=i; return b; }
-Box* box_f(double f) { Box* b=malloc(sizeof(Box)); b->type=1; b->f=f; return b; }
-Box* box_s(char* s) { Box* b=malloc(sizeof(Box)); b->type=2; b->s=strdup(s); return b; }
-Box* box_p(void* p) { Box* b=malloc(sizeof(Box)); b->type=3; b->p=p; return b; }
-Box* box_b(long long i) { Box* b=malloc(sizeof(Box)); b->type=4; b->i=i; return b; }
+Box* box_i(long long i) { Box* b=malloc(sizeof(Box)); b->type=0; b->payload.i=i; return b; }
+Box* box_f(double f) { Box* b=malloc(sizeof(Box)); b->type=1; b->payload.f=f; return b; }
+Box* box_s(char* s) { Box* b=malloc(sizeof(Box)); b->type=2; b->payload.s=strdup(s); return b; }
+Box* box_p(void* p) { Box* b=malloc(sizeof(Box)); b->type=3; b->payload.p=p; return b; }
+Box* box_b(long long i) { Box* b=malloc(sizeof(Box)); b->type=4; b->payload.i=i; return b; }
 // OPEN-4: Null gets its own real Box type tag (6) instead of being encoded
 // as a type==0 int holding the INT32_MIN sentinel value — a genuine boxed
 // int that happens to equal INT32_MIN is no longer misidentified as Null.
 // `i` is still set to the old sentinel as a defensive fallback for any
 // code path that unboxes via unbox_i()/->i without checking type==6 first.
-Box* box_null(void) { Box* b=malloc(sizeof(Box)); b->type=6; b->i=-2147483648LL; b->f=0.0; b->s=NULL; b->p=NULL; b->class_id=-1; return b; }
+Box* box_null(void) { Box* b=malloc(sizeof(Box)); b->type=6; b->payload.i=-2147483648LL; b->payload.f=0.0; b->payload.s=NULL; b->payload.p=NULL; b->class_id=-1; return b; }
 // bugs.log OPEN-9: boxed class instance — p is the raw struct pointer,
 // class_id identifies which class it is (see codegen's self.class_ids).
-Box* box_class(void* p, long long class_id) { Box* b=malloc(sizeof(Box)); b->type=5; b->p=p; b->class_id=class_id; return b; }
+Box* box_class(void* p, long long class_id) { Box* b=malloc(sizeof(Box)); b->type=5; b->payload.p=p; b->class_id=class_id; return b; }
 Box* box_deep_copy(Box* src);  // OPEN-9: forward decl (defined later)
 // BUG-3: forward decls for the temporary arena (defined further down). Every
 // function below that stores a Box BY POINTER calls rub_temp_untrack on it,
@@ -195,10 +196,10 @@ Box* box_deep_copy(Box* src);  // OPEN-9: forward decl (defined later)
 Box* rub_temp_untrack(Box* b);
 Box* box_copy(Box* src) {
     if(!src) return box_i(0);
-    if(src->type==0) return box_i(src->i);
-    if(src->type==1) return box_f(src->f);
-    if(src->type==2) return box_s(src->s);
-    if(src->type==4) return box_b(src->i);
+    if(src->type==0) return box_i(src->payload.i);
+    if(src->type==1) return box_f(src->payload.f);
+    if(src->type==2) return box_s(src->payload.s);
+    if(src->type==4) return box_b(src->payload.i);
     if(src->type==6) return box_null();
     // OPEN-9 (SIGSEGV / heap-use-after-free): a collection (type 3) used to be
     // returned by SHARED POINTER here — but every caller of box_copy takes
@@ -234,22 +235,22 @@ Box* box_copy(Box* src) {
 // switches on ->type) read the same element correctly.
 long long unbox_i(Box* b) {
     if(!b) return 0;
-    if(b->type==1) return (long long)b->f;
-    return b->i;
+    if(b->type==1) return (long long)b->payload.f;
+    return b->payload.i;
 }
 double unbox_f(Box* b) {
     if(!b) return 0.0;
-    if(b->type==0) return (double)b->i;
-    return b->f;
+    if(b->type==0) return (double)b->payload.i;
+    return b->payload.f;
 }
-char* unbox_s(Box* b) { return (b && b->type==2) ? b->s : ""; }
+char* unbox_s(Box* b) { return (b && b->type==2) ? b->payload.s : ""; }
 // bugs.log OPEN-9: accept type==5 (boxed class instance) too, not just the
 // generic type==3 pointer/collection tag — every EXISTING static-type
 // pointer coercion (e.g. `let x: Item = d("k1")`) already goes through
 // unbox_p, so a boxed class instance must unbox the same way a plain boxed
 // pointer does; only the NEW dynamic-dispatch path additionally needs the
 // class_id alongside it (see unbox_class_id below).
-void* unbox_p(Box* b) { return (b && (b->type==3 || b->type==5)) ? b->p : NULL; }
+void* unbox_p(Box* b) { return (b && (b->type==3 || b->type==5)) ? b->payload.p : NULL; }
 long long unbox_class_id(Box* b) { return (b && b->type==5) ? b->class_id : -1; }
 
 // ── Rubidium runtime error mechanism ──────────────────────────────────────
@@ -687,7 +688,7 @@ Box* make_list() { RList* l=malloc(sizeof(RList)); l->magic=1; l->count=0; l->ca
 void list_append_raw(Box* lst, Box* b) {
     rub_temp_untrack(b);        /* the list owns b from here on */
     if(!lst || lst->type != 3) return;
-    RList* l=lst->p;
+    RList* l=lst->payload.p;
     if(!l || l->magic != 1) return; /* not a list */
     if(l->count==l->cap){l->cap*=2; l->items=realloc(l->items,l->cap*sizeof(Box*));}
     l->items[l->count++]=b;
@@ -695,7 +696,7 @@ void list_append_raw(Box* lst, Box* b) {
 void list_append(Box* lst, Box* b) {
     rub_temp_untrack(b);        /* the list owns b from here on */
     if(!lst || lst->type != 3) return;
-    RList* l=lst->p;
+    RList* l=lst->payload.p;
     if(!l || l->magic != 1) return; /* not a list */
     // Spec: [Null].add(x) -> [x]  (single null is replaced, not appended to)
     // [1, Null].add(x) -> [1, Null, x]  (null in non-singleton list is kept)
@@ -729,14 +730,14 @@ Box* str_split(char* src, char* delim) {
 }
 void list_swap(Box* lst, int i, int j) {
     if(!lst) return;
-    RList* l=lst->p;
+    RList* l=lst->payload.p;
     if(i>=0 && i<l->count && j>=0 && j<l->count) {
         Box* tmp=l->items[i]; l->items[i]=l->items[j]; l->items[j]=tmp;
     }
 }
 Box* list_get(void* col, Box* idx) {
     if(!col) return box_i(0);
-    RList* l=col; int i=idx->i; /* 0-based indexing */
+    RList* l=col; int i=idx->payload.i; /* 0-based indexing */
     if(i>=0 && i<l->count) return l->items[i];
     char msg[64]; snprintf(msg, sizeof(msg), "list index %d out of bounds (length %d)", i, l->count);
     _rub_error_msg = strdup(msg);
@@ -758,8 +759,8 @@ int box_equal(Box* a, Box* b) {
     if (!a || !b) return 0;
     if (a->type != b->type) return 0;
     switch (a->type) {
-        case 0: return a->i == b->i;
-        case 1: return a->f == b->f;
+        case 0: return a->payload.i == b->payload.i;
+        case 1: return a->payload.f == b->payload.f;
         // OPEN-4: Null == Null is True (per spec), and both are type==6
         // here already (a->type != b->type would have returned 0 above).
         case 6: return 1;
@@ -767,29 +768,29 @@ int box_equal(Box* a, Box* b) {
         // had no case here at all, so two equal-valued-but-distinct bool
         // boxes fell through every case and hit the final `return 0` below
         // — comparing two boxed `True` values would incorrectly say unequal.
-        case 4: return a->i == b->i;
+        case 4: return a->payload.i == b->payload.i;
         // bugs.log OPEN-9: class instances compare equal only if they're
         // the same underlying instance (and, redundantly but harmlessly,
         // the same class) — field-by-field structural equality isn't
         // possible generically without per-class layout knowledge.
-        case 5: return a->p == b->p && a->class_id == b->class_id;
+        case 5: return a->payload.p == b->payload.p && a->class_id == b->class_id;
         case 2:
-            if (!a->s || !b->s) return a->s == b->s;
-            return strcmp(a->s, b->s) == 0;
+            if (!a->payload.s || !b->payload.s) return a->payload.s == b->payload.s;
+            return strcmp(a->payload.s, b->payload.s) == 0;
         case 3: {
-            if (!a->p || !b->p) return a->p == b->p;
-            int magic_a = *(int*)a->p;
-            int magic_b = *(int*)b->p;
+            if (!a->payload.p || !b->payload.p) return a->payload.p == b->payload.p;
+            int magic_a = *(int*)a->payload.p;
+            int magic_b = *(int*)b->payload.p;
             if (magic_a != magic_b) return 0;
             if (magic_a == 1) {
-                RList* la = (RList*)a->p; RList* lb = (RList*)b->p;
+                RList* la = (RList*)a->payload.p; RList* lb = (RList*)b->payload.p;
                 if (la->count != lb->count) return 0;
                 for (int i = 0; i < la->count; i++) {
                     if (!box_equal(la->items[i], lb->items[i])) return 0;
                 }
                 return 1;
             } else if (magic_a == 2) {
-                RDict* da = (RDict*)a->p; RDict* db = (RDict*)b->p;
+                RDict* da = (RDict*)a->payload.p; RDict* db = (RDict*)b->payload.p;
                 if (da->count != db->count) return 0;
                 for (int i = 0; i < da->count; i++) {
                     int found = 0;
@@ -802,7 +803,7 @@ int box_equal(Box* a, Box* b) {
                 }
                 return 1;
             }
-            return a->p == b->p;
+            return a->payload.p == b->payload.p;
         }
     }
     return 0;
@@ -817,8 +818,8 @@ int box_compare_num(Box* a, Box* b) {
     if (!a || !b) return 0;
     // OPEN-4: Null (type==6) is genuinely -infinity here, rather than
     // relying on it coincidentally holding the smallest representable int.
-    double av = (a->type == 6) ? -INFINITY : (a->type == 1) ? a->f : (double)a->i;
-    double bv = (b->type == 6) ? -INFINITY : (b->type == 1) ? b->f : (double)b->i;
+    double av = (a->type == 6) ? -INFINITY : (a->type == 1) ? a->payload.f : (double)a->payload.i;
+    double bv = (b->type == 6) ? -INFINITY : (b->type == 1) ? b->payload.f : (double)b->payload.i;
     if (av < bv) return -1;
     if (av > bv) return 1;
     return 0;
@@ -828,30 +829,30 @@ int box_compare_num(Box* a, Box* b) {
 // Called on every variable assignment to satisfy the spec's deep-copy semantics.
 Box* box_deep_copy(Box* src) {
     if(!src) return box_i(0);
-    if(src->type==0) return box_i(src->i);
-    if(src->type==1) return box_f(src->f);
-    if(src->type==2) return box_s(src->s ? src->s : "");
+    if(src->type==0) return box_i(src->payload.i);
+    if(src->type==1) return box_f(src->payload.f);
+    if(src->type==2) return box_s(src->payload.s ? src->payload.s : "");
     // BUGFIX (found while implementing bugs.log OPEN-9): bool (type==4) was
     // falling through to the `type!=3` branch below, which resets it to a
     // plain int 0 — silently destroying a boxed bool's value/type on every
     // deep-copy (e.g. a bool stored in a collection or a polymorphic global).
-    if(src->type==4) return box_b(src->i);
+    if(src->type==4) return box_b(src->payload.i);
     // OPEN-4: Null (type==6) must copy as Null, not silently fall through to
     // the generic "reset to int 0" fallback below (which would turn a Null
     // in a collection into a real 0 on the very next deep-copy/assignment).
     if(src->type==6) return box_null();
-    if(src->type!=3 || !src->p) {
+    if(src->type!=3 || !src->payload.p) {
         // bugs.log OPEN-9: class instances (type==5) use reference
         // semantics here, same as collections just below — deep-copying
         // an arbitrary class struct generically isn't possible in the C
         // runtime without per-class field-layout knowledge, which only
         // codegen has.
         if(src->type==5) return src;
-        Box* b=malloc(sizeof(Box)); b->type=0; b->i=0; return b;
+        Box* b=malloc(sizeof(Box)); b->type=0; b->payload.i=0; return b;
     }
-    int* magic = (int*)src->p;
+    int* magic = (int*)src->payload.p;
     if(*magic==1) {
-        RList* sl = (RList*)src->p;
+        RList* sl = (RList*)src->payload.p;
         RList* dl = malloc(sizeof(RList));
         dl->magic=1; dl->count=sl->count; dl->cap=sl->count>0?sl->count:1;
         dl->items = malloc(dl->cap * sizeof(Box*));
@@ -859,7 +860,7 @@ Box* box_deep_copy(Box* src) {
         return box_p(dl);
     }
     if(IS_DICT_MAGIC(*magic)) {
-        RDict* sd = (RDict*)src->p;
+        RDict* sd = (RDict*)src->payload.p;
         RDict* dd = malloc(sizeof(RDict));
         // Preserve the ORIGINAL magic: 2 = dict, 4 = dict+ (see IS_DICT_MAGIC).
         // Hardcoding 2 silently demoted every deep-copied dict+ to a plain
@@ -876,16 +877,16 @@ Box* box_deep_copy(Box* src) {
 }
 int box_eq(Box* a, Box* b) {
     if(!a || !b || a->type!=b->type) return 0;
-    if(a->type==0) return a->i==b->i;
-    if(a->type==1) return a->f==b->f;
-    if(a->type==2) return strcmp(a->s,b->s)==0;
+    if(a->type==0) return a->payload.i==b->payload.i;
+    if(a->type==1) return a->payload.f==b->payload.f;
+    if(a->type==2) return strcmp(a->payload.s,b->payload.s)==0;
     if(a->type==6) return 1;  // OPEN-4: Null == Null
-    return a->p==b->p;
+    return a->payload.p==b->payload.p;
 }
 void dict_set(Box* dct, Box* k, Box* v) {
     rub_temp_untrack(k); rub_temp_untrack(v);   /* the dict owns them now */
     if(!dct || dct->type != 3) return;
-    RDict* d=dct->p;
+    RDict* d=dct->payload.p;
     if(!d || !IS_DICT_MAGIC(d->magic)) return; /* not a dict/dict+ */
     for(int i=0;i<d->count;i++) if(box_eq(d->keys[i],k)) { 
         box_drop(d->vals[i]);
@@ -903,7 +904,7 @@ void dict_set(Box* dct, Box* k, Box* v) {
 // Takes no ownership of `k` (unlike dict_set) — it only reads it.
 int dict_has_key(Box* dct, Box* k) {
     if(!dct || dct->type != 3) return 0;
-    RDict* d=dct->p;
+    RDict* d=dct->payload.p;
     if(!d || !IS_DICT_MAGIC(d->magic)) return 0;
     for(int i=0;i<d->count;i++) if(box_eq(d->keys[i],k)) return 1;
     return 0;
@@ -934,12 +935,12 @@ void collection_add1(Box* col_box, Box* arg) {
         l->magic = 1; l->count = 0; l->cap = 8;
         l->items = malloc(8 * sizeof(Box*));
         col_box->type = 3;
-        col_box->p = l;
+        col_box->payload.p = l;
         list_append(col_box, owned);
         return;
     }
-    if (!col_box || col_box->type != 3 || !col_box->p) return;
-    int magic = *(int*)col_box->p;
+    if (!col_box || col_box->type != 3 || !col_box->payload.p) return;
+    int magic = *(int*)col_box->payload.p;
     if (magic == 1) {
         list_append(col_box, owned);
     } else if (magic == 2) {
@@ -961,20 +962,20 @@ Box* dict_get(void* col, Box* k) {
 // Returns NULL on out-of-bounds/missing-key instead of exiting.
 // Used inside try blocks so the IR can null-check and branch to the error label.
 Box* try_collection_get(Box* col_box, Box* key) {
-    if (!col_box || col_box->type != 3 || !col_box->p) return NULL;
-    int magic = *(int*)col_box->p;
+    if (!col_box || col_box->type != 3 || !col_box->payload.p) return NULL;
+    int magic = *(int*)col_box->payload.p;
     if (magic == 1) {
-        RList* l = (RList*)col_box->p; int i = key->i;
+        RList* l = (RList*)col_box->payload.p; int i = key->payload.i;
         return (i >= 0 && i < l->count) ? l->items[i] : NULL;
     }
-    RDict* d = (RDict*)col_box->p;
+    RDict* d = (RDict*)col_box->payload.p;
     for (int j = 0; j < d->count; j++) if (box_eq(d->keys[j], key)) return d->vals[j];
     return NULL;
 }
 
 Box* collection_get(Box* col_box, Box* key) {
     if (!col_box || col_box->type != 3) return box_i(0);
-    void* col = col_box->p;
+    void* col = col_box->payload.p;
     if(!col) return box_i(0);
     int* magic = (int*)col;
     if (*magic == 1) return list_get(col, key);
@@ -990,17 +991,17 @@ void collection_set(Box* col_box, Box* key, Box* val) {
         d->magic = 2; d->count = 0; d->cap = 8;
         d->keys = malloc(8 * sizeof(Box*)); d->vals = malloc(8 * sizeof(Box*));
         col_box->type = 3;
-        col_box->p = d;
+        col_box->payload.p = d;
         dict_set(col_box, key, val);
         return;
     }
     if (!col_box || col_box->type != 3) return;
-    void* col = col_box->p;
+    void* col = col_box->payload.p;
     if(!col) return;
     int* magic = (int*)col;
     if (*magic == 1) {
         RList* l = col;
-        int i = key->i; /* 0-based indexing */
+        int i = key->payload.i; /* 0-based indexing */
         if(i >= 0 && i < l->count) {
             box_drop(l->items[i]);
             l->items[i] = val;
@@ -1014,17 +1015,17 @@ void collection_set(Box* col_box, Box* key, Box* val) {
 
 // items(1).drop() — remove element/key and shift (spec: NOT replaced with Null)
 void collection_drop(Box* col_box, Box* key) {
-    if (!col_box || col_box->type != 3 || !col_box->p) return;
-    int* magic = (int*)col_box->p;
+    if (!col_box || col_box->type != 3 || !col_box->payload.p) return;
+    int* magic = (int*)col_box->payload.p;
     if (*magic == 1) {
-        RList* l = (RList*)col_box->p;
-        long long idx = key->i;
+        RList* l = (RList*)col_box->payload.p;
+        long long idx = key->payload.i;
         if (idx < 0 || idx >= l->count) return;
         box_drop(l->items[idx]);
         for (int j = (int)idx; j < l->count - 1; j++) l->items[j] = l->items[j+1];
         l->count--;
     } else if (IS_DICT_MAGIC(*magic)) {
-        RDict* d = (RDict*)col_box->p;
+        RDict* d = (RDict*)col_box->payload.p;
         for (int j = 0; j < d->count; j++) {
             if (box_eq(d->keys[j], key)) {
                 box_drop(d->keys[j]); box_drop(d->vals[j]);
@@ -1038,9 +1039,9 @@ void collection_drop(Box* col_box, Box* key) {
 
 int collection_len(Box* col_box) {
     if (!col_box) return 0;
-    if (col_box->type == 2) return col_box->s ? (int)strlen(col_box->s) : 0;
+    if (col_box->type == 2) return col_box->payload.s ? (int)strlen(col_box->payload.s) : 0;
     if (col_box->type != 3) return 0;
-    void* col = col_box->p;
+    void* col = col_box->payload.p;
     if(!col) return 0;
     int* magic = (int*)col;
     if (*magic == 1) return ((RList*)col)->count;
@@ -1068,11 +1069,11 @@ int collection_has(Box* col, Box* needle) {
     if (!col || !needle) return 0;
     // str receiver: substring / character containment.
     if (col->type == 2) {
-        if (!col->s || needle->type != 2 || !needle->s) return 0;
-        return strstr(col->s, needle->s) != NULL;
+        if (!col->payload.s || needle->type != 2 || !needle->payload.s) return 0;
+        return strstr(col->payload.s, needle->payload.s) != NULL;
     }
     if (col->type != 3) return 0;
-    void* ptr = col->p;
+    void* ptr = col->payload.p;
     if(!ptr) return 0;
     int* magic = (int*)ptr;
     if (*magic == 1) {
@@ -1235,7 +1236,7 @@ Box* try_collection_get_copy(Box* col, Box* key) {
 // characters (BUG-4) and freeing either one invalidated the other. This
 // hands back an owned copy instead; the caller (codegen) tracks or binds it.
 char* unbox_s_dup(Box* b) {
-    return strdup((b && b->type == 2 && b->s) ? b->s : "");
+    return strdup((b && b->type == 2 && b->payload.s) ? b->payload.s : "");
 }
 
 // BUG (found via syntax sweep): `let t = s` for plain `str` variables used to
@@ -1254,12 +1255,12 @@ char* rub_strdup_safe(char* s) {
 Box* collection_get_at(Box* col_box, int idx) {
     if (!col_box) return box_i(0);
     if (col_box->type == 2) {
-        if (!col_box->s || idx < 0 || idx >= (int)strlen(col_box->s)) return box_s("");
-        char ch[2] = {col_box->s[idx], '\0'};
+        if (!col_box->payload.s || idx < 0 || idx >= (int)strlen(col_box->payload.s)) return box_s("");
+        char ch[2] = {col_box->payload.s[idx], '\0'};
         return box_s(ch);
     }
     if (col_box->type != 3) return box_i(0);
-    void* col = col_box->p;
+    void* col = col_box->payload.p;
     if(!col) return box_i(0);
     int* magic = (int*)col;
     if (*magic == 1) {
@@ -1275,7 +1276,7 @@ Box* collection_get_at(Box* col_box, int idx) {
 
 void collection_set_at(Box* col_box, int idx, Box* val) {
     if (!col_box || col_box->type != 3) return;
-    void* col = col_box->p;
+    void* col = col_box->payload.p;
     if(!col) return;
     int* magic = (int*)col;
     if (*magic == 1) {
@@ -1341,7 +1342,7 @@ char* box_to_cstr(Box* b);  // forward declaration
 // list is printed it shows text in "" and everything else as is".
 char* elem_cstr(Box* b) {
     if(b && b->type==2) {
-        const char* s = b->s ? b->s : "";
+        const char* s = b->payload.s ? b->payload.s : "";
         char* out = malloc(strlen(s)+3);
         snprintf(out, strlen(s)+3, "\"%s\"", s);
         return out;
@@ -1362,23 +1363,23 @@ void print_boxed(Box* b) {
 char* box_to_cstr(Box* b) {
     if(!b) { char* r = malloc(5); strcpy(r,"null"); return r; }
     char* buf = malloc(64);
-    if(b->type==0) { snprintf(buf, 64, "%lld", b->i); }
+    if(b->type==0) { snprintf(buf, 64, "%lld", b->payload.i); }
     // OPEN-4: Null is now its own real Box type (6), so a genuine boxed int
     // that happens to equal the old sentinel value (INT32_MIN) is no longer
     // misprinted as "Null" — only an actual box_null() prints "Null" here.
     else if(b->type==6) { snprintf(buf, 64, "Null"); }
-    else if(b->type==4) { snprintf(buf, 64, "%s", b->i ? "True" : "False"); }
+    else if(b->type==4) { snprintf(buf, 64, "%s", b->payload.i ? "True" : "False"); }
     // bugs.log OPEN-R: was bare "%g" (6-sig-fig default), silently
     // truncating real digits. b->f is always stored as a C double here
     // (float values are widened to double before boxing), so "%.17g"
     // (DBL_DECIMAL_DIG) is the minimum precision that round-trips exactly.
-    else if(b->type==1) { snprintf(buf, 64, "%.17g", b->f); }
-    else if(b->type==2) { free(buf); return strdup(b->s ? b->s : ""); }
-    else if(b->type==3 && b->p) {
-        int* magic = (int*)b->p;
+    else if(b->type==1) { snprintf(buf, 64, "%.17g", b->payload.f); }
+    else if(b->type==2) { free(buf); return strdup(b->payload.s ? b->payload.s : ""); }
+    else if(b->type==3 && b->payload.p) {
+        int* magic = (int*)b->payload.p;
         if(magic && *magic==1) {
             // List → "[item, item, ...]"
-            RList* l = (RList*)b->p;
+            RList* l = (RList*)b->payload.p;
             size_t cap = 256; char* out = malloc(cap); size_t pos = 0;
             out[pos++] = '[';
             for(int i=0; i<l->count; i++) {
@@ -1392,7 +1393,7 @@ char* box_to_cstr(Box* b) {
             free(buf); return out;
         } else if(magic && IS_DICT_MAGIC(*magic)) {
             // Dict → "{key: val, ...}"
-            RDict* d = (RDict*)b->p;
+            RDict* d = (RDict*)b->payload.p;
             size_t cap = 256; char* out = malloc(cap); size_t pos = 0;
             out[pos++] = '{';
             for(int i=0; i<d->count; i++) {
@@ -1418,17 +1419,17 @@ char* box_to_cstr(Box* b) {
 // merges two lists into a new list (deep-copying each element)
 Box* list_concat(Box* a, Box* b) {
     Box* result = make_list();
-    if (a && a->type==3 && a->p) {
-        int* am = (int*)a->p;
+    if (a && a->type==3 && a->payload.p) {
+        int* am = (int*)a->payload.p;
         if (am && *am==1) {
-            RList* la = (RList*)a->p;
+            RList* la = (RList*)a->payload.p;
             for(int i=0; i<la->count; i++) list_append(result, box_copy(la->items[i]));
         }
     }
-    if (b && b->type==3 && b->p) {
-        int* bm = (int*)b->p;
+    if (b && b->type==3 && b->payload.p) {
+        int* bm = (int*)b->payload.p;
         if (bm && *bm==1) {
-            RList* lb = (RList*)b->p;
+            RList* lb = (RList*)b->payload.p;
             for(int i=0; i<lb->count; i++) list_append(result, box_copy(lb->items[i]));
         }
     }
@@ -1439,8 +1440,8 @@ Box* list_concat(Box* a, Box* b) {
 // example), otherwise falls back to stringify-and-concatenate (covers
 // boxed scalars, e.g. two Any-typed numbers used in a string context)
 Box* box_add(Box* a, Box* b) {
-    if (a && a->type==3 && a->p && b && b->type==3 && b->p) {
-        int* am = (int*)a->p; int* bm = (int*)b->p;
+    if (a && a->type==3 && a->payload.p && b && b->type==3 && b->payload.p) {
+        int* am = (int*)a->payload.p; int* bm = (int*)b->payload.p;
         if (am && bm && *am==1 && *bm==1) return list_concat(a, b);
     }
     char* sa = box_to_cstr(a);
@@ -1455,9 +1456,9 @@ Box* box_add(Box* a, Box* b) {
 // list.combine() — joins all list items as strings with no separator
 char* list_combine(Box* col_box) {
     if(!col_box || col_box->type != 3) return strdup("");
-    int* magic = (int*)col_box->p;
+    int* magic = (int*)col_box->payload.p;
     if(!magic || *magic != 1) return strdup("");
-    RList* l = (RList*)col_box->p;
+    RList* l = (RList*)col_box->payload.p;
     size_t cap = 256;
     char* out = malloc(cap);
     size_t pos = 0;
@@ -1719,17 +1720,17 @@ static double rub_net_now(void) {
 // in find()/list() order) match — see the NET section's DISCOVERY notes.
 static RubNetPeer* _net_resolve_locked(Box* target) {
     if (!target) return NULL;
-    if (target->type == 2 && target->s) {
+    if (target->type == 2 && target->payload.s) {
         RubNetPeer* best = NULL;
         for (int i = 0; i < RUB_NET_MAX_PEERS; i++) {
             RubNetPeer* p = &g_net_peers[i];
-            if (p->in_use && p->name[0] && strcmp(p->name, target->s) == 0) {
+            if (p->in_use && p->name[0] && strcmp(p->name, target->payload.s) == 0) {
                 if (!best || p->rtt < best->rtt) best = p;
             }
         }
         return best;
     }
-    long long id = target->i;
+    long long id = target->payload.i;
     for (int i = 0; i < RUB_NET_MAX_PEERS; i++) {
         if (g_net_peers[i].in_use && g_net_peers[i].id == id) return &g_net_peers[i];
     }
@@ -2072,19 +2073,19 @@ void rub_net_close(Box* target) {
 static char* rub_net_serialize(Box* v) {
     char buf[64];
     if (!v || v->type == 6) return strdup("n:");
-    if (v->type == 0) { snprintf(buf, sizeof(buf), "i:%lld", (long long)v->i); return strdup(buf); }
-    if (v->type == 1) { snprintf(buf, sizeof(buf), "f:%.15g", v->f); return strdup(buf); }
-    if (v->type == 4) return strdup(v->i ? "b:True" : "b:False");
+    if (v->type == 0) { snprintf(buf, sizeof(buf), "i:%lld", (long long)v->payload.i); return strdup(buf); }
+    if (v->type == 1) { snprintf(buf, sizeof(buf), "f:%.15g", v->payload.f); return strdup(buf); }
+    if (v->type == 4) return strdup(v->payload.i ? "b:True" : "b:False");
     if (v->type == 2) {
-        const char* s = v->s ? v->s : "";
+        const char* s = v->payload.s ? v->payload.s : "";
         char* out = malloc(strlen(s) + 3);
         sprintf(out, "s:%s", s);
         return out;
     }
     if (v->type == 3) {
-        int* magic = (int*)v->p;
+        int* magic = (int*)v->payload.p;
         if (!magic || *magic != 1) { rub_throw("net.send: only flat lists of scalars are supported (v1)"); return strdup("n:"); }
-        RList* l = (RList*)v->p;
+        RList* l = (RList*)v->payload.p;
         char** parts = malloc(sizeof(char*) * (l->count > 0 ? l->count : 1));
         size_t total = 3;
         for (int i = 0; i < l->count; i++) { parts[i] = rub_net_serialize(l->items[i]); total += strlen(parts[i]) + 1; }

@@ -1462,6 +1462,32 @@ class Parser:
         empty `{}` or anything that doesn't fully parse is a compile error.
         """
         from lexer import tokenize
+        
+        def unescape(s):
+            """Unescape common escape sequences in a string."""
+            result = []
+            i = 0
+            while i < len(s):
+                if s[i] == '\\' and i + 1 < len(s):
+                    next_char = s[i + 1]
+                    if next_char == '"':
+                        result.append('"')
+                    elif next_char == '\\':
+                        result.append('\\')
+                    elif next_char == 'n':
+                        result.append('\n')
+                    elif next_char == 't':
+                        result.append('\t')
+                    elif next_char == 'r':
+                        result.append('\r')
+                    else:
+                        result.append(next_char)
+                    i += 2
+                else:
+                    result.append(s[i])
+                    i += 1
+            return ''.join(result)
+        
         parts = []
         i, last, n = 0, 0, len(raw)
         while i < n:
@@ -1486,6 +1512,7 @@ class Parser:
                             f"Line {self.line_no}: empty '{{}}' in an interpolated string — "
                             f"put an expression inside, e.g. i\"...{{name}}...\""
                         )
+                    inner = unescape(inner)
                     sub_tokens = tokenize(inner)
                     sub_parser = Parser(sub_tokens)
                     node = sub_parser.expr()

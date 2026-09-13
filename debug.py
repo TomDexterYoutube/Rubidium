@@ -2346,6 +2346,52 @@ def _token_syntax_check(tokens: list, source_lines: list) -> list:
 # discover its own imports and (b) surface a SyntaxError with its real
 # filename attached, the instant the first broken file is hit.
 
+
+def _validate_full_syntax(tokens: list, source_lines: list, filepath: str) -> list:
+    """
+    Run the actual parser on the token stream to catch ALL syntax errors
+    that the token-level check might miss. Returns a list of Issue objects.
+    This is a pre-validation step to fail fast on broken syntax before
+    running the rest of the debug pipeline.
+    """
+    issues = []
+    try:
+        from parser import Parser
+        parser = Parser(tokens)
+        parser.parse()
+    except SyntaxError as e:
+        # Parse the error message to extract line number if possible
+        err_msg = str(e)
+        line = 1
+        # Try to extract line number from error message
+        import re
+        match = re.search(r'Line (\d+)', err_msg)
+        if match:
+            line = int(match.group(1))
+        elif hasattr(e, 'lineno') and e.lineno:
+            line = e.lineno
+        else:
+            # Fallback: try to find line from the parser's current position
+            if hasattr(parser, 'line_no'):
+                line = parser.line_no
+        
+        src_line = source_lines[line - 1].rstrip() if 0 < line <= len(source_lines) else ""
+        issues.append(Issue('ERROR', line, 'Syntax Error',
+                          f"{err_msg}",
+                          f"Fix the syntax error on line {line}"))
+    except Exception as e:
+        # Catch any other parser exceptions (infinite loops, etc.)
+        err_msg = str(e)
+        line = 1
+        if hasattr(parser, 'line_no'):
+            line = parser.line_no
+        src_line = source_lines[line - 1].rstrip() if 0 < line <= len(source_lines) else ""
+        issues.append(Issue('ERROR', line, 'Parse Error',
+                          f"Parser failed: {err_msg}",
+                          f"Check syntax around line {line}"))
+    return issues
+
+
 def _find_imports_in_body(stmts):
     """Recursively collect Import nodes from a statement list, including
     ones nested inside functions/classes/control flow — mirrors
@@ -2603,6 +2649,39 @@ def _analyze_single_file(filepath: str, strict: bool, exit_on_fatal: bool,
                 # problem it hits and exits, which would bury the full list
                 # above under one more, differently-formatted single-line
                 # error instead of leaving every issue visible together.
+                if exit_on_fatal:
+                    sys.exit(1)
+                return False
+
+        # ── Full Syntax Validation (Parser) ──────────────────────────────────
+        # Run the actual parser to catch ALL syntax errors that token-level
+        # checks might miss. This fails fast on broken syntax before running
+        # the rest of the debug pipeline (which could hang on infinite loops
+        # or other parser issues).
+        full_syntax_issues = _validate_full_syntax(tokens, source_lines, filepath)
+        if full_syntax_issues:
+            print(f"\n{ANSI['BOLD']}Rubidium Syntax Validation{ANSI['RESET']}")
+            print(f"{ANSI['DIM']}Checking: {filepath}{ANSI['RESET']}\n")
+            for issue in full_syntax_issues:
+                color = ANSI.get(issue.severity, '')
+                print(f"{color}{issue.severity}{ANSI['RESET']}:")
+                print()
+                if issue.line:
+                    print(f"Line {issue.line}:")
+                print(issue.category)
+                print()
+                print(issue.message)
+                if issue.suggestion:
+                    print()
+                    print("Suggestion:")
+                    print(f"  {issue.suggestion}")
+                print()
+                print(f"{ANSI['DIM']}{'─' * 44}{ANSI['RESET']}")
+                print()
+            errs = [i for i in full_syntax_issues if i.severity == 'ERROR']
+            if errs:
+                print(f"{ANSI['ERROR']}✖  {len(errs)} syntax error{'s' if len(errs) != 1 else ''} "
+                      f"— parser validation failed{ANSI['RESET']}\n")
                 if exit_on_fatal:
                     sys.exit(1)
                 return False
