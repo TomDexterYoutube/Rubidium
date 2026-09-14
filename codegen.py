@@ -2098,6 +2098,26 @@ class CodeGen:
         else: self.emit(f"  ret {ret_ir} null")
 
     def emit_fn(self, node):
+        # Skip external runtime functions that are declared in extern_decls
+        external_fns = {
+            "make_fixed_list", "make_fixed_index", "make_list", "make_index", "make_dict", "make_dictplus",
+            "box_i", "box_f", "box_s", "box_p", "box_b", "box_null",
+            "unbox_i", "unbox_f", "unbox_s", "unbox_p",
+            "list_append", "index_set", "collection_get", "print_boxed", "box_to_cstr",
+            "rub_dynvar_set", "_rubidium_pow", "strtod",
+            "exit", "pthread_create", "pthread_join", "_thread_is_running",
+            "malloc", "free", "printf", "fopen", "fclose", "fread", "fwrite",
+            "fseek", "ftell", "remove", "rename", "mkdir", "opendir", "readdir",
+            "closedir", "getcwd", "chdir", "strdup", "strcpy", "strcat", "strlen",
+            "strcmp", "strncmp", "memcpy", "memset", "memcmp", "atoi", "atol", "atof",
+            "strtod", "strtol", "strtoul", "abs", "labs", "llabs",
+            "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+            "sinh", "cosh", "tanh", "exp", "log", "log10", "pow",
+            "floor", "ceil", "round", "fabs", "fmod", "ldexp", "frexp", "modf"
+        }
+        if node.name in external_fns:
+            return
+        
         self.tmp_count, self.label_count, self.cur_fn, self.cur_class = 0, 0, node.name, None
         self.local_vars_stack = [{}]  # Stack of scopes, each scope is a dict of variable names to types
         self.dropped_vars = set()
