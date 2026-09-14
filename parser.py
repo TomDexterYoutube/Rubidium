@@ -1520,7 +1520,7 @@ class Parser:
                         if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
                     self.match("RPAREN")
                     res = FnCall(name, args)
-                    if self.peek() and self.peek()[0] == "DOT":
+                    if self.peek() and self.peek()[0] in ("DOT", "LBRACKET"):
                         continue
                     break
                 else:
@@ -1561,7 +1561,7 @@ class Parser:
                     self.match("RPAREN")
                     res = FnCall(name, args)
                     # Continue loop to allow method chaining on collection access
-                    if self.peek() and self.peek()[0] == "DOT":
+                    if self.peek() and self.peek()[0] in ("DOT", "LBRACKET"):
                         continue
                     break
                 else:
@@ -1627,27 +1627,32 @@ class Parser:
                     index_path = self._parse_index_path()
                     # Check for .set()/.add()/.drop() after the [ ] path for WRITE
                     if self.peek() and self.peek()[0] == "DOT":
+                        # Peek at the method name without consuming
+                        saved_pos = self.pos
                         self.match("DOT")
                         method = self.match_attr()
-                        if method == "set" and self.peek() and self.peek()[0] == "LPAREN":
+                        if method in ("set", "add", "drop") and self.peek() and self.peek()[0] == "LPAREN":
+                            # Consume the method call for set/add/drop
                             self.match("LPAREN")
-                            value = self.expr()
-                            self.match("RPAREN")
-                            res = IndexSet(res, index_path, value)
-                        elif method == "add" and self.peek() and self.peek()[0] == "LPAREN":
-                            self.match("LPAREN")
-                            args = []
-                            while self.peek() and self.peek()[0] != "RPAREN":
-                                args.append(self._call_arg())
-                                if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
-                            self.match("RPAREN")
-                            res = IndexAdd(res, index_path, args)
-                        elif method == "drop" and self.peek() and self.peek()[0] == "LPAREN":
-                            self.match("LPAREN")
-                            self.match("RPAREN")
-                            res = IndexDrop(res, index_path)
+                            if method == "set":
+                                value = self.expr()
+                                self.match("RPAREN")
+                                res = IndexSet(res, index_path, value)
+                            elif method == "add":
+                                args = []
+                                while self.peek() and self.peek()[0] != "RPAREN":
+                                    args.append(self._call_arg())
+                                    if self.peek() and self.peek()[0] == "COMMA": self.match("COMMA")
+                                self.match("RPAREN")
+                                res = IndexAdd(res, index_path, args)
+                            else:  # drop
+                                self.match("RPAREN")
+                                res = IndexDrop(res, index_path)
                         else:
-                            raise SyntaxError(f"Unknown collection method after [ ]: {method}")
+                            # Not a set/add/drop method call - restore position and let outer loop handle it
+                            self.pos = saved_pos
+                            for idx in index_path:
+                                res = IndexAccess(res, idx)
                     else:
                         # Just READ access - build nested IndexAccess for chained [ ]
                         for idx in index_path:
@@ -1709,7 +1714,7 @@ class Parser:
                     else:
                         res = FnCall(res, args)
                     # Continue loop to allow method chaining on collection access
-                    if self.peek() and self.peek()[0] == "DOT":
+                    if self.peek() and self.peek()[0] in ("DOT", "LBRACKET"):
                         continue
                     break
                 else:

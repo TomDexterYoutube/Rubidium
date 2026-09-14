@@ -1571,6 +1571,19 @@ class CodeGen:
 
     def _infer_type(self, node):
         if isinstance(node, FileList): return "%Box*"
+        # BUGFIX: `let x = my_list[0]` / `let x = my_index["key"]` (and any
+        # chained `[ ]` read, e.g. `my_nested[1]["k"]`) — a collection READ
+        # via IndexAccess always hands back a boxed element (collection_get_copy
+        # in emit_index_access always returns %Box*, since the element's real
+        # type isn't known statically). This case was entirely missing here,
+        # so `let` with no explicit type on ANY `[ ]` read fell through to the
+        # generic "i64" default further down, causing the compiler to treat a
+        # non-integer element (e.g. a string) as a raw i64 and store/print
+        # garbage instead of unboxing it correctly. Mirrors the identical fix
+        # already in place for the equivalent `tokens(pos)` paren-call form
+        # (the FnCall case below).
+        if isinstance(node, IndexAccess):
+            return "%Box*"
         if isinstance(node, LinkArg):
             # BUGFIX (bugs.log #4): `link expr` is a pass-by-reference marker,
             # not a distinct type — it must infer as whatever `expr` itself is

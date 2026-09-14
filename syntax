@@ -1085,6 +1085,22 @@ add(7, b = 3);      // OK — 7 positional for 'a', 3 named for 'b'
 // the same way at the call site (p.method(x = 1)).
 
 // =========================================
+// CONST
+// =========================================
+
+// Const is a avrble declared in the top level that 
+// - can not be mut
+// - can not be shadowed
+// - can not be local (exluding pub / not pub)
+// - must have the type declared
+
+let const x: i32 = 10;
+
+fn main() {
+    let x = 10; // cant over write or shadow this would cuaze a error
+}
+
+// =========================================
 // The Link Rule
 // =========================================
 
@@ -2723,6 +2739,7 @@ fn main() {
 //   - Global variables remain alive until dropped
 //   - Global variables are accessible from functions and threads
 //   - Global variables may be shadowed by local variables
+//   - Global variables can not be overwriten
 
 // Assignment:
 //   - Assignment copies values
