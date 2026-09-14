@@ -852,7 +852,7 @@ class Parser:
     # right after 'return' means it's a bare `return` with no value, not the
     # start of an expression that happens to be missing.
     _STMT_BOUNDARY_TOKENS = {
-        "RBRACE", "IMPORT", "XEON", "USE", "LET", "PRINT", "PRINTLN", "IF", "WHILE",
+        "RBRACE", "SEMICOLON", "IMPORT", "XEON", "USE", "LET", "PRINT", "PRINTLN", "IF", "WHILE",
         "FOR", "BREAK", "CONTINUE", "RETURN", "TRY", "FN", "OPEN", "CLASS",
         "DROP", "RAISE",
     }

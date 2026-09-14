@@ -6536,6 +6536,46 @@ class CodeGen:
             self.emit(f"  {tmp} = call i32 @collection_len(%Box* {obj_val})")
             return tmp, "i32"
 
+        # Collection .remove(index) — remove element at index
+        if obj_t == "%Box*" and node.method == "remove" and len(node.args) == 1:
+            idx_v, idx_t = self.emit_expr(node.args[0])
+            idx_box = self.coerce_to_box(idx_v, idx_t)
+            self.emit(f"  call void @collection_drop(%Box* {obj_val}, %Box* {idx_box})")
+            return "0", "i64"
+
+        # Collection .add(value) — append to list or set key/value in index/dict
+        if obj_t == "%Box*" and node.method == "add" and len(node.args) >= 1:
+            args_boxes = []
+            for a in node.args:
+                av, at = self.emit_expr(a)
+                args_boxes.append(self.coerce_to_box(av, at))
+            if len(args_boxes) == 1:
+                self.emit(f"  call void @list_append(%Box* {obj_val}, %Box* {args_boxes[0]})")
+            else:
+                # Multiple args for index/dict set: first is key, second is value
+                key_box = args_boxes[0]
+                val_box = args_boxes[1] if len(args_boxes) > 1 else self.coerce_to_box("0", "i64")
+                self.emit(f"  call void @index_set(%Box* {obj_val}, %Box* {key_box}, %Box* {val_box})")
+            return "0", "i64"
+
+        # Collection .set(index, value) — set element at index
+        if obj_t == "%Box*" and node.method == "set" and len(node.args) == 2:
+            idx_v, idx_t = self.emit_expr(node.args[0])
+            val_v, val_t = self.emit_expr(node.args[1])
+            idx_box = self.coerce_to_box(idx_v, idx_t)
+            val_box = self.coerce_to_box(val_v, val_t)
+            val_copy = self.new_tmp()
+            self.emit(f"  {val_copy} = call %Box* @box_deep_copy(%Box* {val_box})")
+            self.emit(f"  call void @collection_set(%Box* {obj_val}, %Box* {idx_box}, %Box* {val_copy})")
+            return "0", "i64"
+
+        # Collection .drop(index) — remove element at index (alias for remove)
+        if obj_t == "%Box*" and node.method == "drop" and len(node.args) == 1:
+            idx_v, idx_t = self.emit_expr(node.args[0])
+            idx_box = self.coerce_to_box(idx_v, idx_t)
+            self.emit(f"  call void @collection_drop(%Box* {obj_val}, %Box* {idx_box})")
+            return "0", "i64"
+
         # Collection .combine() — join all items as a string
         if obj_t == "%Box*" and node.method == "combine" and not node.args:
             tmp = self.new_tmp()
