@@ -1093,6 +1093,8 @@ add(7, b = 3);      // OK — 7 positional for 'a', 3 named for 'b'
 // - can not be shadowed
 // - can not be local (exluding pub / not pub)
 // - must have the type declared
+// - can not be dropped, ever
+// - can not be binded
 
 let const x: i32 = 10;
 
