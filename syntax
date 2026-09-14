@@ -2320,6 +2320,8 @@ let back: list = raw.pull();         // Clist -> list
 //   .cast()/.pull() — nested lists included.
 // - index has no Clist equivalent and cannot be cast at all.
 
+// You can also cast and pull Null, to CNull
+
 // -----------------------------------------
 // FFI FUNCTION RENAMING
 // -----------------------------------------
@@ -2985,6 +2987,7 @@ fn main() {
 //     before crossing, and .pull() (Clist -> list) coming back
 //   - index is never supported across FFI; binding a function with an
 //     index parameter or return type is a compile error
+//   - note indexs may be sent to Rubidium libs or Rubidium supporting libs
 //
 // General Rules:
 //   - Attempting to modify a non-mut value causes a compile error
